@@ -48,6 +48,7 @@ in the body of the message.
    radosgw/index*
    ceph-volume/index*
    crimson/index*
+   lockstat
 
 .. raw:: html
 
