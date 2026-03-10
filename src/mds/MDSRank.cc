@@ -18,7 +18,6 @@
 #include <typeinfo>
 #include "common/debug.h"
 #include "common/errno.h"
-#include "common/fair_mutex.h"
 #include "common/likely.h"
 #include "common/Timer.h"
 #include "common/async/blocked_completion.h"
@@ -456,9 +455,9 @@ private:
 
 MDSRank::MDSRank(
     mds_rank_t whoami_,
-    ceph::fair_mutex &mds_lock_,
+    ceph::mutex &mds_lock_,
     LogChannelRef &clog_,
-    CommonSafeTimer<ceph::fair_mutex> &timer_,
+    CommonSafeTimer<ceph::mutex> &timer_,
     Beacon &beacon_,
     std::unique_ptr<MDSMap>& mdsmap_,
     Messenger *msgr,
@@ -4025,9 +4024,9 @@ bool MDSRank::evict_client(int64_t session_id,
 
 MDSRankDispatcher::MDSRankDispatcher(
     mds_rank_t whoami_,
-    ceph::fair_mutex &mds_lock_,
+    ceph::mutex &mds_lock_,
     LogChannelRef &clog_,
-    CommonSafeTimer<ceph::fair_mutex> &timer_,
+    CommonSafeTimer<ceph::mutex> &timer_,
     Beacon &beacon_,
     std::unique_ptr<MDSMap> &mdsmap_,
     Messenger *msgr,
