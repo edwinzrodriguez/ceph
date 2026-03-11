@@ -4892,8 +4892,11 @@ void Client::add_update_cap(Inode *in, MetaSession *mds_session, uint64_t cap_id
   const auto &capem = in->caps.emplace(std::piecewise_construct, std::forward_as_tuple(mds), std::forward_as_tuple(*in, mds_session));
   Cap &cap = capem.first->second;
   if (!capem.second) {
-    if (cap.gen < mds_session->cap_gen)
+    if (cap.gen < mds_session->cap_gen) {
       cap.issued = cap.implemented = CEPH_CAP_PIN;
+      inc_pinned_icaps();
+      inc_caps();
+    }
 
     /*
      * auth mds of the inode changed. we received the cap export
