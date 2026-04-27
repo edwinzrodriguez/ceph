@@ -190,6 +190,42 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL Clang)
   endif()
 endif(CMAKE_CXX_COMPILER_ID STREQUAL GNU)
 
+if(USE_TRACEFLOW)
+  set(CMAKE_REQUIRED_LIBRARIES "backtrace")
+  check_c_source_compiles("
+    #include <backtrace.h>
+    int main(int argc, char **argv) {
+        return 0;
+    }
+" HAVE_LIBBACKTRACE_WORKS_NOW)
+  set(CMAKE_REQUIRED_LIBRARIES "")
+  if(HAVE_LIBBACKTRACE_WORKS_NOW)
+    set(HAVE_LIBBACKTRACE 1)
+  endif()
+  set(CMAKE_REQUIRED_LIBRARIES "")
+  if(HAVE_LIBBACKTRACE)
+    add_compile_definitions(HAVE_LIBBACKTRACE)
+  endif()
+
+  add_compile_options(
+          "$<$<COMPILE_LANGUAGE:C>:-finstrument-functions>"
+          "$<$<COMPILE_LANGUAGE:C>:-finstrument-functions-exclude-function-list=boost,std::,::__,fmt::>"
+          "$<$<COMPILE_LANGUAGE:C>:-fno-omit-frame-pointer>"
+          "$<$<COMPILE_LANGUAGE:C>:-rdynamic>"
+          "$<$<COMPILE_LANGUAGE:CXX>:-finstrument-functions>"
+          "$<$<COMPILE_LANGUAGE:CXX>:-finstrument-functions-exclude-function-list=boost,std::,::__,fmt::>"
+          "$<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>"
+          "$<$<COMPILE_LANGUAGE:CXX>:-rdynamic>"
+          "$<$<COMPILE_LANGUAGE:CXX>:-fno-inline>"
+          "$<$<COMPILE_LANGUAGE:CXX>:-fno-inline-small-functions>"
+          "$<$<COMPILE_LANGUAGE:CXX>:-fno-ipa-sra>"
+          "$<$<COMPILE_LANGUAGE:CXX>:-fvisibility=default>"
+          "$<$<COMPILE_LANGUAGE:CXX>:-fverbose-asm>"
+          -ggdb3
+)
+  add_link_options("-Wl,--export-dynamic")
+endif()
+
 if(WITH_CEPH_DEBUG_MUTEX)
   add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-DCEPH_DEBUG_MUTEX>)
 endif()
@@ -355,6 +391,7 @@ if(NOT TARGET RapidJSON::RapidJSON)
 endif()
 
 option(WITH_FMT_HEADER_ONLY "use header-only version of fmt library" OFF)
+option(USE_TRACEFLOW "build with traceflow" OFF)
 option(WITH_SYSTEM_FMT "build against system fmt" OFF)
 if(WITH_SYSTEM_FMT)
   find_package(fmt 8.1.1...11.1.4 REQUIRED)
@@ -573,6 +610,9 @@ add_library(common STATIC ${ceph_common_objs})
 target_link_libraries(common
   ${ceph_common_deps}
   legacy-option-headers)
+if(USE_TRACEFLOW)
+  target_link_libraries(common traceflow)
+endif()
 if(WITH_JAEGER)
 add_dependencies(common jaeger_base)
 endif()
@@ -586,6 +626,9 @@ else()
 endif()
 
 target_link_libraries(ceph-common ${ceph_common_deps})
+if(USE_TRACEFLOW)
+  target_link_libraries(ceph-common traceflow)
+endif()
 if(ENABLE_COVERAGE)
   target_link_libraries(ceph-common gcov)
 endif(ENABLE_COVERAGE)
