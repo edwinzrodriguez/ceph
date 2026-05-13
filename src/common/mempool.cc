@@ -13,6 +13,7 @@
  *
  */
 
+#include <atomic>
 #include <thread>
 #include "include/mempool.h"
 #include "include/demangle.h"
@@ -83,7 +84,20 @@ mempool::pool_t& mempool::get_pool(mempool::pool_index_t ix)
   // this function, even if it is called by ctors in other compilation
   // units that are being initialized before this compilation unit.
   static mempool::pool_t table[num_pools];
-  table[ix].pool_index = ix;
+  
+  // Initialize pool_index only once per pool to avoid data races.
+  // Use a static flag array to track initialization.
+  static std::atomic<bool> initialized[num_pools] = {};
+  
+  if (!initialized[ix].load(std::memory_order_acquire)) {
+    bool expected = false;
+    if (initialized[ix].compare_exchange_strong(expected, true,
+                                                 std::memory_order_release,
+                                                 std::memory_order_acquire)) {
+      table[ix].pool_index = ix;
+    }
+  }
+  
   return table[ix];
 }
 
