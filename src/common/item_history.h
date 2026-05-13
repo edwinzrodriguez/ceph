@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <list>
 #include <mutex>
 
@@ -20,7 +21,7 @@ class safe_item_history {
 private:
   std::mutex lock;
   std::list<T> history;
-  T *current = nullptr;
+  std::atomic<T*> current = nullptr;
 
 public:
   safe_item_history() {
@@ -30,18 +31,18 @@ public:
 
   // readers are lock-free
   const T& operator*() const {
-    return *current;
+    return *current.load(std::memory_order_acquire);
   }
   const T *operator->() const {
-    return current;
+    return current.load(std::memory_order_acquire);
   }
 
   // writes are serialized
   const T& operator=(const T& other) {
     std::lock_guard l(lock);
     history.push_back(other);
-    current = &history.back();
-    return *current;
+    current.store(&history.back(), std::memory_order_release);
+    return *current.load(std::memory_order_acquire);
   }
 
 };
