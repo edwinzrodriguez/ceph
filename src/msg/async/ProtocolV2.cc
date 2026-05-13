@@ -445,6 +445,11 @@ void ProtocolV2::send_message(Message *m) {
     is_prepared = false;
   }
 
+  // Read state before acquiring write_lock to avoid data race with worker thread.
+  // This is safe because we only need a snapshot for decision-making, and the
+  // state can only transition to CLOSED or STANDBY which are both handled correctly.
+  State current_state = state.load(std::memory_order_relaxed);
+
   std::lock_guard<std::mutex> l(connection->write_lock);
   // "features" changes will change the payload encoding
   if (can_fast_prepare && (!can_write || connection->get_features() != f)) {
@@ -454,7 +459,7 @@ void ProtocolV2::send_message(Message *m) {
     ldout(cct, 10) << __func__ << " clear encoded buffer previous " << f
                    << " != " << connection->get_features() << dendl;
   }
-  if (state == CLOSED) {
+  if (current_state == CLOSED) {
     ldout(cct, 10) << __func__ << " connection closed."
                    << " Drop message " << m << dendl;
     m->put();
@@ -467,7 +472,7 @@ void ProtocolV2::send_message(Message *m) {
       out_queue_entry_t{is_prepared, m});
     ldout(cct, 15) << __func__ << " message queued for async transmission m=" << m
                    << dendl;
-    if (((!replacing && can_write) || state == STANDBY) && !write_in_progress) {
+    if (((!replacing && can_write) || current_state == STANDBY) && !write_in_progress) {
       write_in_progress = true;
       connection->center->dispatch_event_external(connection->write_handler);
     }
@@ -1515,7 +1520,7 @@ CtPtr ProtocolV2::handle_message() {
     need_dispatch_writer = true;
   }
 
-  state = READY;
+  state.store(READY, std::memory_order_release);
 
   ceph::mono_time fast_dispatch_time;
 
@@ -1740,7 +1745,7 @@ CtPtr ProtocolV2::start_client_banner_exchange() {
 
   INTERCEPT(1);
 
-  state = BANNER_CONNECTING;
+  state.store(BANNER_CONNECTING, std::memory_order_relaxed);
 
   global_seq = messenger->get_global_seq();
 
