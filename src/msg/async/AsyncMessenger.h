@@ -18,6 +18,7 @@
 #ifndef CEPH_ASYNCMESSENGER_H
 #define CEPH_ASYNCMESSENGER_H
 
+#include <atomic>
 #include <map>
 #include <optional>
 #include <unordered_map>
@@ -254,8 +255,8 @@ private:
   uint64_t nonce;
 
   /// true, specifying we haven't learned our addr; set false when we find it.
-  // maybe this should be protected by the lock?
-  bool need_addr = true;
+  // Uses atomic to avoid data race in double-checked locking pattern
+  std::atomic<bool> need_addr{true};
 
   /**
    * set to bind addresses if bind or bindv were called before NetworkStack
