@@ -1153,10 +1153,12 @@ bool AsyncMessenger::learned_addr(const entity_addr_t &peer_addr_for_me)
   // this always goes from true -> false under the protection of the
   // mutex.  if it is already false, we need not retake the mutex at
   // all.
-  if (!need_addr)
+  // Use memory_order_acquire to ensure we see all previous writes if need_addr is false
+  if (!need_addr.load(std::memory_order_acquire))
     return false;
   std::lock_guard l(lock);
-  if (need_addr) {
+  // Double-check with relaxed ordering since we're already synchronized by the lock
+  if (need_addr.load(std::memory_order_relaxed)) {
     if (my_addrs->empty()) {
       auto a = peer_addr_for_me;
       a.set_type(entity_addr_t::TYPE_ANY);
@@ -1188,9 +1190,11 @@ bool AsyncMessenger::learned_addr(const entity_addr_t &peer_addr_for_me)
       set_myaddrs(newaddrs);
     }
     ldout(cct, 1) << __func__ << " learned my addr " << *my_addrs
-		  << " (peer_addr_for_me " << peer_addr_for_me << ")" << dendl;
+    << " (peer_addr_for_me " << peer_addr_for_me << ")" << dendl;
     _init_local_connection();
-    need_addr = false;
+    // Use memory_order_release to ensure all previous writes are visible
+    // to threads that subsequently read need_addr as false
+    need_addr.store(false, std::memory_order_release);
     return true;
   }
   return false;
