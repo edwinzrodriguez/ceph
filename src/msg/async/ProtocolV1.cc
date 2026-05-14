@@ -1,6 +1,8 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
 // vim: ts=8 sw=2 sts=2 expandtab
 
+#include <atomic>
+
 #include "ProtocolV1.h"
 
 #include "common/errno.h"
@@ -1453,14 +1455,17 @@ CtPtr ProtocolV1::handle_server_banner_and_identify(char *buffer, int r) {
     a.set_port(0);
     connection->lock.unlock();
     messenger->learned_addr(a);
-    if (cct->_conf->ms_inject_internal_delays &&
-	cct->_conf->ms_inject_socket_failures) {
-      if (rand() % cct->_conf->ms_inject_socket_failures == 0) {
-	ldout(cct, 10) << __func__ << " sleep for "
-		       << cct->_conf->ms_inject_internal_delays << dendl;
-	utime_t t;
-	t.set_from_double(cct->_conf->ms_inject_internal_delays);
-	t.sleep();
+    // Use relaxed atomic load to avoid data race with config updates
+    auto inject_failures = std::atomic_load_explicit(
+      reinterpret_cast<const std::atomic<uint64_t>*>(&cct->_conf->ms_inject_socket_failures),
+      std::memory_order_relaxed);
+    if (cct->_conf->ms_inject_internal_delays && inject_failures) {
+      if (rand() % inject_failures == 0) {
+ ldout(cct, 10) << __func__ << " sleep for "
+         << cct->_conf->ms_inject_internal_delays << dendl;
+ utime_t t;
+ t.set_from_double(cct->_conf->ms_inject_internal_delays);
+ t.sleep();
       }
     }
     connection->lock.lock();

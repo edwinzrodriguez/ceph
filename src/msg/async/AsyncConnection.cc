@@ -17,6 +17,7 @@
 
 #include "AsyncConnection.h"
 
+#include <atomic>
 #include <fmt/core.h>
 
 #include <unistd.h>
@@ -218,8 +219,12 @@ ssize_t AsyncConnection::read_until(unsigned len, char *p)
   ldout(async_msgr->cct, 25) << __func__ << " len is " << len << " state_offset is "
                              << state_offset << dendl;
 
-  if (async_msgr->cct->_conf->ms_inject_socket_failures && cs) {
-    if (rand() % async_msgr->cct->_conf->ms_inject_socket_failures == 0) {
+  // Use relaxed atomic load to avoid data race with config updates
+  auto inject_failures = std::atomic_load_explicit(
+    reinterpret_cast<const std::atomic<uint64_t>*>(&async_msgr->cct->_conf->ms_inject_socket_failures),
+    std::memory_order_relaxed);
+  if (inject_failures && cs) {
+    if (rand() % inject_failures == 0) {
       ldout(async_msgr->cct, 0) << __func__ << " injecting socket failure" << dendl;
       cs.shutdown();
     }
@@ -328,8 +333,12 @@ ssize_t AsyncConnection::write(ceph::buffer::list &bl,
 // else return < 0 means error
 ssize_t AsyncConnection::_try_send(bool more)
 {
-  if (async_msgr->cct->_conf->ms_inject_socket_failures && cs) {
-    if (rand() % async_msgr->cct->_conf->ms_inject_socket_failures == 0) {
+  // Use relaxed atomic load to avoid data race with config updates
+  auto inject_failures = std::atomic_load_explicit(
+    reinterpret_cast<const std::atomic<uint64_t>*>(&async_msgr->cct->_conf->ms_inject_socket_failures),
+    std::memory_order_relaxed);
+  if (inject_failures && cs) {
+    if (rand() % inject_failures == 0) {
       ldout(async_msgr->cct, 0) << __func__ << " injecting socket failure" << dendl;
       cs.shutdown();
     }
