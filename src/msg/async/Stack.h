@@ -243,7 +243,7 @@ class Worker {
   bool init = false;
 
  public:
-  bool done = false;
+  std::atomic_bool done = false;
 
   CephContext *cct;
   PerfCounters *perf_logger;
