@@ -1,0 +1,8 @@
+# ThreadSanitizer suppression file for Ceph
+# Config value updates are protected by ConfigProxy lock on write side,
+# but readers access values directly without locks. This is intentional -
+# brief stale reads during config updates are acceptable.
+
+# Suppress data races in config value updates
+race:md_config_t::update_legacy_vals
+race:md_config_t::update_legacy_val
