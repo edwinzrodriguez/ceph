@@ -15,6 +15,8 @@
  *
  */
 
+#include <atomic>
+
 #include "Infiniband.h"
 #include "common/errno.h"
 #include "common/debug.h"
@@ -403,8 +405,12 @@ int Infiniband::QueuePair::recv_cm_meta(CephContext *cct, int socket_fd)
   char gid[33];
   ssize_t r = ::read(socket_fd, &msg, sizeof(msg));
   // Drop incoming qpt
-  if (cct->_conf->ms_inject_socket_failures && socket_fd >= 0) {
-    if (rand() % cct->_conf->ms_inject_socket_failures == 0) {
+  // Use relaxed atomic load to avoid data race with config updates
+  auto inject_failures = std::atomic_load_explicit(
+    reinterpret_cast<const std::atomic<uint64_t>*>(&cct->_conf->ms_inject_socket_failures),
+    std::memory_order_relaxed);
+  if (inject_failures && socket_fd >= 0) {
+    if (rand() % inject_failures == 0) {
       ldout(cct, 0) << __func__ << " injecting socket failure" << dendl;
       return -EINVAL;
     }
@@ -441,8 +447,12 @@ retry:
                  << ", " << local_cm_meta.psn << ", " << local_cm_meta.peer_qpn << ", "  << gid  << dendl;
   r = ::write(socket_fd, msg, sizeof(msg));
   // Drop incoming qpt
-  if (cct->_conf->ms_inject_socket_failures && socket_fd >= 0) {
-    if (rand() % cct->_conf->ms_inject_socket_failures == 0) {
+  // Use relaxed atomic load to avoid data race with config updates
+  bool inject_failures = std::atomic_load_explicit(
+    reinterpret_cast<const std::atomic<uint64_t>*>(&cct->_conf->ms_inject_socket_failures),
+    std::memory_order_relaxed);
+  if (inject_failures && socket_fd >= 0) {
+    if (rand() % inject_failures == 0) {
       ldout(cct, 0) << __func__ << " injecting socket failure" << dendl;
       return -EINVAL;
     }
