@@ -16,6 +16,10 @@
 #ifndef CEPH_CONNECTION_H
 #define CEPH_CONNECTION_H
 
+#include <atomic>
+#include <stdlib.h>
+#include <ostream>
+
 #include "auth/Auth.h"
 #include "common/RefCountedObj.h"
 #include "common/config.h"
@@ -47,7 +51,7 @@ struct Connection : public RefCountedObjectSafe {
   utime_t last_keepalive, last_keepalive_ack;
   bool anon = false;  ///< anonymous outgoing connection
 private:
-  uint64_t features = 0;
+  std::atomic<uint64_t> features = 0;
 public:
   bool is_loopback = false;
   bool failed = false; // true if we are a lossy connection that has failed.
@@ -192,13 +196,14 @@ public:
   }
   void set_peer_addrs(const entity_addrvec_t& av) { peer_addrs = av; }
 
-  uint64_t get_features() const { return features; }
-  bool has_feature(uint64_t f) const { return features & f; }
+  uint64_t get_features() const { return features.load(std::memory_order_relaxed); }
+  bool has_feature(uint64_t f) const { return features.load(std::memory_order_relaxed) & f; }
   bool has_features(uint64_t f) const {
-    return (features & f) == f;
+    uint64_t feat = features.load(std::memory_order_relaxed);
+    return (feat & f) == f;
   }
-  void set_features(uint64_t f) { features = f; }
-  void set_feature(uint64_t f) { features |= f; }
+  void set_features(uint64_t f) { features.store(f, std::memory_order_relaxed); }
+  void set_feature(uint64_t f) { features.fetch_or(f, std::memory_order_relaxed); }
 
   virtual int get_con_mode() const {
     return CEPH_CON_MODE_CRC;
