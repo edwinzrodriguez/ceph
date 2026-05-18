@@ -2762,9 +2762,7 @@ private:
       return false;
     }
   }
-  void ms_fast_dispatch2(const MessageRef& m) override {
-    [[maybe_unused]] auto s = ms_dispatch2(m);
-  }
+  void ms_fast_dispatch2(const MessageRef& m) override;
 
   void handle_osd_op_reply(cref_t<MOSDOpReply> m);
   boost::system::error_code handle_osd_op_reply2(Op *op, const std::vector<OSDOp> &out_ops);
