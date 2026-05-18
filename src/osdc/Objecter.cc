@@ -1099,12 +1099,11 @@ void Objecter::ms_fast_dispatch2(const MessageRef& m)
     auto s = static_cast<OSDSession*>(priv.get());
     if (s) {
       s->track_enqueue(m, [this, priv, s, m]() {
-        cref_t<MOSDOpReply> msg = ref_cast<MOSDOpReply>(m);
         s->track_dequeue(m);
-        handle_osd_op_reply(std::move(msg));
+        handle_osd_op_reply(cref_cast<MOSDOpReply>(m));
       });
     } else {
-      handle_osd_op_reply(ref_cast<MOSDOpReply>(m));
+      handle_osd_op_reply(cref_cast<MOSDOpReply>(m));
     }
     return;
   }
@@ -1114,12 +1113,11 @@ void Objecter::ms_fast_dispatch2(const MessageRef& m)
     auto s = static_cast<OSDSession*>(priv.get());
     if (s) {
       s->track_enqueue(m, [this, priv, s, m]() {
-        cref_t<MWatchNotify> msg = ref_cast<MWatchNotify>(m);
         s->track_dequeue(m);
-        handle_watch_notify(std::move(msg));
+        handle_watch_notify(cref_cast<MWatchNotify>(m));
       });
     } else {
-      handle_watch_notify(ref_cast<MWatchNotify>(m));
+      handle_watch_notify(cref_cast<MWatchNotify>(m));
     }
     return;
   }
@@ -1138,12 +1136,11 @@ Dispatcher::dispatch_result_t Objecter::ms_dispatch2(const MessageRef& m)
     auto s = static_cast<OSDSession*>(priv.get());
     if (s) {
       s->track_enqueue(m, [this, priv, s, m]() {
-        cref_t<MOSDBackoff> msg = ref_cast<MOSDBackoff>(m);
         s->track_dequeue(m);
-        handle_osd_backoff(std::move(msg));
+        handle_osd_backoff(cref_cast<MOSDBackoff>(m));
       });
     } else {
-      handle_osd_backoff(ref_cast<MOSDBackoff>(m));
+      handle_osd_backoff(cref_cast<MOSDBackoff>(m));
     }
     return Dispatcher::HANDLED();
   }
@@ -1156,12 +1153,11 @@ Dispatcher::dispatch_result_t Objecter::ms_dispatch2(const MessageRef& m)
       auto s = static_cast<OSDSession*>(priv.get());
       if (s) {
         s->track_enqueue(m, [this, priv, s, m]() {
-          cref_t<MCommandReply> msg = ref_cast<MCommandReply>(m);
           s->track_dequeue(m);
-          handle_command_reply(std::move(msg));
+          handle_command_reply(cref_cast<MCommandReply>(m));
         });
       } else {
-        handle_command_reply(ref_cast<MCommandReply>(m));
+        handle_command_reply(cref_cast<MCommandReply>(m));
       }
       return Dispatcher::HANDLED();
     } else {
