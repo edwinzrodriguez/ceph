@@ -6,3 +6,6 @@
 # Suppress data races in config value updates
 race:md_config_t::update_legacy_vals
 race:md_config_t::update_legacy_val
+race:ceph::mutex_debug_detail::mutex_debugging_base::_will_lock
+race:ceph::mutex_debug_detail::mutex_debugging_base::_will_unlock
+race:ceph::mutex_debug_detail::mutex_debugging_base::_locked
