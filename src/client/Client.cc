@@ -104,6 +104,7 @@ using namespace std::literals::string_view_literals;
 #include "include/random.h"
 
 #include "Client.h"
+#include "ClientCaps.h"
 #include "Inode.h"
 #include "Dentry.h"
 #include "Delegation.h"
@@ -459,14 +460,17 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
   writeback_handler.reset(new ObjecterWriteback(objecter, &objecter_finisher,
   			    &cache_lock));
   objectcacher.reset(new ObjectCacher(cct, "libcephfs", *writeback_handler, cache_lock,
-				  client_flush_set_callback,    // all commit callback
-				  (void*)this,
-				  cct->_conf->client_oc_size,
-				  cct->_conf->client_oc_max_objects,
-				  cct->_conf->client_oc_max_dirty,
-				  cct->_conf->client_oc_target_dirty,
-				  cct->_conf->client_oc_max_dirty_age,
-				  true));
+  		  client_flush_set_callback,    // all commit callback
+  		  (void*)this,
+  		  cct->_conf->client_oc_size,
+  		  cct->_conf->client_oc_max_objects,
+  		  cct->_conf->client_oc_max_dirty,
+  		  cct->_conf->client_oc_target_dirty,
+  		  cct->_conf->client_oc_max_dirty_age,
+  		  true));
+  
+  // Initialize ClientCaps for capability management
+  client_caps.reset(new ClientCaps(this, cct, client_lock, cache_lock, objectcacher.get()));
 }
 
 

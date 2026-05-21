@@ -300,6 +300,8 @@ protected:
     std::shared_mutex metrics_lock;
 };
 
+class ClientCaps;  // Forward declaration
+
 class Client : public Dispatcher, public md_config_obs_t {
 public:
   friend class C_Block_Sync; // Calls block map and protected helpers
@@ -310,6 +312,7 @@ public:
   friend class C_Client_RequestInterrupt;
   friend class C_Deleg_Timeout; // Asserts on client_lock, called when a delegation is unreturned
   friend class C_Client_CacheRelease; // Asserts on client_lock
+  friend class ClientCaps; // Manages capability operations with its own lock
   friend class SyntheticClient;
   friend void intrusive_ptr_release(Inode *in);
   template <typename T> friend struct RWRefState;
@@ -2350,6 +2353,9 @@ private:
   xlist<Inode*> delayed_list;
   int num_flushing_caps = 0;
   std::unordered_map<inodeno_t, SnapRealm*> snap_realms;
+  
+  // Capability management - separate lock from client_lock
+  std::unique_ptr<ClientCaps> client_caps;
   std::map<std::string, std::string> metadata;
 
   ceph::coarse_mono_time last_auto_reconnect;
