@@ -218,7 +218,7 @@ void bench_write_worker(int thread_id,
                         std::stringstream& ss) {
 
   struct ceph_mount_info *cmount = shared_cmount;
-
+  ceph_pthread_setname(("wr-worker-" + std::to_string(thread_id)).c_str());
   if (config.per_thread_mount) {
     if (int rc = setup_mount(&cmount, config, ss); rc < 0) {
       ss << "Thread " << thread_id << " mount failed: " << strerror(-rc) << std::endl;
@@ -314,6 +314,7 @@ void bench_read_worker(int thread_id,
                        std::stringstream& ss) {
 
   struct ceph_mount_info *cmount = shared_cmount;
+  ceph_pthread_setname(("rd-worker-" + std::to_string(thread_id)).c_str());
 
   if (config.per_thread_mount) {
     if (int rc = setup_mount(&cmount, config, ss); rc < 0) {
