@@ -249,5 +249,27 @@ ceph::containers::tiny_vector<LockT> make_lock_container(
     }
   };
 }
+template<typename Mutex>
+class unique_unlock {
+public:
+  explicit unique_unlock(Mutex& m) : m_mutex(m) {
+    m_mutex.unlock();   // release on construction
+    m_owns = false;
+  }
+
+  ~unique_unlock() noexcept(false) {
+    if (!m_owns) {
+      m_mutex.lock();     // acquire on destruction
+      m_owns = true;
+    }
+  }
+
+  unique_unlock(const unique_unlock&) = delete;
+  unique_unlock& operator=(const unique_unlock&) = delete;
+
+private:
+  Mutex& m_mutex;
+  bool m_owns = false;
+};
 } // namespace ceph
 
