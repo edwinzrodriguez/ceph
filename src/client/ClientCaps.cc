@@ -67,6 +67,7 @@ void ClientCaps::dec_pinned_icaps(uint64_t nr)
 
 void ClientCaps::set_cap_epoch_barrier(epoch_t e)
 {
+  ldout(cct, 5) << __func__ << " epoch = " << e << dendl;
   std::scoped_lock lock(caps_lock);
   cap_epoch_barrier = e;
 }

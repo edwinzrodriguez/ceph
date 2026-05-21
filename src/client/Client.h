@@ -1074,8 +1074,6 @@ protected:
   bool _wrap_name(Inode& diri, std::string& dname, std::string& alternate_name);
   std::string _unwrap_name(Inode& diri, const std::string& dname, const std::string& alternate_name);
 
-  void set_cap_epoch_barrier(epoch_t e);
-
   bool handle_command_reply(const MConstRef<MCommandReply>& m);
   int fetch_fsmap(bool user);
   int resolve_mds(
@@ -2297,8 +2295,6 @@ private:
 
   int user_id, group_id;
   int acl_type = NO_ACL;
-
-  epoch_t cap_epoch_barrier = 0;
 
   // mds sessions
   map<mds_rank_t, MetaSessionRef> mds_sessions;  // mds -> push seq

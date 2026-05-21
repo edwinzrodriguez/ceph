@@ -638,7 +638,7 @@ void Client::dump_status(Formatter *f)
     f->dump_int("inode_count", inode_map.size());
     f->dump_int("mds_epoch", mdsmap->get_epoch());
     f->dump_int("osd_epoch", osd_epoch);
-    f->dump_int("osd_epoch_barrier", cap_epoch_barrier);
+    f->dump_int("osd_epoch_barrier", client_caps->get_cap_epoch_barrier());
     f->dump_bool("blocklisted", blocklisted);
     f->dump_string("fs_name", mdsmap->get_fs_name());
   }
@@ -3124,7 +3124,7 @@ void Client::_handle_full_flag(int64_t pool)
   }
 
   if (cancelled_epoch != (epoch_t)-1) {
-    set_cap_epoch_barrier(cancelled_epoch);
+    client_caps->set_cap_epoch_barrier(cancelled_epoch);
   }
 }
 
@@ -4131,8 +4131,8 @@ void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
 				   want,
 				   flush,
 				   cap->mseq,
-                                   cap->issue_seq,
-                                   cap_epoch_barrier);
+				                               cap->issue_seq,
+				                               client_caps->get_cap_epoch_barrier());
   /*
    * Since the setattr will check the cephx mds auth access before
    * buffering the changes, so it makes no sense any more to let
@@ -4463,8 +4463,8 @@ void Client::send_flush_snap(Inode *in, MetaSession *session,
 			     snapid_t follows, CapSnap& capsnap)
 {
   auto m = make_message<MClientCaps>(CEPH_CAP_OP_FLUSHSNAP,
-				     in->ino, in->snaprealm->ino, 0,
-				     in->auth_cap->mseq, cap_epoch_barrier);
+  		     in->ino, in->snaprealm->ino, 0,
+  		     in->auth_cap->mseq, client_caps->get_cap_epoch_barrier());
   /*
    * Since the setattr will check the cephx mds auth access before
    * buffering the changes, so it makes no sense any more to let
@@ -4920,7 +4920,7 @@ void Client::remove_cap(Cap *cap, bool queue_release)
       cap->cap_id,
       cap->issue_seq,
       cap->mseq,
-      cap_epoch_barrier);
+      client_caps->get_cap_epoch_barrier());
   } else {
     dec_pinned_icaps();
   }
@@ -5729,9 +5729,9 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
     objecter->set_epoch_barrier(m->osd_epoch_barrier);
   }
 
-  if (m->osd_epoch_barrier > cap_epoch_barrier) {
+  if (m->osd_epoch_barrier > client_caps->get_cap_epoch_barrier()) {
     // Record the barrier so that we will transmit it to MDS when releasing
-    set_cap_epoch_barrier(m->osd_epoch_barrier);
+    client_caps->set_cap_epoch_barrier(m->osd_epoch_barrier);
   }
 
   got_mds_push(session.get());
@@ -5782,7 +5782,7 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
       m->get_cap_id(),
       m->get_seq(),
       m->get_mseq(),
-      cap_epoch_barrier);
+      client_caps->get_cap_epoch_barrier());
 
     flush_cap_releases();
     return;
@@ -18937,18 +18937,6 @@ void Client::handle_client_reclaim_reply(const MConstRef<MClientReclaimReply>& r
   signal_cond_list(waiting_for_reclaim);
 }
 
-/**
- * This is included in cap release messages, to cause
- * the MDS to wait until this OSD map epoch.  It is necessary
- * in corner cases where we cancel RADOS ops, so that
- * nobody else tries to do IO to the same objects in
- * the same epoch as the cancelled ops.
- */
-void Client::set_cap_epoch_barrier(epoch_t e)
-{
-  ldout(cct, 5) << __func__ << " epoch = " << e << dendl;
-  cap_epoch_barrier = e;
-}
 
 int Client::get_perf_counters(bufferlist *outbl) {
   RWRef_t iref_reader(initialize_state, CLIENT_INITIALIZED);
