@@ -2347,7 +2347,6 @@ private:
   ceph_tid_t last_flush_tid = 1;
 
   xlist<Inode*> delayed_list;
-  int num_flushing_caps = 0;
   std::unordered_map<inodeno_t, SnapRealm*> snap_realms;
   
   // Capability management - separate lock from client_lock
@@ -2355,7 +2354,7 @@ private:
   std::map<std::string, std::string> metadata;
 
   ceph::coarse_mono_time last_auto_reconnect;
-  std::chrono::seconds caps_release_delay, mount_timeout;
+  std::chrono::seconds mount_timeout;
   int injected_write_delay_secs;
   // trace generation
   std::ofstream traceout;

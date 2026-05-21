@@ -124,7 +124,13 @@ public:
   
   // Statistics
   int get_num_flushing_caps() const { return num_flushing_caps; }
+  void inc_num_flushing_caps() { num_flushing_caps++; }
+  void dec_num_flushing_caps() { num_flushing_caps--; }
   ceph_tid_t get_last_flush_tid() const { return last_flush_tid; }
+  
+  // Caps release delay management
+  std::chrono::seconds get_caps_release_delay() const { return caps_release_delay; }
+  void set_caps_release_delay(std::chrono::seconds delay) { caps_release_delay = delay; }
   
   // Increment/decrement pinned icaps
   void inc_pinned_icaps();

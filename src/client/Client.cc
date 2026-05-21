@@ -428,8 +428,7 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
   mount_timeout = cct->_conf.get_val<std::chrono::seconds>(
     "client_mount_timeout");
 
-  caps_release_delay = cct->_conf.get_val<std::chrono::seconds>(
-    "client_caps_release_delay");
+  // caps_release_delay is now managed by ClientCaps
 
   injected_write_delay_secs = std::chrono::duration<int>(
     cct->_conf.get_val<std::chrono::seconds>("client_inject_write_delay_secs")).count();
@@ -4069,7 +4068,7 @@ void Client::cap_delay_requeue(Inode *in)
 {
   ldout(cct, 10) << __func__ << " on " << *in << dendl;
 
-  in->hold_caps_until = ceph::coarse_mono_clock::now() + caps_release_delay;
+  in->hold_caps_until = ceph::coarse_mono_clock::now() + client_caps->get_caps_release_delay();
   delayed_list.push_back(&in->delay_cap_item);
 }
 
@@ -5185,7 +5184,7 @@ int Client::mark_caps_flushing(Inode *in, ceph_tid_t* ptid)
 
   if (!in->flushing_caps) {
     ldout(cct, 10) << __func__ << " " << ccap_string(flushing) << " " << *in << dendl;
-    num_flushing_caps++;
+    client_caps->inc_num_flushing_caps();
   } else {
     ldout(cct, 10) << __func__ << " (more) " << ccap_string(flushing) << " " << *in << dendl;
   }
@@ -5260,7 +5259,7 @@ void Client::wait_sync_caps(ceph_tid_t want)
 {
  retry:
   ldout(cct, 10) << __func__ << " want " << want  << " (last is " << last_flush_tid << ", "
-	   << num_flushing_caps << " total flushing)" << dendl;
+    << client_caps->get_num_flushing_caps() << " total flushing)" << dendl;
   for (auto &p : mds_sessions) {
     auto s = p.second;
     if (s->flushing_caps_tids.empty())
@@ -5908,7 +5907,7 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, con
       in->flushing_caps &= ~cleaned;
       if (in->flushing_caps == 0) {
 	ldout(cct, 10) << " " << *in << " !flushing" << dendl;
-	num_flushing_caps--;
+	client_caps->dec_num_flushing_caps();
        if (in->flushing_cap_tids.empty())
 	  in->flushing_cap_item.remove_myself();
       }
@@ -18973,8 +18972,8 @@ void Client::handle_conf_change(const ConfigProxy& conf,
       "client_collect_and_send_global_metrics");
   }
   if (changed.count("client_caps_release_delay")) {
-    caps_release_delay = cct->_conf.get_val<std::chrono::seconds>(
-      "client_caps_release_delay");
+    client_caps->set_caps_release_delay(cct->_conf.get_val<std::chrono::seconds>(
+      "client_caps_release_delay"));
   }
   if (changed.count("client_mount_timeout")) {
     mount_timeout = cct->_conf.get_val<std::chrono::seconds>(
