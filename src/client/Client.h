@@ -1298,6 +1298,10 @@ protected:
   //  - protects Client and buffer cache both!
   ceph::mutex client_lock = ceph::make_mutex("Client::client_lock");
 
+  // objectcacher lock
+  ceph::mutex cache_lock = ceph::make_mutex("Client::cache_lock");
+
+
   std::map<snapid_t, int> ll_snap_ref;
 
   InodeRef               root = nullptr;
