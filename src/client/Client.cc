@@ -4953,61 +4953,8 @@ void Client::remove_all_caps(Inode *in)
 
 void Client::remove_session_caps(MetaSession *s, int err)
 {
-  ldout(cct, 10) << __func__ << " mds." << s->mds_num << dendl;
-
-  while (s->caps.size()) {
-    Cap *cap = *s->caps.begin();
-    InodeRef in(&cap->inode);
-    bool dirty_caps = false;
-    if (in->auth_cap == cap) {
-      dirty_caps = in->dirty_caps | in->flushing_caps;
-      in->wanted_max_size = 0;
-      in->requested_max_size = 0;
-      if (in->has_any_filelocks())
-	in->flags |= I_ERROR_FILELOCK;
-    }
-    auto caps = cap->implemented;
-    if (cap->wanted | cap->issued)
-      in->flags |= I_CAP_DROPPED;
-    remove_cap(cap, false);
-    in->cap_snaps.clear();
-    if (dirty_caps) {
-      lderr(cct) << __func__ << " still has dirty|flushing caps on " << *in << dendl;
-      if (in->flushing_caps) {
-	num_flushing_caps--;
-	in->flushing_cap_tids.clear();
-      }
-      in->flushing_caps = 0;
-      in->mark_caps_clean();
-      put_inode(in.get());
-    }
-    caps &= CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_BUFFER;
-    if (caps && !in->caps_issued_mask(caps, true)) {
-      if (err == -EBLOCKLISTED) {
-	if (in->oset.dirty_or_tx) {
-	  lderr(cct) << __func__ << " still has dirty data on " << *in << dendl;
-	  in->set_async_err(err);
-	}
-	       {
-	         ceph::unique_unlock u(client_lock);
-	         std::scoped_lock l(cache_lock);
-	         objectcacher->purge_set(&in->oset);
-	       }
-	     } else {
-	       {
-	         ceph::unique_unlock u(client_lock);
-	         std::scoped_lock l(cache_lock);
-	         objectcacher->release_set(&in->oset);
-	       }
-	     }
-      _schedule_invalidate_callback(in.get(), 0, 0);
-    }
-
-    ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
-    signal_caps_inode(in.get());
-  }
-  s->flushing_caps_tids.clear();
-  sync_cond.notify_all();
+  // Delegate to ClientCaps for the core caps removal logic
+  client_caps->remove_session_caps(s, err);
 }
 
 std::pair<int, bool> Client::_do_remount(bool retry_on_error)

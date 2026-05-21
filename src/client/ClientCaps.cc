@@ -282,7 +282,7 @@ void ClientCaps::remove_session_caps(MetaSession *s, int err)
     remove_cap(cap, false);
     in->cap_snaps.clear();
     if (dirty_caps) {
-      lderr(cct) << __func__ << " still has dirty|flushing caps on " 
+      lderr(cct) << __func__ << " still has dirty|flushing caps on "
                  << *in << dendl;
       if (in->flushing_caps) {
         num_flushing_caps--;
@@ -292,8 +292,30 @@ void ClientCaps::remove_session_caps(MetaSession *s, int err)
       in->mark_caps_clean();
       client->put_inode(in.get());
     }
-    client->signal_context_list(in->waitfor_caps);
-    client->signal_context_list(in->waitfor_commit);
+    caps &= CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_BUFFER;
+    if (caps && !in->caps_issued_mask(caps, true)) {
+      if (err == -EBLOCKLISTED) {
+        if (in->oset.dirty_or_tx) {
+          lderr(cct) << __func__ << " still has dirty data on " << *in << dendl;
+          in->set_async_err(err);
+        }
+        {
+          ceph::unique_unlock u(client_lock);
+          std::scoped_lock l(cache_lock);
+          objectcacher->purge_set(&in->oset);
+        }
+      } else {
+        {
+          ceph::unique_unlock u(client_lock);
+          std::scoped_lock l(cache_lock);
+          objectcacher->release_set(&in->oset);
+        }
+      }
+      client->_schedule_invalidate_callback(in.get(), 0, 0);
+    }
+
+    ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
+    client->signal_caps_inode(in.get());
   }
   s->flushing_caps_tids.clear();
   client->sync_cond.notify_all();
