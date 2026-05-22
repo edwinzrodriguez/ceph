@@ -46,6 +46,7 @@
 #include "InodeRef.h"
 #include "MetaSession.h"
 #include "UserPerm.h"
+#include "reentrant_lock.h"
 
 #if defined(__linux__)
 #include "FSCrypt.h"
@@ -1182,13 +1183,29 @@ protected:
   /*
    * Resolve file descriptor, or return NULL.
    */
-  Fh *get_filehandle(int fd) {
+  Fh *_get_filehandle(int fd) {
+    ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+
     auto it = fd_map.find(fd);
     if (it == fd_map.end())
       return NULL;
     return it->second;
   }
-  int get_fd_inode(int fd, InodeRef *in);
+
+  Fh *get_filehandle(int fd) {
+    ceph_assert(ceph_mutex_is_not_locked_by_me(client_lock));
+
+    std::scoped_lock lock(client_lock);
+    return _get_filehandle(fd);
+  }
+  int _get_fd_inode(int fd, InodeRef *in);
+  int get_fd_inode(int fd, InodeRef *in)
+  {
+    ceph_assert(ceph_mutex_is_not_locked_by_me(client_lock));
+    std::scoped_lock lock(client_lock);
+    return _get_fd_inode(fd, in);
+  }
+
   bool _ll_fh_exists(Fh *f) {
     return ll_unclosed_fh_set.count(f);
   }

@@ -22,8 +22,9 @@
 #include "common/ceph_time.h"
 #include "mds/mdstypes.h"
 #include "InodeRef.h"
-
+#include "include/Context.h"
 #include <chrono>
+#include "reentrant_lock.h"
 
 class Client;
 class Inode;
@@ -87,7 +88,8 @@ public:
   
   // Capability snapshots
   void queue_cap_snap(Inode *in, const class SnapContext &old_snapc);
-  
+  void finish_cap_snap(Inode *in, CapSnap &capsnap, int used);
+
   // Capability synchronization
   void submit_sync_caps(Inode *in, ceph_tid_t want, class Context *onfinish);
   void wait_sync_caps(Inode *in, ceph_tid_t want);
@@ -136,6 +138,14 @@ public:
   void inc_pinned_icaps();
   void dec_pinned_icaps(uint64_t nr = 1);
 
+  static bool is_max_size_approaching(Inode *in);
+  static int adjust_caps_used_for_lazyio(int used, int issued, int implemented);
+  void wait_on_context_list(std::vector<Context*>& ls);
+  void signal_context_list(std::vector<Context*>& ls) {
+    finish_contexts(cct, ls, 0);
+  }
+  void signal_caps_inode(Inode *in);
+
 private:
   Client *client;
   CephContext *cct;
@@ -151,7 +161,8 @@ private:
   
   // Caps-specific lock - protects all caps state
   mutable ceph::mutex caps_lock = ceph::make_mutex("ClientCaps::caps_lock");
-  
+  // mutable ReentrantLock caps_lock = make_reentrant("ClientCaps::caps_lock");
+
   // Capability state
   ceph::coarse_mono_time last_cap_renew;
   epoch_t cap_epoch_barrier = 0;

@@ -1,0 +1,169 @@
+//
+// Created by edrodrig on 5/22/26.
+//
+
+#ifndef CEPH_REENTRANT_LOCK_H
+#define CEPH_REENTRANT_LOCK_H
+
+#include <common/ceph_mutex.h>
+
+namespace ceph {
+
+template <class Mutex>
+class ReentrantLockImpl {
+  Mutex mtx;                    // The real mutex for waiting
+  std::atomic<std::thread::id> owner{};
+  std::atomic<int> recursion_count{0};  // Or plain int + proper fencing
+
+public:
+  ReentrantLockImpl() = default;
+
+  template <typename ...Args>
+  explicit ReentrantLockImpl(Args&& ...args) : mtx(std::forward<Args>(args)...) {}
+
+  void lock() {
+    auto tid = std::this_thread::get_id();
+
+    // Fast path: already owner
+    if (owner.load(std::memory_order_acquire) == tid) {
+      ++recursion_count;   // No atomic needed here (we own it)
+      return;
+    }
+
+    // Slow path
+    mtx.lock();              // Now we have exclusive access
+
+    owner.store(tid, std::memory_order_release);
+    recursion_count.store(1, std::memory_order_relaxed);
+  }
+
+  void unlock() {
+    ceph_assert(owner == std::this_thread::get_id());
+    // Assert or handle error in debug: owner == tid
+
+    if (--recursion_count == 0) {
+      owner.store({}, std::memory_order_release);
+      mtx.unlock();
+    }
+  }
+
+  Mutex& native_mutex() { return mtx; }  // For condition_variable
+
+  bool is_locked() const {
+    return (recursion_count > 0);
+  }
+  bool is_locked_by_me() const {
+    if (recursion_count.load(std::memory_order_acquire) <= 0) {
+      return false;
+    }
+    return owner.load(std::memory_order_relaxed) == std::this_thread::get_id();
+  }
+
+  operator bool() const {
+    return is_locked_by_me();
+  }
+
+  // Called by reentrant_condition_variable before blocking: saves recursion
+  // depth and marks the lock as released so other threads can acquire it.
+  int release_for_wait() noexcept {
+    int saved = recursion_count.load(std::memory_order_relaxed);
+    owner.store({}, std::memory_order_release);
+    recursion_count.store(0, std::memory_order_relaxed);
+    return saved;
+  }
+
+  // Called by reentrant_condition_variable after waking: restores the saved
+  // recursion depth and re-establishes ownership for the current thread.
+  void restore_after_wait(int saved) noexcept {
+    owner.store(std::this_thread::get_id(), std::memory_order_release);
+    recursion_count.store(saved, std::memory_order_relaxed);
+  }
+};
+
+using ReentrantLock = ReentrantLockImpl<ceph::mutex>;
+
+template <typename ...Args>
+ReentrantLock make_reentrant(Args&& ...args) {
+  return ReentrantLock(std::forward<Args>(args)...);
+}
+
+// condition_variable that accepts std::unique_lock<ReentrantLock>.
+//
+// On wait, the lock's full recursion depth is saved and the underlying native
+// mutex is handed to the real condition_variable.  On wakeup the recursion
+// depth is restored, so the caller re-emerges holding the lock with the same
+// count as before the wait.
+class reentrant_condition_variable {
+  ceph::condition_variable cv;
+
+  // RAII helper: releases all recursion levels before a wait and restores
+  // them afterwards.  Keeps a unique_lock on the native mutex so the
+  // real condition_variable can atomically unlock+sleep.
+  struct Guard {
+    ReentrantLock& rl;
+    int saved;
+    std::unique_lock<ceph::mutex> nl;
+
+    explicit Guard(std::unique_lock<ReentrantLock>& lock)
+      : rl(*lock.mutex()),
+        saved(rl.release_for_wait()),
+        nl(rl.native_mutex(), std::adopt_lock) {}
+
+    ~Guard() {
+      nl.release();               // native mutex stays locked; rl takes it back
+      rl.restore_after_wait(saved);
+    }
+  };
+
+public:
+  void wait(std::unique_lock<ReentrantLock>& lock) {
+    Guard g(lock);
+    cv.wait(g.nl);
+  }
+
+  template <class Predicate>
+  void wait(std::unique_lock<ReentrantLock>& lock, Predicate pred) {
+    while (!pred()) wait(lock);
+  }
+
+  template <class Rep, class Period>
+  std::cv_status wait_for(std::unique_lock<ReentrantLock>& lock,
+                          const std::chrono::duration<Rep, Period>& rel_time) {
+    Guard g(lock);
+    return cv.wait_for(g.nl, rel_time);
+  }
+
+  template <class Rep, class Period, class Predicate>
+  bool wait_for(std::unique_lock<ReentrantLock>& lock,
+                const std::chrono::duration<Rep, Period>& rel_time,
+                Predicate pred) {
+    return wait_until(lock,
+                      std::chrono::steady_clock::now() + rel_time,
+                      std::move(pred));
+  }
+
+  template <class Clock, class Duration>
+  std::cv_status wait_until(std::unique_lock<ReentrantLock>& lock,
+                            const std::chrono::time_point<Clock, Duration>& abs_time) {
+    Guard g(lock);
+    return cv.wait_until(g.nl, abs_time);
+  }
+
+  template <class Clock, class Duration, class Predicate>
+  bool wait_until(std::unique_lock<ReentrantLock>& lock,
+                  const std::chrono::time_point<Clock, Duration>& abs_time,
+                  Predicate pred) {
+    while (!pred()) {
+      if (wait_until(lock, abs_time) == std::cv_status::timeout) {
+        return pred();
+      }
+    }
+    return true;
+  }
+
+  void notify_one() noexcept { cv.notify_one(); }
+  void notify_all() noexcept { cv.notify_all(); }
+};
+
+} // namespace ceph
+#endif //CEPH_REENTRANT_LOCK_H

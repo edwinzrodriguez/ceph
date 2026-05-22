@@ -99,6 +99,7 @@ void Inode::print(std::ostream& out) const
 
 void Inode::make_long_path(filepath& p)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (!dentries.empty()) {
     Dentry *dn = get_first_parent();
     ceph_assert(dn->dir && dn->dir->parent_inode);
@@ -112,6 +113,7 @@ void Inode::make_long_path(filepath& p)
 
 void Inode::make_short_path(filepath& p)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (!dentries.empty()) {
     Dentry *dn = get_first_parent();
     ceph_assert(dn->dir && dn->dir->parent_inode);
@@ -127,6 +129,7 @@ void Inode::make_short_path(filepath& p)
  */
 bool Inode::make_path_string(std::string& s)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (client->_get_root_ino(false) == ino) {
     return true;
   } else if (!dentries.empty()) {
@@ -145,6 +148,7 @@ bool Inode::make_path_string(std::string& s)
  */
 void Inode::make_nosnap_relative_path(filepath& p)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (snapid == CEPH_NOSNAP) {
     p = filepath(ino);
   } else if (snapdir_parent) {
@@ -164,6 +168,7 @@ void Inode::make_nosnap_relative_path(filepath& p)
 void Inode::get_open_ref(int mode)
 {
   client->inc_opened_files();
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (open_by_mode[mode] == 0) {
     client->inc_opened_inodes();
   }
@@ -173,6 +178,7 @@ void Inode::get_open_ref(int mode)
 
 bool Inode::put_open_ref(int mode)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   //cout << "open_by_mode[" << mode << "] " << open_by_mode[mode] << " -> " << (open_by_mode[mode]-1) << std::endl;
   auto& ref = open_by_mode.at(mode);
   ceph_assert(ref > 0);
@@ -186,6 +192,7 @@ bool Inode::put_open_ref(int mode)
 
 void Inode::get_cap_ref(int cap)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   int n = 0;
   while (cap) {
     if (cap & 1) {
@@ -200,6 +207,7 @@ void Inode::get_cap_ref(int cap)
 
 bool Inode::is_last_cap_ref(int c)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (c != CEPH_CAP_FILE_BUFFER) {
     return cap_refs[c] == 0;
   }
@@ -214,6 +222,7 @@ bool Inode::is_last_cap_ref(int c)
 
 int Inode::put_cap_ref(int cap)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   int last = 0;
   int n = 0;
   while (cap) {
@@ -236,6 +245,7 @@ int Inode::put_cap_ref(int cap)
 
 bool Inode::is_any_caps()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   return !caps.empty() || snap_caps;
 }
 
@@ -254,6 +264,7 @@ bool Inode::cap_is_valid(const Cap &cap) const
 
 int Inode::caps_issued(int *implemented) const
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   int c = snap_caps;
   int i = 0;
   for (const auto &[mds, cap] : caps) {
@@ -275,6 +286,7 @@ int Inode::caps_issued(int *implemented) const
 
 void Inode::try_touch_cap(mds_rank_t mds)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   auto it = caps.find(mds);
   if (it != caps.end()) {
     it->second.touch();
@@ -300,6 +312,7 @@ void Inode::try_touch_cap(mds_rank_t mds)
  */
 bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   int c = snap_caps;
   int i = 0;
 
@@ -345,6 +358,7 @@ bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
 
 int Inode::caps_used()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   int w = 0;
   for (const auto &[cap, cnt] : cap_refs)
     if (cnt)
@@ -354,6 +368,7 @@ int Inode::caps_used()
 
 int Inode::caps_file_wanted()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   int want = 0;
   for (const auto &[mode, cnt] : open_by_mode)
     if (cnt) {
@@ -379,6 +394,7 @@ int Inode::caps_wanted()
 
 int Inode::caps_mds_wanted()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   int want = 0;
   for (const auto &pair : caps) {
     want |= pair.second.wanted;
@@ -388,11 +404,13 @@ int Inode::caps_mds_wanted()
 
 int Inode::caps_dirty()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   return dirty_caps | flushing_caps;
 }
 
 const UserPerm* Inode::get_best_perms()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   const UserPerm *perms = NULL;
   for (const auto &pair : caps) {
     const UserPerm& iperm = pair.second.latest_perms;
@@ -423,6 +441,7 @@ bool Inode::have_valid_size()
 // open Dir for an inode.  if it's not open, allocated it (and pin dentry in memory).
 Dir *Inode::open_dir()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (!dir) {
     dir = new Dir(this);
     lsubdout(client->cct, client, 15) << "open_dir " << dir << " on " << this << dendl;
@@ -449,6 +468,7 @@ bool Inode::check_mode(const UserPerm& perms, unsigned want)
 
 void Inode::dump(Formatter *f) const
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   f->dump_stream("ino") << ino;
   f->dump_stream("snapid") << snapid;
   if (rdev)
@@ -608,6 +628,7 @@ void Inode::dump(Formatter *f) const
 
 void Cap::dump(Formatter *f) const
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode.inode_lock));
   f->dump_int("mds", session->mds_num);
   f->dump_stream("ino") << inode.ino;
   f->dump_unsigned("cap_id", cap_id);
@@ -648,6 +669,7 @@ void CapSnap::dump(Formatter *f) const
 
 void Inode::set_async_err(int r)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   for (const auto &fh : fhs) {
     fh->async_err = r;
   }
@@ -655,6 +677,7 @@ void Inode::set_async_err(int r)
 
 bool Inode::has_recalled_deleg()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (delegations.empty())
     return false;
 
@@ -665,6 +688,7 @@ bool Inode::has_recalled_deleg()
 
 bool Inode::is_write_delegated()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (delegations.empty()) {
     return false;
   }
@@ -680,6 +704,7 @@ bool Inode::is_write_delegated()
 
 void Inode::recall_deleg(bool skip_read)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (delegations.empty())
     return;
 
@@ -694,6 +719,7 @@ void Inode::recall_deleg(bool skip_read)
 
 bool Inode::delegations_broken(bool skip_read)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (delegations.empty()) {
     lsubdout(client->cct, client, 10) <<
 	  __func__ << ": delegations empty on " << *this << dendl;
@@ -737,6 +763,7 @@ void Inode::break_deleg(bool skip_read)
  */
 int Inode::set_deleg(Fh *fh, unsigned type, ceph_deleg_cb_t cb, void *priv)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   lsubdout(client->cct, client, 10) <<
 	  __func__ << ": inode " << *this << dendl;
 
@@ -815,6 +842,7 @@ int Inode::set_deleg(Fh *fh, unsigned type, ceph_deleg_cb_t cb, void *priv)
  */
 void Inode::unset_deleg(Fh *fh)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   for (list<Delegation>::iterator d = delegations.begin();
        d != delegations.end(); ++d) {
     Delegation& deleg = *d;
@@ -835,6 +863,7 @@ void Inode::unset_deleg(Fh *fh)
 */
 void Inode::mark_caps_dirty(int caps)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   /*
    * If auth_cap is nullptr means the reonnecting is not finished or
    * already rejected.
@@ -863,6 +892,7 @@ void Inode::mark_caps_dirty(int caps)
 */
 void Inode::mark_caps_clean()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   lsubdout(client->cct, client, 10) << __func__ << " " << *this << dendl;
   dirty_caps = 0;
   dirty_cap_item.remove_myself();
@@ -876,6 +906,7 @@ FSCryptContextRef Inode::init_fscrypt_ctx(FSCrypt *fscrypt)
 
 void Inode::gen_inherited_fscrypt_auth(std::vector<uint8_t> *fsa)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (!fscrypt_ctx) {
     //TODO:Revisit to make sure that we do not skip entire subtree somehow
     return;
@@ -894,6 +925,7 @@ void Inode::gen_inherited_fscrypt_auth(std::vector<uint8_t> *fsa)
 #endif
 uint64_t Inode::effective_size() const
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (fscrypt_file.size() < sizeof(uint64_t) || !client->get_fscrypt_as()) {
     return size;
   }
@@ -903,6 +935,7 @@ uint64_t Inode::effective_size() const
 
 void Inode::set_effective_size(uint64_t size)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode_lock));
   if (fscrypt_file.size() < sizeof(uint64_t)) {
     fscrypt_file.resize(sizeof(uint64_t));
   }
