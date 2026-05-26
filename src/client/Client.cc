@@ -7128,28 +7128,42 @@ relookup:
     ldout(cct, 20) << __func__ << " have " << *dn << " from mds." << dn->lease_mds
         << " ttl " << dn->lease_ttl << " seq " << dn->lease_seq << dendl;
 
-    if (!dn->inode || dn->inode->caps_issued_mask(mask, true)) {
+    bool has_caps = false;
+    if (dn->inode) {
+      std::unique_lock in_lock(dn->inode->inode_lock);
+      has_caps = dn->inode->caps_issued_mask(mask, true);
+    }
+    
+    if (!dn->inode || has_caps) {
       ldout(cct, 25) << __func__ << " no inode or have caps" << dendl;
 
       if (_dentry_valid(dn)) {
         ldout(cct, 25) << __func__ << " dentry is valid" << dendl;
         // touch this mds's dir cap too, even though we don't _explicitly_ use it here, to
         // make trim_caps() behave.
-        dir->try_touch_cap(dn->lease_mds);
+        {
+          std::unique_lock dir_lock(dir->inode_lock);
+          dir->try_touch_cap(dn->lease_mds);
+        }
           goto hit_dn;
       }
       // dir shared caps?
-      if (dir->caps_issued_mask(CEPH_CAP_FILE_SHARED, true)) {
+      bool dir_has_caps = false;
+      {
+        std::unique_lock dir_lock(dir->inode_lock);
+        dir_has_caps = dir->caps_issued_mask(CEPH_CAP_FILE_SHARED, true);
+      }
+      if (dir_has_caps) {
         ldout(cct, 25) << __func__ << " dir has Fs" << dendl;
-	if (dn->cap_shared_gen == dir->shared_gen) {
+ if (dn->cap_shared_gen == dir->shared_gen) {
           ldout(cct, 25) << __func__ << " valid shared_gen match" << dendl;
-	  goto hit_dn;
+   goto hit_dn;
         }
-	if (!dn->inode && (dir->flags & I_COMPLETE)) {
-	  ldout(cct, 10) << __func__ << " concluded ENOENT locally for "
-			 << *dir << " dn '" << dname << "'" << dendl;
-	  return -ENOENT;
-	}
+ if (!dn->inode && (dir->flags & I_COMPLETE)) {
+   ldout(cct, 10) << __func__ << " concluded ENOENT locally for "
+    << *dir << " dn '" << dname << "'" << dendl;
+   return -ENOENT;
+ }
       }
     } else {
       ldout(cct, 20) << " no cap on " << dn->inode->vino() << dendl;
@@ -7180,7 +7194,10 @@ relookup:
     r = 0;
     goto done;
   }
-  r = _do_lookup(dir, dname, mask, target, perms);
+  {
+    std::unique_lock dir_lock(dir->inode_lock);
+    r = _do_lookup(dir, dname, mask, target, perms);
+  }
   did_lookup_request = true;
   if (r == 0) {
     /* complete lookup to get dentry for alternate_name */
@@ -7291,33 +7308,35 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
       rc = -ENOTDIR;
       goto out;
     }
-    std::unique_lock in_lock(diri->inode_lock);
-    if (should_check_perms()) {
-      int r = may_lookup(diri.get(), perms);
-      if (r < 0) {
-        rc = r;
+    {
+      std::unique_lock in_lock(diri->inode_lock);
+      if (should_check_perms()) {
+        int r = may_lookup(diri.get(), perms);
+        if (r < 0) {
+          rc = r;
+          goto out;
+        }
+        caps = CEPH_CAP_AUTH_SHARED;
+      }
+
+      if (dname.size() > NAME_MAX) {
+        rc = -ENAMETOOLONG;
         goto out;
       }
-      caps = CEPH_CAP_AUTH_SHARED;
-    }
 
-    if (dname.size() > NAME_MAX) {
-      rc = -ENAMETOOLONG;
-      goto out;
-    }
+      // N.B.: we don't validate alternate_name we generate during wrapping
+      // matches the dentry. We probably should!
+      if (!_wrap_name(*diri, dname, alternate_name)) {
+        rc = -EACCES;
+        goto out;
+      }
 
-    // N.B.: we don't validate alternate_name we generate during wrapping
-    // matches the dentry. We probably should!
-    if (!_wrap_name(*diri, dname, alternate_name)) {
-      rc = -EACCES;
-      goto out;
-    }
+      dn = get_or_create(diri.get(), dname.c_str());
 
-    dn = get_or_create(diri.get(), dname.c_str());
-
-    /* Get extra requested caps on the last component */
-    if (i == (path.depth() - 1)) {
-      caps |= extra_options.mask;
+      /* Get extra requested caps on the last component */
+      if (i == (path.depth() - 1)) {
+        caps |= extra_options.mask;
+      }
     }
 
     int r = _lookup(diri, dname, alternate_name, caps, &next, perms, extra_options.is_rename);
