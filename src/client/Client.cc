@@ -5055,7 +5055,10 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
       case CEPH_CAP_OP_TRUNC: return handle_cap_trunc(session.get(), in, m);
       case CEPH_CAP_OP_IMPORT:
       case CEPH_CAP_OP_REVOKE:
-      case CEPH_CAP_OP_GRANT: return handle_cap_grant(session.get(), in, &cap, m);
+      case CEPH_CAP_OP_GRANT: {
+        std::unique_lock in_lock(in->inode_lock);
+        return handle_cap_grant(session.get(), in, &cap, m);
+      }
       case CEPH_CAP_OP_FLUSH_ACK: return handle_cap_flush_ack(session.get(), in, &cap, m);
     }
   } else {
@@ -7032,6 +7035,7 @@ int Client::_do_lookup(const InodeRef& dir, const string& name, int mask,
 
   ldout(cct, 10) << __func__ << " on " << path << dendl;
 
+  unique_unlock in_unlock(dir->inode_lock);
   int r = make_request(req, perms, target);
   ldout(cct, 10) << __func__ << " res is " << r << dendl;
   return r;
@@ -7130,6 +7134,7 @@ relookup:
 
     bool has_caps = false;
     if (dn->inode) {
+      unique_unlock unlock(client_lock);
       std::unique_lock in_lock(dn->inode->inode_lock);
       has_caps = dn->inode->caps_issued_mask(mask, true);
     }
@@ -10047,16 +10052,22 @@ int Client::create_and_open(int dirfd, const char *relpath, int flags,
 
   if (!in && (flags & O_CREAT)) {
     if (should_check_perms()) {
-      r = may_create(wdr.diri, perms);
+      {
+        std::unique_lock diri_lock(wdr.diri->inode_lock);
+        r = may_create(wdr.diri, perms);
+      }
       if (r < 0)
         goto out;
     }
     if (alternate_name.empty()) {
       alternate_name = wdr.alternate_name;
     }
-    r = _create(wdr, flags, mode, &in, &fh, stripe_unit,
-                stripe_count, object_size, data_pool, &created, perms,
-                std::move(alternate_name), fscrypt_options);
+    {
+      std::unique_lock diri_lock(wdr.diri->inode_lock);
+      r = _create(wdr, flags, mode, &in, &fh, stripe_unit,
+                      stripe_count, object_size, data_pool, &created, perms,
+                      std::move(alternate_name), fscrypt_options);
+    }
     if (r < 0)
       goto out;
   }
@@ -15421,7 +15432,10 @@ int Client::_create(const walk_dentry_result& wdr, int flags, mode_t mode,
   if (xattrs_bl.length() > 0)
     req->set_data(xattrs_bl);
 
-  res = make_request(req, perms, inp, created);
+  {
+    unique_unlock in_unlock(wdr.diri->inode_lock);
+    res = make_request(req, perms, inp, created);
+  }
   if (res < 0) {
     goto reply_error;
   }
@@ -15439,6 +15453,8 @@ int Client::_create(const walk_dentry_result& wdr, int flags, mode_t mode,
     }
 #endif
 
+    unique_unlock in_unlock(wdr.diri->inode_lock);
+    std::unique_lock inp_lock((*inp)->inode_lock);
     (*inp)->get_open_ref(cmode);
     *fhp = _create_fh(inp->get(), flags, cmode, perms);
   }

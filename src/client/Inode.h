@@ -23,6 +23,7 @@
 #include "MetaSession.h"
 #include "UserPerm.h"
 #include "Delegation.h"
+#include "reentrant_lock.h"
 
 #include "FSCrypt.h"
 
@@ -127,7 +128,8 @@ struct Inode : RefCountedObject {
   ceph::coarse_mono_time hold_caps_until;
   Client *client;
 
-  ceph::mutex inode_lock = ceph::make_mutex("Inode::inode_lock");
+  // ceph::mutex inode_lock = ceph::make_mutex("Inode::inode_lock");
+  ceph::ReentrantLock inode_lock = ceph::make_reentrant("Inode::inode_lock");
 
   // -- the actual inode --
   inodeno_t ino; // ORDER DEPENDENCY: oset
