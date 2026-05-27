@@ -445,6 +445,7 @@ void ClientCaps::cap_delay_requeue(Inode *in)
   ldout(cct, 10) << __func__ << " on " << *in << dendl;
 
   in->hold_caps_until = ceph::coarse_mono_clock::now() + caps_release_delay;
+  std::unique_lock in_lock(caps_lock);
   delayed_list.push_back(&in->delay_cap_item);
 }
 
@@ -831,6 +832,7 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 
   int r = 0;
   {
+    unique_unlock in_unlock(in->inode_lock);
     std::unique_lock lock(client->client_lock);
     r = client->check_pool_perm(in, need);
     if (r < 0)

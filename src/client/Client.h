@@ -1172,11 +1172,13 @@ protected:
   InodeRef open_snapdir(const InodeRef& diri);
 
   int get_fd() {
+    ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
     int fd = free_fd_set.range_start();
     free_fd_set.erase(fd, 1);
     return fd;
   }
   void put_fd(int fd) {
+    ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
     free_fd_set.insert(fd, 1);
   }
 
@@ -1316,6 +1318,7 @@ protected:
   // global client lock
   //  - protects Client and buffer cache both!
   ceph::mutex client_lock = ceph::make_mutex("Client::client_lock");
+  // ReentrantLock client_lock = make_reentrant("Client::client_lock", false);
 
   // objectcacher lock
   ceph::mutex cache_lock = ceph::make_mutex("Client::cache_lock");
