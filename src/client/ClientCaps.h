@@ -51,8 +51,7 @@ namespace ceph {
  */
 class ClientCaps {
 public:
-  ClientCaps(Client *client, CephContext *cct, ceph::mutex &client_lock,
-             ceph::mutex &cache_lock, ObjectCacher *objectcacher);
+  ClientCaps(Client *client, CephContext *cct);
   ~ClientCaps();
 
   // Capability checking and issuing
@@ -149,19 +148,10 @@ public:
 private:
   Client *client;
   CephContext *cct;
-  
-  // Reference to client_lock for operations that need it
-  ceph::mutex &client_lock;
-  
-  // Reference to cache_lock for objectcacher operations
-  ceph::mutex &cache_lock;
-  
-  // Reference to objectcacher
-  ObjectCacher *objectcacher;
-  
+
   // Caps-specific lock - protects all caps state
-  mutable ceph::mutex caps_lock = ceph::make_mutex("ClientCaps::caps_lock");
-  // mutable ReentrantLock caps_lock = make_reentrant("ClientCaps::caps_lock");
+  // mutable ceph::mutex caps_lock = ceph::make_mutex("ClientCaps::caps_lock");
+  mutable ReentrantLock caps_lock = make_reentrant("ClientCaps::caps_lock", false);
 
   // Capability state
   ceph::coarse_mono_time last_cap_renew;

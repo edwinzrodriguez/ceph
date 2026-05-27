@@ -470,7 +470,7 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
   		  true));
   
   // Initialize ClientCaps for capability management
-  client_caps.reset(new ClientCaps(this, cct, client_lock, cache_lock, objectcacher.get()));
+  client_caps.reset(new ClientCaps(this, cct));
 }
 
 

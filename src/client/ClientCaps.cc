@@ -40,15 +40,9 @@
 
 using std::string;
 
-ClientCaps::ClientCaps(Client *client, CephContext *cct, 
-                       ceph::mutex &client_lock,
-                       ceph::mutex &cache_lock,
-                       ObjectCacher *objectcacher)
+ClientCaps::ClientCaps(Client *client, CephContext *cct)
   : client(client),
     cct(cct),
-    client_lock(client_lock),
-    cache_lock(cache_lock),
-    objectcacher(objectcacher),
     last_cap_renew(ceph::coarse_mono_clock::now()),
     caps_release_delay(cct->_conf.get_val<std::chrono::seconds>("client_caps_release_delay"))
 {
@@ -90,8 +84,8 @@ int ClientCaps::get_caps_used(Inode *in)
   if (!(used & CEPH_CAP_FILE_CACHE)) {
     bool is_empty;
     {
-      std::scoped_lock l(cache_lock);
-      is_empty = objectcacher->set_is_empty(&in->oset);
+      std::scoped_lock l(client->cache_lock);
+      is_empty = client->objectcacher->set_is_empty(&in->oset);
     }
     if (!is_empty)
       used |= CEPH_CAP_FILE_CACHE;
@@ -320,9 +314,9 @@ void ClientCaps::remove_session_caps(MetaSession *s, int err)
 	  lderr(cct) << __func__ << " still has dirty data on " << *in << dendl;
 	  in->set_async_err(err);
 	}
-	objectcacher->purge_set(&in->oset);
+	client->objectcacher->purge_set(&in->oset);
       } else {
-	objectcacher->release_set(&in->oset);
+	client->objectcacher->release_set(&in->oset);
       }
       client->_schedule_invalidate_callback(in.get(), 0, 0);
     }
@@ -456,7 +450,7 @@ void ClientCaps::cap_delay_requeue(Inode *in)
 
 void ClientCaps::flush_cap_releases()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   
   uint64_t nr_caps = 0;
 
@@ -490,7 +484,7 @@ void ClientCaps::flush_cap_releases()
 
 void ClientCaps::renew_and_flush_cap_releases()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
 
   if (!client->mount_aborted && client->mdsmap->get_epoch()) {
     // renew caps?
@@ -504,7 +498,7 @@ void ClientCaps::renew_and_flush_cap_releases()
 
 void ClientCaps::renew_caps()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   
   ldout(cct, 10) << "renew_caps()" << dendl;
   last_cap_renew = ceph::coarse_mono_clock::now();
@@ -549,10 +543,10 @@ int ClientCaps::get_caps_issued(const char *path, const UserPerm& perms)
 
 void ClientCaps::wait_on_context_list(std::vector<Context*>& ls)
 {
-  ceph::condition_variable cond;
+  reentrant_condition_variable cond;
   bool done = false;
   int r;
-  ls.push_back(new C_Cond(cond, &done, &r));
+  ls.push_back(new C_ReentrantCond(cond, &done, &r));
   std::unique_lock l{caps_lock, std::adopt_lock};
   cond.wait(l, [&done] { return done;});
   l.release();
@@ -1033,7 +1027,7 @@ void ClientCaps::early_kick_flushing_caps(MetaSession *session)
 
 void ClientCaps::flush_caps_sync()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   
   ldout(cct, 10) << __func__ << dendl;
   for (auto &q : client->mds_sessions) {
@@ -1183,7 +1177,7 @@ void ClientCaps::flush_snaps(Inode *in)
 
 void ClientCaps::submit_sync_caps(Inode *in, ceph_tid_t want, Context *onfinish)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   // TODO: Implement sync caps submission
   // For now, just complete the context immediately
   if (onfinish)
@@ -1192,13 +1186,13 @@ void ClientCaps::submit_sync_caps(Inode *in, ceph_tid_t want, Context *onfinish)
 
 void ClientCaps::wait_sync_caps(Inode *in, ceph_tid_t want)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   client->wait_sync_caps(in, want);
 }
 
 void ClientCaps::wait_sync_caps(ceph_tid_t want)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   client->wait_sync_caps(want);
 }
 
