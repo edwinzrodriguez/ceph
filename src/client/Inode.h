@@ -128,8 +128,8 @@ struct Inode : RefCountedObject {
   ceph::coarse_mono_time hold_caps_until;
   Client *client;
 
-  // ceph::mutex inode_lock = ceph::make_mutex("Inode::inode_lock");
-  ceph::ReentrantLock inode_lock = ceph::make_reentrant("Inode::inode_lock");
+  // mutable ceph::mutex inode_lock = ceph::make_mutex("Inode::inode_lock");
+  mutable ceph::ReentrantLock inode_lock = ceph::make_reentrant("Inode::inode_lock", false); // disable deadlock detection
 
   // -- the actual inode --
   inodeno_t ino; // ORDER DEPENDENCY: oset

@@ -44,6 +44,7 @@ Inode::~Inode()
 
 void Inode::print(std::ostream& out) const
 {
+  std::unique_lock in_lock(inode_lock);
   out << vino() << "("
       << "faked_ino=" << faked_ino
       << " nref=" << get_nref()
