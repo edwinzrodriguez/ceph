@@ -165,5 +165,20 @@ public:
   void notify_all() noexcept { cv.notify_all(); }
 };
 
+class C_ReentrantCond : public Context {
+  reentrant_condition_variable& cond;   ///< Cond to signal
+  bool *done;   ///< true if finish() has been called
+  int *rval;    ///< return value
+public:
+  C_ReentrantCond(reentrant_condition_variable &c, bool *d, int *r) : cond(c), done(d), rval(r) {
+    *done = false;
+  }
+  void finish(int r) override {
+    *done = true;
+    *rval = r;
+    cond.notify_all();
+  }
+};
+
 } // namespace ceph
 #endif //CEPH_REENTRANT_LOCK_H
