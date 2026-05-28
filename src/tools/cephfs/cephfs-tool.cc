@@ -25,6 +25,7 @@
 #include <map>
 #include <numeric>
 #include <random>
+#include <semaphore>
 #include <span>
 #include <sstream>
 #include <string>
@@ -177,6 +178,8 @@ struct BenchConfig {
   int msgr_workers;
   bool show_progress;
   int progress_interval;
+  bool async_io;
+  int queue_depth;
 #ifdef CEPH_LOCKSTAT
   string lockstat_dump_path;
   uint64_t lockstat_threshold_ns;
@@ -189,6 +192,41 @@ struct ThreadStats {
   std::atomic<uint64_t> files{0}; // files successfully opened/closed
   std::atomic<int> errors{0};
 };
+
+// Structure to track async I/O operations
+struct AsyncIOContext {
+  struct ceph_ll_io_info io_info;
+  std::vector<char> buffer;
+  struct iovec iov;  // Must persist for lifetime of async operation
+  Fh* fh;
+  uint64_t offset;
+  std::atomic<bool> completed;
+  int64_t result;
+  std::atomic<bool>* stop_signal_ptr;
+  ThreadStats* stats_ptr;
+  std::counting_semaphore<>* semaphore_ptr;
+};
+
+// Callback for async I/O completion
+static void async_io_callback(struct ceph_ll_io_info* cb_info) {
+  AsyncIOContext* ctx = static_cast<AsyncIOContext*>(cb_info->priv);
+  ctx->result = cb_info->result;
+  
+  if (cb_info->result > 0) {
+    ctx->stats_ptr->bytes_transferred += cb_info->result;
+    ctx->stats_ptr->ops++;
+  } else if (cb_info->result < 0) {
+    ctx->stats_ptr->errors++;
+    *(ctx->stop_signal_ptr) = true;
+  }
+  
+  ctx->completed = true;
+  
+  // Release semaphore to signal slot availability
+  if (ctx->semaphore_ptr) {
+    ctx->semaphore_ptr->release();
+  }
+}
 
 // --- Setup Helper (Updated to use stream for output) ---
 int setup_mount(struct ceph_mount_info **cmount, const BenchConfig& config, std::ostream& out_stream) {
@@ -493,6 +531,199 @@ bench_write_worker(
   }
 }
 
+// Async I/O write worker using ceph_ll_nonblocking_readv_writev
+void
+bench_async_write_worker(
+    int thread_id,
+    int files_to_write,
+    BenchConfig config,
+    struct ceph_mount_info* cmount,
+    ThreadStats& stats,
+    std::atomic<bool>& stop_signal,
+    std::stringstream& ss,
+    steady_clock::time_point phase_start_time)
+{
+  auto duration_limit = std::chrono::seconds(config.duration);
+
+  // Semaphore for queue depth management
+  std::counting_semaphore<> queue_semaphore(config.queue_depth);
+
+  // Allocate queue of async contexts
+  std::vector<std::unique_ptr<AsyncIOContext>> io_queue;
+  for (int i = 0; i < config.queue_depth; ++i) {
+    auto ctx = std::make_unique<AsyncIOContext>();
+    ctx->buffer.resize(config.block_size);
+    RandomHelper::fill_buffer(std::as_writable_bytes(std::span(ctx->buffer)));
+    ctx->io_info.callback = async_io_callback;
+    ctx->io_info.priv = ctx.get();
+    ctx->io_info.write = true;
+    ctx->io_info.fsync = false;
+    ctx->completed = true;
+    ctx->stop_signal_ptr = &stop_signal;
+    ctx->stats_ptr = &stats;
+    ctx->semaphore_ptr = &queue_semaphore;
+    io_queue.push_back(std::move(ctx));
+  }
+
+  for (int file_iter = 0;; ++file_iter) {
+    if (stop_signal) {
+      break;
+    }
+
+    if (config.duration > 0) {
+      if ((steady_clock::now() - phase_start_time) >= duration_limit) {
+        break;
+      }
+    } else if (file_iter >= files_to_write) {
+      break;
+    }
+
+    int file_idx = file_iter % files_to_write;
+    string fname = config.subdir + "/" + config.prefix +
+                   std::to_string(thread_id) + "_" + std::to_string(file_idx);
+
+    // Get just the filename without path
+    size_t last_slash = fname.find_last_of('/');
+    string filename = (last_slash != string::npos) ? fname.substr(last_slash + 1) : fname;
+    
+    // Get parent directory inode
+    Inode* parent_inode = nullptr;
+    struct ceph_statx parent_stx;
+    UserPerm* perms = ceph_userperm_new(config.uid, config.gid, 0, nullptr);
+    
+    int rc = ceph_ll_walk(cmount, config.subdir.c_str(), &parent_inode, &parent_stx,
+                          CEPH_STATX_INO, 0, perms);
+    
+    if (rc < 0) {
+      ss << "Thread " << thread_id << " walk parent dir failed " << config.subdir << ": " << strerror(-rc) << std::endl;
+      stats.errors++;
+      stop_signal = true;
+      ceph_userperm_destroy(perms);
+      break;
+    }
+
+    // Create and open file using low-level API
+    Inode* inode = nullptr;
+    Fh* fh = nullptr;
+    struct ceph_statx stx;
+    
+    rc = ceph_ll_create(cmount, parent_inode, filename.c_str(), 0644,
+                        O_WRONLY | O_CREAT | O_TRUNC, &inode, &fh, &stx,
+                        CEPH_STATX_INO, 0, perms);
+    ceph_userperm_destroy(perms);
+    
+    if (rc < 0) {
+      ss << "Thread " << thread_id << " ll_create failed " << fname << ": " << strerror(-rc) << std::endl;
+      stats.errors++;
+      stop_signal = true;
+      if (parent_inode) ceph_ll_forget(cmount, parent_inode, 1);
+      break;
+    }
+    
+    // Release parent inode reference
+    if (parent_inode) {
+      ceph_ll_forget(cmount, parent_inode, 1);
+    }
+
+    uint64_t written = 0;
+    bool write_error = false;
+
+    while (written < config.file_size) {
+      if (stop_signal) {
+        break;
+      }
+
+      if (config.duration > 0 &&
+          (steady_clock::now() - phase_start_time) >= duration_limit) {
+        break;
+      }
+
+      // Wait for available slot in queue (blocks efficiently)
+      queue_semaphore.acquire();
+
+      if (stop_signal) {
+        queue_semaphore.release();
+        break;
+      }
+
+      // Find available slot in queue
+      AsyncIOContext* available_ctx = nullptr;
+      for (auto& ctx : io_queue) {
+        if (ctx->completed.load()) {
+          available_ctx = ctx.get();
+          break;
+        }
+      }
+
+      if (!available_ctx) {
+        // Should not happen if semaphore logic is correct
+        ss << "Thread " << thread_id << " internal error: no available context after semaphore acquire" << std::endl;
+        queue_semaphore.release();
+        break;
+      }
+
+      // Setup I/O operation
+      uint64_t to_write = std::min(config.block_size, config.file_size - written);
+      available_ctx->fh = fh;
+      available_ctx->offset = written;
+      available_ctx->completed = false;
+      available_ctx->result = 0;
+      
+      // Setup iovec in context (must persist for async operation)
+      available_ctx->iov.iov_base = available_ctx->buffer.data();
+      available_ctx->iov.iov_len = to_write;
+      
+      available_ctx->io_info.fh = fh;
+      available_ctx->io_info.iov = &available_ctx->iov;
+      available_ctx->io_info.iovcnt = 1;
+      available_ctx->io_info.off = written;
+      available_ctx->io_info.result = 0;
+
+      // Submit async I/O
+      int64_t submit_rc = ceph_ll_nonblocking_readv_writev(cmount, &available_ctx->io_info);
+      if (submit_rc < 0) {
+        ss << "Thread " << thread_id << " async write submit error: " << strerror(-submit_rc) << std::endl;
+        stats.errors++;
+        stop_signal = true;
+        write_error = true;
+        queue_semaphore.release();
+        break;
+      }
+
+      written += to_write;
+    }
+
+    // Wait for all outstanding I/Os to complete for this file
+    for (auto& ctx : io_queue) {
+      while (!ctx->completed.load() && ctx->fh == fh && !stop_signal) {
+        std::this_thread::yield();
+      }
+    }
+
+    if (!write_error && !stop_signal) {
+      if (int close_rc = ceph_ll_close(cmount, fh); close_rc < 0) {
+        ss << "Thread " << thread_id << " close error " << fname << ": " << strerror(-close_rc) << std::endl;
+        stats.errors++;
+        stop_signal = true;
+      } else {
+        if (stats.files < (uint64_t)files_to_write) {
+          stats.files++;
+        }
+      }
+    } else {
+      ceph_ll_close(cmount, fh);
+    }
+
+    if (inode) {
+      ceph_ll_forget(cmount, inode, 1);
+    }
+
+    if (write_error) {
+      break;
+    }
+  }
+}
+
 // Worker function for Read phase
 void
 bench_read_worker(
@@ -596,6 +827,208 @@ bench_read_worker(
       ss << "Thread " << thread_id << " unmount failed: " << strerror(-rc) << std::endl;
     }
     ceph_shutdown(cmount);
+  }
+}
+
+// Async I/O read worker using ceph_ll_nonblocking_readv_writev
+void
+bench_async_read_worker(
+    int thread_id,
+    int files_to_read,
+    BenchConfig config,
+    struct ceph_mount_info* cmount,
+    ThreadStats& stats,
+    std::atomic<bool>& stop_signal,
+    std::stringstream& ss,
+    steady_clock::time_point phase_start_time)
+{
+  auto duration_limit = std::chrono::seconds(config.duration);
+
+  // Semaphore for queue depth management
+  std::counting_semaphore<> queue_semaphore(config.queue_depth);
+
+  // Allocate queue of async contexts
+  std::vector<std::unique_ptr<AsyncIOContext>> io_queue;
+  for (int i = 0; i < config.queue_depth; ++i) {
+    auto ctx = std::make_unique<AsyncIOContext>();
+    ctx->buffer.resize(config.block_size);
+    ctx->io_info.callback = async_io_callback;
+    ctx->io_info.priv = ctx.get();
+    ctx->io_info.write = false;
+    ctx->io_info.fsync = false;
+    ctx->completed = true;
+    ctx->stop_signal_ptr = &stop_signal;
+    ctx->stats_ptr = &stats;
+    ctx->semaphore_ptr = &queue_semaphore;
+    io_queue.push_back(std::move(ctx));
+  }
+
+  for (int file_iter = 0;; ++file_iter) {
+    if (stop_signal) {
+      break;
+    }
+
+    if (config.duration > 0) {
+      if ((steady_clock::now() - phase_start_time) >= duration_limit) {
+        break;
+      }
+    } else if (file_iter >= files_to_read) {
+      break;
+    }
+
+    int file_idx = file_iter % files_to_read;
+    string fname = config.subdir + "/" + config.prefix +
+                   std::to_string(thread_id) + "_" + std::to_string(file_idx);
+
+    // Get just the filename without path
+    size_t last_slash = fname.find_last_of('/');
+    string filename = (last_slash != string::npos) ? fname.substr(last_slash + 1) : fname;
+    
+    // Get parent directory inode
+    Inode* parent_inode = nullptr;
+    struct ceph_statx parent_stx;
+    UserPerm* perms = ceph_userperm_new(config.uid, config.gid, 0, nullptr);
+    
+    int rc = ceph_ll_walk(cmount, config.subdir.c_str(), &parent_inode, &parent_stx,
+                          CEPH_STATX_INO, 0, perms);
+    
+    if (rc < 0) {
+      ss << "Thread " << thread_id << " walk parent dir failed " << config.subdir << ": " << strerror(-rc) << std::endl;
+      stats.errors++;
+      stop_signal = true;
+      ceph_userperm_destroy(perms);
+      break;
+    }
+
+    // Lookup file inode
+    Inode* inode = nullptr;
+    struct ceph_statx stx;
+    rc = ceph_ll_lookup(cmount, parent_inode, filename.c_str(), &inode, &stx,
+                        CEPH_STATX_INO, 0, perms);
+    
+    if (rc < 0) {
+      ss << "Thread " << thread_id << " lookup failed " << fname << ": " << strerror(-rc) << std::endl;
+      stats.errors++;
+      stop_signal = true;
+      ceph_userperm_destroy(perms);
+      if (parent_inode) ceph_ll_forget(cmount, parent_inode, 1);
+      break;
+    }
+
+    // Open file for reading
+    Fh* fh = nullptr;
+    rc = ceph_ll_open(cmount, inode, O_RDONLY, &fh, perms);
+    ceph_userperm_destroy(perms);
+    
+    // Release parent inode reference
+    if (parent_inode) {
+      ceph_ll_forget(cmount, parent_inode, 1);
+    }
+    
+    if (rc < 0) {
+      ss << "Thread " << thread_id << " ll_open failed " << fname << ": " << strerror(-rc) << std::endl;
+      stats.errors++;
+      stop_signal = true;
+      if (inode) ceph_ll_forget(cmount, inode, 1);
+      break;
+    }
+
+    uint64_t total_read = 0;
+    bool read_error = false;
+
+    while (total_read < config.file_size) {
+      if (stop_signal) {
+        break;
+      }
+
+      if (config.duration > 0 &&
+          (steady_clock::now() - phase_start_time) >= duration_limit) {
+        break;
+      }
+
+      // Wait for available slot in queue (blocks efficiently)
+      queue_semaphore.acquire();
+
+      if (stop_signal) {
+        queue_semaphore.release();
+        break;
+      }
+
+      // Find available slot in queue
+      AsyncIOContext* available_ctx = nullptr;
+      for (auto& ctx : io_queue) {
+        if (ctx->completed.load()) {
+          available_ctx = ctx.get();
+          break;
+        }
+      }
+
+      if (!available_ctx) {
+        // Should not happen if semaphore logic is correct
+        ss << "Thread " << thread_id << " internal error: no available context after semaphore acquire" << std::endl;
+        queue_semaphore.release();
+        break;
+      }
+
+      // Setup I/O operation
+      uint64_t to_read = std::min(config.block_size, config.file_size - total_read);
+      available_ctx->fh = fh;
+      available_ctx->offset = total_read;
+      available_ctx->completed = false;
+      available_ctx->result = 0;
+      
+      // Setup iovec in context (must persist for async operation)
+      available_ctx->iov.iov_base = available_ctx->buffer.data();
+      available_ctx->iov.iov_len = to_read;
+      
+      available_ctx->io_info.fh = fh;
+      available_ctx->io_info.iov = &available_ctx->iov;
+      available_ctx->io_info.iovcnt = 1;
+      available_ctx->io_info.off = total_read;
+      available_ctx->io_info.result = 0;
+
+      // Submit async I/O
+      int64_t submit_rc = ceph_ll_nonblocking_readv_writev(cmount, &available_ctx->io_info);
+      if (submit_rc < 0) {
+        ss << "Thread " << thread_id << " async read submit error: " << strerror(-submit_rc) << std::endl;
+        stats.errors++;
+        stop_signal = true;
+        read_error = true;
+        queue_semaphore.release();
+        break;
+      }
+
+      total_read += to_read;
+    }
+
+    // Wait for all outstanding I/Os to complete for this file
+    for (auto& ctx : io_queue) {
+      while (!ctx->completed.load() && ctx->fh == fh && !stop_signal) {
+        std::this_thread::yield();
+      }
+    }
+
+    if (!read_error && !stop_signal) {
+      if (int close_rc = ceph_ll_close(cmount, fh); close_rc < 0) {
+        ss << "Thread " << thread_id << " close error " << fname << ": " << strerror(-close_rc) << std::endl;
+        stats.errors++;
+        stop_signal = true;
+      } else {
+        if (stats.files < (uint64_t)files_to_read) {
+          stats.files++;
+        }
+      }
+    } else {
+      ceph_ll_close(cmount, fh);
+    }
+
+    if (inode) {
+      ceph_ll_forget(cmount, inode, 1);
+    }
+
+    if (read_error) {
+      break;
+    }
   }
 }
 
@@ -829,6 +1262,10 @@ int do_bench(BenchConfig& config) {
         json_formatter->dump_string("ms_async_op_threads", buf);
       }
     }
+    json_formatter->dump_bool("async_io", config.async_io);
+    if (config.async_io) {
+      json_formatter->dump_int("queue_depth", config.queue_depth);
+    }
     json_formatter->close_section(); // configuration
     json_formatter->open_array_section("iterations");
   }
@@ -862,6 +1299,10 @@ int do_bench(BenchConfig& config) {
     if (rc >= 0) {
       cout << "  ms_async_op_threads: " << buf << std::endl;
     }
+  }
+  cout << "  Async I/O: " << (config.async_io ? "enabled" : "disabled") << std::endl;
+  if (config.async_io) {
+    cout << "  Queue Depth: " << config.queue_depth << std::endl;
   }
 
   if (int rc = ceph_mkdir(shared_cmount, config.subdir.c_str(), 0755); rc < 0) {
@@ -919,10 +1360,17 @@ int do_bench(BenchConfig& config) {
     for (int i = 0; i < config.num_threads; ++i) {
       int f_count = files_per_thread + (i < remainder ? 1 : 0);
       struct ceph_mount_info *worker_mount = config.per_thread_mount ? NULL : shared_cmount;
-      threads.emplace_back(
-          bench_write_worker, i, f_count, config, worker_mount,
-          std::ref(write_stats[i]), std::ref(stop_signal),
-          std::ref(thread_outputs[i]), start_time);
+      if (config.async_io) {
+        threads.emplace_back(
+            bench_async_write_worker, i, f_count, config, worker_mount,
+            std::ref(write_stats[i]), std::ref(stop_signal),
+            std::ref(thread_outputs[i]), start_time);
+      } else {
+        threads.emplace_back(
+            bench_write_worker, i, f_count, config, worker_mount,
+            std::ref(write_stats[i]), std::ref(stop_signal),
+            std::ref(thread_outputs[i]), start_time);
+      }
     }
     for (auto& t : threads) {
       t.join();
@@ -1021,11 +1469,19 @@ int do_bench(BenchConfig& config) {
     }
 
     for (int i = 0; i < config.num_threads; ++i) {
+      int f_count = files_per_thread + (i < remainder ? 1 : 0);
       struct ceph_mount_info *worker_mount = config.per_thread_mount ? NULL : shared_cmount;
-      threads.emplace_back(
-          bench_read_worker, i, (int)write_stats[i].files.load(), config,
-          worker_mount, std::ref(read_stats[i]), std::ref(stop_signal),
-          std::ref(thread_outputs[i]), start_time);
+      if (config.async_io) {
+        threads.emplace_back(
+            bench_async_read_worker, i, f_count, config,
+            worker_mount, std::ref(read_stats[i]), std::ref(stop_signal),
+            std::ref(thread_outputs[i]), start_time);
+      } else {
+        threads.emplace_back(
+            bench_read_worker, i, (int)write_stats[i].files.load(), config,
+            worker_mount, std::ref(read_stats[i]), std::ref(stop_signal),
+            std::ref(thread_outputs[i]), start_time);
+      }
     }
     for (auto& t : threads) {
       t.join();
@@ -1223,6 +1679,8 @@ int main(int argc, char **argv) {
     ("perf-dump", po::value<string>(&config.perf_dump_path), "File to dump performance counters to")
     ("progress", po::bool_switch(&config.show_progress), "Show progress and current bandwidth during benchmark")
     ("progress-interval", po::value<int>(&config.progress_interval)->default_value(10), "Progress update interval in percent (1-100)")
+    ("async-io", po::bool_switch(&config.async_io), "Use asynchronous I/O with ceph_ll_nonblocking_readv_writev")
+    ("queue-depth", po::value<int>(&config.queue_depth)->default_value(16), "Queue depth for async I/O (number of outstanding I/Os per thread)")
 #ifdef CEPH_LOCKSTAT
     ("lockstat-dump", po::value<string>(&config.lockstat_dump_path), "Base path for lockstat output files (iteration and phase will be appended)")
     ("lockstat-threshold", po::value<uint64_t>(&config.lockstat_threshold_ns)->default_value(0), "Lockstat threshold in nanoseconds (0 = collect all)")
@@ -1284,6 +1742,16 @@ int main(int argc, char **argv) {
 
     if (config.msgr_workers != 0 && (config.msgr_workers < 1 || config.msgr_workers > 24)) {
       cerr << "Error: msgr-workers must be between 1 and 24\n";
+      return 1;
+    }
+
+    if (config.queue_depth < 1 || config.queue_depth > 1024) {
+      cerr << "Error: queue-depth must be between 1 and 1024\n";
+      return 1;
+    }
+
+    if (config.async_io && config.per_thread_mount) {
+      cerr << "Error: async-io is not compatible with per-thread-mount\n";
       return 1;
     }
 
