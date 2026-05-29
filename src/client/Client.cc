@@ -11268,8 +11268,12 @@ void Client::C_Read_Finisher::finish_io(int r)
     clnt->unlock_fh_pos(f);
   }
 
-  onfinish->complete(r);
+  // Save onfinish pointer before deleting this object to avoid
+  // use-after-free if onfinish->complete() triggers callbacks
+  // that might reference this object
+  Context *saved_onfinish = onfinish;
   delete this;
+  saved_onfinish->complete(r);
 }
 void Client::C_Read_Sync_NonBlocking::start()
 {
