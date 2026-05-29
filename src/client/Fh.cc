@@ -27,6 +27,8 @@ Fh::Fh(InodeRef in, int flags, int cmode, uint64_t _gen, const UserPerm &perms) 
 
 Fh::~Fh()
 {
-  inode->rm_fh(this);
+  if (inode) {
+    inode->rm_fh(this);
+  }
 }
 
