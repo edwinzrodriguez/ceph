@@ -699,6 +699,14 @@ bench_async_write_worker(
       break;
     }
   }
+
+  // Wait for ALL outstanding I/Os to complete before exiting thread
+  // This includes any operations that may still be in flight
+  for (auto& ctx : io_queue) {
+    while (!ctx->completed.load()) {
+      std::this_thread::yield();
+    }
+  }
 }
 
 // Worker function for Read phase
@@ -1005,6 +1013,14 @@ bench_async_read_worker(
 
     if (read_error) {
       break;
+    }
+  }
+
+  // Wait for ALL outstanding I/Os to complete before exiting thread
+  // This includes any readahead operations that may have been triggered
+  for (auto& ctx : io_queue) {
+    while (!ctx->completed.load()) {
+      std::this_thread::yield();
     }
   }
 }
