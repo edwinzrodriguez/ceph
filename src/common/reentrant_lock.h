@@ -6,6 +6,7 @@
 #define CEPH_REENTRANT_LOCK_H
 
 #include <common/ceph_mutex.h>
+#include <include/Context.h>
 
 namespace ceph {
 
@@ -165,6 +166,22 @@ public:
   void notify_all() noexcept { cv.notify_all(); }
 };
 
+struct C_ReentrantLock : public Context {
+  ceph::ReentrantLock *lock;
+  Context *fin;
+  C_ReentrantLock(ceph::ReentrantLock *l, Context *c) : lock(l), fin(c) {}
+  ~C_ReentrantLock() override {
+    delete fin;
+  }
+  void finish(int r) override {
+    if (fin) {
+      std::lock_guard l{*lock};
+      fin->complete(r);
+      fin = NULL;
+    }
+  }
+};
+
 class C_ReentrantCond : public Context {
   reentrant_condition_variable& cond;   ///< Cond to signal
   bool *done;   ///< true if finish() has been called
@@ -178,6 +195,34 @@ public:
     *rval = r;
     cond.notify_all();
   }
+};
+
+// Specialization of unique_unlock for ReentrantLockImpl.
+//
+// Mirrors reentrant_condition_variable::Guard: saves the full recursion depth
+// before releasing the underlying mutex and restores it after reacquiring.
+// This ensures that code which temporarily drops the lock (e.g. to call
+// blocking I/O) re-emerges holding the lock with the same recursion count.
+template <class Mutex>
+class unique_unlock<ReentrantLockImpl<Mutex>> {
+public:
+  explicit unique_unlock(ReentrantLockImpl<Mutex>& rl)
+    : m_lock(rl),
+      m_saved(rl.release_for_wait()) {
+    rl.native_mutex().unlock();
+  }
+
+  ~unique_unlock() noexcept(false) {
+    m_lock.native_mutex().lock();
+    m_lock.restore_after_wait(m_saved);
+  }
+
+  unique_unlock(const unique_unlock&) = delete;
+  unique_unlock& operator=(const unique_unlock&) = delete;
+
+private:
+  ReentrantLockImpl<Mutex>& m_lock;
+  int m_saved;
 };
 
 } // namespace ceph

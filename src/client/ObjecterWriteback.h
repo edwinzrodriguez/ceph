@@ -6,10 +6,11 @@
 
 #include "osdc/Objecter.h"
 #include "osdc/WritebackHandler.h"
+#include "common/reentrant_lock.h"
 
 class ObjecterWriteback : public WritebackHandler {
  public:
-  ObjecterWriteback(Objecter *o, Finisher *fin, ceph::mutex *lock)
+  ObjecterWriteback(Objecter *o, Finisher *fin, ceph::ReentrantLock *lock)
     : m_objecter(o),
       m_finisher(fin),
       m_lock(lock) { }
@@ -23,7 +24,7 @@ class ObjecterWriteback : public WritebackHandler {
                     Context *onfinish) override {
     m_objecter->read_trunc(oid, oloc, off, len, snapid, pbl, 0,
 			   trunc_size, trunc_seq,
-			   new C_OnFinisher(new C_Lock(m_lock, onfinish),
+			   new C_OnFinisher(new C_ReentrantLock(m_lock, onfinish),
 					    m_finisher));
   }
 
@@ -41,7 +42,7 @@ class ObjecterWriteback : public WritebackHandler {
 			   Context *oncommit) override {
     return m_objecter->write_trunc(oid, oloc, off, len, snapc, bl, mtime, 0,
 				   trunc_size, trunc_seq,
-				   new C_OnFinisher(new C_Lock(m_lock,
+				   new C_OnFinisher(new C_ReentrantLock(m_lock,
 							       oncommit),
 						    m_finisher));
   }
@@ -58,14 +59,14 @@ class ObjecterWriteback : public WritebackHandler {
       op.write(offset, bl, trunc_size, trunc_seq);
 
     return m_objecter->mutate(oid, oloc, op, snapc, mtime, 0,
-			      new C_OnFinisher(new C_Lock(m_lock, oncommit),
+			      new C_OnFinisher(new C_ReentrantLock(m_lock, oncommit),
 					       m_finisher));
   }
 
  private:
   Objecter *m_objecter;
   Finisher *m_finisher;
-  ceph::mutex *m_lock;
+  ceph::ReentrantLock *m_lock;
 };
 
 #endif

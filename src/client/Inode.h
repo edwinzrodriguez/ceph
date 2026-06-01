@@ -23,7 +23,7 @@
 #include "MetaSession.h"
 #include "UserPerm.h"
 #include "Delegation.h"
-#include "reentrant_lock.h"
+#include "common/reentrant_lock.h"
 
 #include "FSCrypt.h"
 
@@ -278,7 +278,7 @@ struct Inode : RefCountedObject {
   std::vector<Context*> waitfor_caps;
   std::vector<Context*> waitfor_caps_pending;
   std::vector<Context*> waitfor_commit;
-  std::list<ceph::condition_variable*> waitfor_deleg;
+  std::list<ceph::reentrant_condition_variable*> waitfor_deleg;
 
   Dentry *get_first_parent() {
     ceph_assert(!dentries.empty());

@@ -82,11 +82,7 @@ int ClientCaps::get_caps_used(Inode *in)
   
   unsigned used = in->caps_used();
   if (!(used & CEPH_CAP_FILE_CACHE)) {
-    bool is_empty;
-    {
-      std::scoped_lock l(client->cache_lock);
-      is_empty = client->objectcacher->set_is_empty(&in->oset);
-    }
+    bool is_empty = client->objectcacher->set_is_empty(&in->oset);
     if (!is_empty)
       used |= CEPH_CAP_FILE_CACHE;
   }
@@ -832,7 +828,6 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 
   int r = 0;
   {
-    unique_unlock in_unlock(in->inode_lock);
     std::unique_lock lock(client->client_lock);
     r = client->check_pool_perm(in, need);
     if (r < 0)

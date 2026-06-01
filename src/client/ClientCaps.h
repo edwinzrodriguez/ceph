@@ -24,7 +24,7 @@
 #include "InodeRef.h"
 #include "include/Context.h"
 #include <chrono>
-#include "reentrant_lock.h"
+#include "common/reentrant_lock.h"
 
 class Client;
 class Inode;

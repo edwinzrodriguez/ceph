@@ -46,7 +46,7 @@
 #include "InodeRef.h"
 #include "MetaSession.h"
 #include "UserPerm.h"
-#include "reentrant_lock.h"
+#include "common/reentrant_lock.h"
 
 #if defined(__linux__)
 #include "FSCrypt.h"
@@ -786,8 +786,8 @@ public:
   int ll_delegation(Fh *fh, unsigned cmd, ceph_deleg_cb_t cb, void *priv);
 
   entity_name_t get_myname() { return messenger->get_myname(); }
-  void wait_on_list(std::list<ceph::condition_variable*>& ls);
-  void signal_cond_list(std::list<ceph::condition_variable*>& ls);
+  void wait_on_list(std::list<ceph::reentrant_condition_variable*>& ls);
+  void signal_cond_list(std::list<ceph::reentrant_condition_variable*>& ls);
 
   void set_filer_flags(int flags);
   void clear_filer_flags(int flags);
@@ -801,6 +801,8 @@ public:
   inodeno_t _get_root_ino(bool fake=true);
   inodeno_t get_root_ino();
   Inode *get_root();
+  InodeRef get_root_ref();
+  InodeRef get_cwd_ref();
 
   virtual int init();
   virtual void shutdown();
@@ -978,7 +980,7 @@ public:
     ++dlease_misses;
   }
   std::tuple<uint64_t, uint64_t, uint64_t> get_dlease_hit_rates() {
-    return std::make_tuple(dlease_hits, dlease_misses, dentry_nr);
+    return std::make_tuple(dlease_hits.load(), dlease_misses.load(), dentry_nr.load());
   }
 
   void cap_hit() {
@@ -988,7 +990,7 @@ public:
     ++cap_misses;
   }
   std::pair<uint64_t, uint64_t> get_cap_hit_rates() {
-    return std::make_pair(cap_hits, cap_misses);
+    return std::make_pair(cap_hits.load(), cap_misses.load());
   }
 
   void inc_opened_files() {
@@ -998,7 +1000,7 @@ public:
     --opened_files;
   }
   std::pair<uint64_t, uint64_t> get_opened_files_rates() {
-    return std::make_pair(opened_files, inode_map.size());
+    return std::make_pair(opened_files.load(), inode_map.size());
   }
 
   void inc_pinned_icaps() {
@@ -1008,7 +1010,7 @@ public:
     pinned_icaps -= nr;
   }
   std::pair<uint64_t, uint64_t> get_pinned_icaps_rates() {
-    return std::make_pair(pinned_icaps, inode_map.size());
+    return std::make_pair(pinned_icaps.load(), inode_map.size());
   }
 
   void inc_opened_inodes() {
@@ -1018,7 +1020,7 @@ public:
     --opened_inodes;
   }
   std::pair<uint64_t, uint64_t> get_opened_inodes_rates() {
-    return std::make_pair(opened_inodes, inode_map.size());
+    return std::make_pair(opened_inodes.load(), inode_map.size());
   }
 
   void set_is_fuse() {
@@ -1038,7 +1040,7 @@ public:
 
   /* tick thread */
   std::thread upkeeper;
-  ceph::condition_variable upkeep_cond;
+  ceph::reentrant_condition_variable upkeep_cond;
   bool tick_thread_stopped = false;
 
   std::unique_ptr<PerfCounters> logger;
@@ -1066,7 +1068,7 @@ protected:
     void print(std::ostream& os) const;
   };
 
-  std::list<ceph::condition_variable*> waiting_for_reclaim;
+  std::list<ceph::reentrant_condition_variable*> waiting_for_reclaim;
   /* Flags for check_caps() */
   static const unsigned CHECK_CAPS_NODELAY = 0x1;
   static const unsigned CHECK_CAPS_SYNCHRONOUS = 0x2;
@@ -1171,15 +1173,24 @@ protected:
   void refresh_snapdir_attrs(Inode *in, Inode *diri);
   InodeRef open_snapdir(const InodeRef& diri);
 
-  int get_fd() {
-    ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  int _get_fd() {
     int fd = free_fd_set.range_start();
     free_fd_set.erase(fd, 1);
     return fd;
   }
-  void put_fd(int fd) {
-    ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+
+  int get_fd() {
+    std::scoped_lock lock(client_lock);
+    return _get_fd();
+  }
+
+  void _put_fd(int fd) {
     free_fd_set.insert(fd, 1);
+  }
+
+  void put_fd(int fd) {
+    std::scoped_lock lock(client_lock);
+    _put_fd(fd);
   }
 
   /*
@@ -1209,7 +1220,13 @@ protected:
   }
 
   bool _ll_fh_exists(Fh *f) {
+    ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
     return ll_unclosed_fh_set.count(f);
+  }
+  
+  bool ll_fh_exists(Fh *f) {
+    std::scoped_lock lock(client_lock);
+    return _ll_fh_exists(f);
   }
 
   // helpers
@@ -1317,12 +1334,9 @@ protected:
 
   // global client lock
   //  - protects Client and buffer cache both!
-  ceph::mutex client_lock = ceph::make_mutex("Client::client_lock");
-  // ReentrantLock client_lock = make_reentrant("Client::client_lock", false);
+  // ceph::mutex client_lock = ceph::make_mutex("Client::client_lock");
 
-  // objectcacher lock
-  ceph::mutex cache_lock = ceph::make_mutex("Client::cache_lock");
-
+  mutable ceph::ReentrantLock client_lock = ceph::make_reentrant("Client::client_lock", false); // disable deadlock detection
 
   std::map<snapid_t, int> ll_snap_ref;
 
@@ -2116,15 +2130,15 @@ private:
   int _unlink(Inode *dir, const char *name, const UserPerm& perm);
 #if defined(__linux__)
   int get_keyhandler(FSCryptContextRef fscrypt_ctx, FSCryptKeyHandlerRef& kh);
-  bool is_inode_locked(const InodeRef& to_check);
+  bool is_inode_locked(const InodeRef& to_check) const;
 #endif
-  int _rename(Inode *olddir, const char *oname, Inode *ndir, const char *nname, const UserPerm& perm, std::string alternate_name);
+  int _rename(Inode *olddir, const char *oname, Inode *ndir, const char *nname, const UserPerm& perm, const std::string& alternate_name);
   int _mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& perm,
 	     InodeRef *inp = 0, const std::map<std::string, std::string> &metadata={},
-             std::string alternate_name="", FSCrypt_Options={});
+             const std::string& alternate_name="", const FSCrypt_Options& opts ={});
   int _rmdir(Inode *dir, const char *name, const UserPerm& perms, bool check_perms=true);
   int _symlink(Inode *dir, const char *name, const char *target,
-	       const UserPerm& perms, std::string alternate_name, InodeRef *inp = 0, FSCrypt_Options fscrypt_options = {});
+	       const UserPerm& perms, const std::string& alternate_name, InodeRef *inp = 0, const FSCrypt_Options& fscrypt_options = {});
   int _mknod(Inode *dir, const char *name, mode_t mode, dev_t rdev,
 	     const UserPerm& perms, InodeRef *inp = 0);
   bool make_absolute_path_string(const InodeRef& in, std::string& path);
@@ -2162,7 +2176,7 @@ private:
   int _create(const walk_dentry_result& wdr, int flags, mode_t mode, InodeRef *inp,
 	      Fh **fhp, int stripe_unit, int stripe_count, int object_size,
 	      const char *data_pool, bool *created, const UserPerm &perms,
-              std::string alternate_name, FSCrypt_Options fscrypt_options={});
+              const std::string& alternate_name, const FSCrypt_Options& fscrypt_options={});
 
   loff_t _lseek(Fh *fh, loff_t offset, int whence);
   int64_t _read(Fh *fh, int64_t offset, uint64_t size, bufferlist *bl,
@@ -2320,10 +2334,10 @@ private:
   // mds sessions
   map<mds_rank_t, MetaSessionRef> mds_sessions;  // mds -> push seq
   std::set<mds_rank_t> mds_ranks_closing;  // mds ranks currently tearing down sessions
-  std::list<ceph::condition_variable*> waiting_for_mdsmap;
+  std::list<ceph::reentrant_condition_variable*> waiting_for_mdsmap;
 
   // FSMap, for when using mds_command
-  std::list<ceph::condition_variable*> waiting_for_fsmap;
+  std::list<ceph::reentrant_condition_variable*> waiting_for_fsmap;
   std::unique_ptr<FSMap> fsmap;
   std::unique_ptr<FSMapUser> fsmap_user;
 
@@ -2382,12 +2396,12 @@ private:
 
   bool fscrypt_as;
 
-  ceph::condition_variable mount_cond, sync_cond;
+  ceph::reentrant_condition_variable mount_cond, sync_cond;
 
   std::map<std::pair<int64_t,std::string>, int> pool_perms;
-  std::list<ceph::condition_variable*> waiting_for_pool_perm;
+  std::list<ceph::reentrant_condition_variable*> waiting_for_pool_perm;
 
-  std::list<ceph::condition_variable*> waiting_for_rename;
+  std::list<ceph::reentrant_condition_variable*> waiting_for_rename;
 
   uint64_t retries_on_invalidate = 0;
 
@@ -2397,29 +2411,29 @@ private:
   entity_addrvec_t reclaim_target_addrs;
 
   // dentry lease metrics
-  uint64_t dentry_nr = 0;
-  uint64_t dlease_hits = 0;
-  uint64_t dlease_misses = 0;
+  std::atomic<uint64_t> dentry_nr = 0;
+  std::atomic<uint64_t> dlease_hits = 0;
+  std::atomic<uint64_t> dlease_misses = 0;
 
-  uint64_t cap_hits = 0;
-  uint64_t cap_misses = 0;
+  std::atomic<uint64_t> cap_hits = 0;
+  std::atomic<uint64_t> cap_misses = 0;
 
-  uint64_t opened_files = 0;
-  uint64_t pinned_icaps = 0;
-  uint64_t opened_inodes = 0;
+  std::atomic<uint64_t> opened_files = 0;
+  std::atomic<uint64_t> pinned_icaps = 0;
+  std::atomic<uint64_t> opened_inodes = 0;
 
-  uint64_t total_read_ops = 0;
-  uint64_t total_read_size = 0;
+  std::atomic<uint64_t> total_read_ops = 0;
+  std::atomic<uint64_t> total_read_size = 0;
 
-  uint64_t total_write_ops = 0;
-  uint64_t total_write_size = 0;
+  std::atomic<uint64_t> total_write_ops = 0;
+  std::atomic<uint64_t> total_write_size = 0;
 
   ceph::spinlock delay_i_lock;
   std::map<Inode*,int> delay_i_release;
 
-  uint64_t nr_metadata_request = 0;
-  uint64_t nr_read_request = 0;
-  uint64_t nr_write_request = 0;
+  std::atomic<uint64_t> nr_metadata_request = 0;
+  std::atomic<uint64_t> nr_read_request = 0;
+  std::atomic<uint64_t> nr_write_request = 0;
 
   std::vector<MDSCapAuth> cap_auths;
 

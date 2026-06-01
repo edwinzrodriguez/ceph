@@ -26,7 +26,7 @@ struct Fh {
   int       mode;       // the mode i opened the file with
 
   bool pos_locked = false;           // pos is currently in use
-  std::list<ceph::condition_variable*> pos_waiters;   // waiters for pos
+  std::list<ceph::reentrant_condition_variable*> pos_waiters;   // waiters for pos
 
   Readahead readahead;
 
