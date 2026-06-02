@@ -5778,6 +5778,7 @@ std::ostream& operator<<(std::ostream &out, const UserPerm& perm) {
 int Client::may_setattr(const InodeRef& in, struct ceph_statx *stx, int mask,
 			const UserPerm& perms)
 {
+  std::unique_lock in_lock(in->inode_lock);
   ldout(cct, 20) << __func__ << " " << *in << "; " << perms << " stx_mode: "
       << hex << stx->stx_mode << " mask:" << mask << dec << dendl;
   int r = _getattr_for_perm(in, perms);
@@ -5898,6 +5899,7 @@ out:
 
 int Client::may_lookup(const InodeRef& dir, const UserPerm& perms)
 {
+  std::unique_lock dir_lock(dir->inode_lock);
   ldout(cct, 20) << __func__ << " " << *dir << "; " << perms << dendl;
 
   int r = _getattr_for_perm(dir, perms);
@@ -5912,6 +5914,7 @@ out:
 
 int Client::may_create(const InodeRef& dir, const UserPerm& perms)
 {
+  std::unique_lock dir_lock(dir->inode_lock);
   ldout(cct, 20) << __func__ << " " << *dir << "; " << perms << dendl;
 #if defined(__linux__)
   if (dir->is_dir() && is_inode_locked(dir) && fscrypt_as)
@@ -5963,6 +5966,10 @@ int Client::may_delete(const walk_dentry_result& wdr, const UserPerm& perms, boo
   ldout(cct, 20) << __func__ << " " << wdr << "; " << perms << dendl;
   auto* diri = wdr.diri.get();
   auto* in = wdr.target.get();
+  std::unique_lock diri_lock(diri->inode_lock);
+  std::unique_lock in_lock(in->inode_lock, std::defer_lock);
+  if (in && in != diri)
+    in_lock.lock();
   int r = _getattr_for_perm(diri, perms);
   if (r < 0)
     goto out;
