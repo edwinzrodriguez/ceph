@@ -53,9 +53,7 @@ public:
       caps.push_back(&cap_item);
     });
   }
-  ~Cap() {
-    cap_item.remove_myself();
-  }
+  ~Cap();
 
   void touch(void) {
     // move to back of LRU
@@ -412,4 +410,8 @@ private:
 
 };
 
+inline Cap::~Cap() {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode.inode_lock));
+  cap_item.remove_myself();
+}
 #endif

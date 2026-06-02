@@ -3715,7 +3715,7 @@ void Client::_put_inode(Inode *in, int n)
 
   ldout(cct, 10) << __func__ << " on " << *in << " n = " << n << dendl;
   // ceph_assert(ceph_mutex_is_locked_by_me(in->inode_lock));
-  std::scoped_lock in_lock(in->inode_lock);
+  std::unique_lock in_lock(in->inode_lock);
 
   int left = in->get_nref();
   ceph_assert(left >= n + 1);
@@ -3738,7 +3738,7 @@ void Client::_put_inode(Inode *in, int n)
         root_parents.erase(root_parents.begin());
     }
 
-    // in->inode_lock.unlock();
+    in_lock.unlock();
     in->iput();
   }
 }
@@ -7039,7 +7039,7 @@ int Client::_do_lookup(const InodeRef& dir, const string& name, int mask,
 
   ldout(cct, 10) << __func__ << " on " << path << dendl;
 
-  unique_unlock in_unlock(dir->inode_lock);
+  unique_unlock dir_in_unlock(dir->inode_lock);
   int r = make_request(req, perms, target);
   ldout(cct, 10) << __func__ << " res is " << r << dendl;
   return r;
@@ -7076,7 +7076,7 @@ int Client::_lookup(const InodeRef& dir, const std::string& name, std::string& a
   mask &= CEPH_CAP_ANY_SHARED | CEPH_STAT_RSTAT;
   std::string dname = name;
 
-  std::unique_lock in_lock(dir->inode_lock);
+  std::unique_lock dir_lock(dir->inode_lock);
   if (!dir->is_dir()) {
     r = -ENOTDIR;
     goto done;
@@ -7139,7 +7139,7 @@ relookup:
 
     bool has_caps = false;
     if (dn->inode) {
-      std::unique_lock in_lock(dn->inode->inode_lock);
+      std::unique_lock dn_lock(dn->inode->inode_lock);
       has_caps = dn->inode->caps_issued_mask(mask, true);
     }
     
@@ -7278,15 +7278,14 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
     diri = std::move(dirinode);
   }
   ceph_assert(diri);
-  std::unique_lock diri_lock(diri->inode_lock);
   dname = "";
   alternate_name = "";
   target = InodeRef();
   int symlinks = 0;
   unsigned i = 0;
 
-  if (trimmed_path == "") {
-    std::string trimmed_path = path.get_trimmed_path();
+  if (trimmed_path.empty()) {
+    trimmed_path = path.get_trimmed_path();
   }
 
   ldout(cct, 10) << __func__ << ": cur=" << *diri << " path=" << binstrprint(trimmed_path) << dendl;
@@ -7333,6 +7332,7 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
         goto out;
       }
 
+      std::unique_lock diri_lock(diri->inode_lock);
       dn = get_or_create(diri.get(), dname.c_str());
 
       /* Get extra requested caps on the last component */
@@ -13853,7 +13853,7 @@ void Client::_ll_get(Inode *in)
 
 int Client::_ll_put(Inode *in, uint64_t num)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(in->inode_lock));
+  std::unique_lock in_lock(in->inode_lock);
   in->ll_put(num);
   ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " " << num << " -> " << in->ll_ref << dendl;
   if (in->ll_ref == 0) {
