@@ -2874,7 +2874,9 @@ void Client::send_request(MetaRequest *request, MetaSession *session,
     }
   }
 
-  session->requests.push_back(&request->item);
+  session->with_requests([request](auto& requests) {
+    requests.push_back(&request->item);
+  });
 
   ldout(cct, 10) << __func__ << " " << *r << " to mds." << mds << dendl;
   session->con->send_message2(std::move(r));
@@ -3063,7 +3065,9 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
   // Handle unsafe reply
   if (!is_safe) {
     request->got_unsafe = true;
-    session->unsafe_requests.push_back(&request->unsafe_item);
+    session->with_unsafe_requests([request](auto& unsafe_requests) {
+      unsafe_requests.push_back(&request->unsafe_item);
+    });
     if (is_dir_operation(request)) {
       Inode *dir = request->inode();
       ceph_assert(dir);
@@ -3550,10 +3554,13 @@ void Client::kick_requests(MetaSession *session)
 
 void Client::resend_unsafe_requests(MetaSession *session)
 {
-  for (xlist<MetaRequest*>::iterator iter = session->unsafe_requests.begin();
-       !iter.end();
-       ++iter)
-    send_request(*iter, session);
+  session->with_unsafe_requests([&](auto& unsafe_requests) {
+    for (xlist<MetaRequest*>::iterator iter = unsafe_requests.begin();
+         !iter.end();
+         ++iter) {
+      send_request(*iter, session);
+    }
+  });
 
   // also re-send old requests when MDS enters reconnect stage. So that MDS can
   // process completed requests in clientreplay stage.
@@ -3577,11 +3584,13 @@ void Client::wait_unsafe_requests()
   list<MetaRequest*> last_unsafe_reqs;
   for (const auto &p : mds_sessions) {
     const auto s = p.second;
-    if (!s->unsafe_requests.empty()) {
-      MetaRequest *req = s->unsafe_requests.back();
-      req->get();
-      last_unsafe_reqs.push_back(req);
-    }
+    s->with_unsafe_requests([&](auto& unsafe_requests) {
+      if (!unsafe_requests.empty()) {
+        MetaRequest *req = unsafe_requests.back();
+        req->get();
+        last_unsafe_reqs.push_back(req);
+      }
+    });
   }
 
   for (list<MetaRequest*>::iterator p = last_unsafe_reqs.begin();
@@ -4048,8 +4057,10 @@ void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
     }
   }
 
-  if (!session->flushing_caps_tids.empty())
-    m->set_oldest_flush_tid(*session->flushing_caps_tids.begin());
+  session->with_flushing_caps_tids([&](auto& tids) {
+    if (!tids.empty())
+      m->set_oldest_flush_tid(*tids.begin());
+  });
 
   session->con->send_message2(std::move(m));
 }
@@ -4158,23 +4169,25 @@ void Client::signal_caps_inode(Inode *in)
 
 void Client::wake_up_session_caps(MetaSession *s, bool reconnect)
 {
-  for (const auto &cap : s->caps) {
-    auto &in = cap->inode;
-    if (reconnect) {
-      in.requested_max_size = 0;
-      in.wanted_max_size = 0;
-    } else {
-      if (cap->gen < s->cap_gen) {
-	// mds did not re-issue stale cap.
-	cap->issued = cap->implemented = CEPH_CAP_PIN;
-	// make sure mds knows what we want.
-	if (in.caps_file_wanted() & ~cap->wanted)
-	  in.flags |= I_CAP_DROPPED;
+  s->with_caps_list([&](auto& caps) {
+    for (const auto &cap : caps) {
+      auto &in = cap->inode;
+      if (reconnect) {
+        in.requested_max_size = 0;
+        in.wanted_max_size = 0;
+      } else {
+        if (cap->gen < s->cap_gen) {
+          // mds did not re-issue stale cap.
+          cap->issued = cap->implemented = CEPH_CAP_PIN;
+          // make sure mds knows what we want.
+          if (in.caps_file_wanted() & ~cap->wanted)
+            in.flags |= I_CAP_DROPPED;
+        }
       }
+      ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
+      signal_caps_inode(&in);
     }
-    ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
-    signal_caps_inode(&in);
-  }
+  });
 }
 
 
@@ -5182,7 +5195,9 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, con
     if (it->first == flush_ack_tid)
       cleaned = it->second;
     if (it->first <= flush_ack_tid) {
-      session->flushing_caps_tids.erase(it->first);
+      session->with_flushing_caps_tids([&it](auto& tids) {
+        tids.erase(it->first);
+      });
       in->flushing_cap_tids.erase(it++);
       ++flushed;
       continue;
@@ -5216,9 +5231,10 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, con
   if (flushed) {
     ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
     signal_caps_inode(in);
-    if (session->flushing_caps_tids.empty() ||
-	*session->flushing_caps_tids.begin() > flush_ack_tid)
-      sync_cond.notify_all();
+    session->with_flushing_caps_tids([&](auto& tids) {
+      if (tids.empty() || *tids.begin() > flush_ack_tid)
+ sync_cond.notify_all();
+    });
   }
 
   if (cleaned && !in->caps_dirty()) {
@@ -5242,7 +5258,9 @@ void Client::handle_cap_flushsnap_ack(MetaSession *session, Inode *in, const MCo
       InodeRef tmp_ref(in);
       ldout(cct, 5) << __func__ << " mds." << mds << " flushed snap follows " << follows
 	      << " on " << *in << dendl;
-      session->flushing_caps_tids.erase(capsnap.flush_tid);
+      session->with_flushing_caps_tids([&capsnap](auto& tids) {
+        tids.erase(capsnap.flush_tid);
+      });
       in->flushing_cap_tids.erase(capsnap.flush_tid);
       if (in->flushing_caps == 0 && in->flushing_cap_tids.empty())
 	in->flushing_cap_item.remove_myself();
@@ -5250,9 +5268,10 @@ void Client::handle_cap_flushsnap_ack(MetaSession *session, Inode *in, const MCo
 
       ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
       signal_caps_inode(in);
-      if (session->flushing_caps_tids.empty() ||
-	  *session->flushing_caps_tids.begin() > flush_ack_tid)
-	sync_cond.notify_all();
+      session->with_flushing_caps_tids([&](auto& tids) {
+        if (tids.empty() || *tids.begin() > flush_ack_tid)
+          sync_cond.notify_all();
+      });
     }
   } else {
     ldout(cct, 5) << __func__ << " DUP(?) mds." << mds << " flushed snap follows " << follows
@@ -6594,15 +6613,17 @@ void Client::_unmount(bool abort)
   if (abort || blocklisted) {
     for (auto &q : mds_sessions) {
       auto s = q.second;
-      for (auto p = s->dirty_list.begin(); !p.end(); ) {
-        Inode *in = *p;
-        ++p;
-        if (in->dirty_caps) {
-          ldout(cct, 0) << " drop dirty caps on " << *in << dendl;
-          in->mark_caps_clean();
-          put_inode(in);
+      s->with_dirty_list([&](auto& dirty_list) {
+        for (auto p = dirty_list.begin(); !p.end(); ) {
+          Inode *in = *p;
+          ++p;
+          if (in->dirty_caps) {
+            ldout(cct, 0) << " drop dirty caps on " << *in << dendl;
+            in->mark_caps_clean();
+            put_inode(in);
+          }
         }
-      }
+      });
     }
   } else {
     flush_caps_sync();

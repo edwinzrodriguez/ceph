@@ -912,7 +912,9 @@ void Inode::mark_caps_dirty(int caps)
     iget();
 
   dirty_caps |= caps;
-  auth_cap->session->get_dirty_list().push_back(&dirty_cap_item);
+  auth_cap->session->with_dirty_list([this](auto& dirty_list) {
+    dirty_list.push_back(&dirty_cap_item);
+  });
   client->cap_delay_requeue(this);
 }
 

@@ -4,12 +4,15 @@
 #ifndef CEPH_CLIENT_METASESSION_H
 #define CEPH_CLIENT_METASESSION_H
 
+#include <utility>
+
 #include "include/types.h"
 #include "include/utime.h"
 #include "include/xlist.h"
 #include "mds/MDSMap.h"
 #include "mds/mdstypes.h"
 #include "messages/MClientCapRelease.h"
+#include "common/reentrant_lock.h"
 
 struct Cap;
 struct Inode;
@@ -17,6 +20,8 @@ struct CapSnap;
 struct MetaRequest;
 
 struct MetaSession {
+  mutable ceph::ReentrantLock session_lock =
+    ceph::make_reentrant("MetaSession::session_lock", false);
   mds_rank_t mds_num;
   ConnectionRef con;
   version_t seq = 0;
@@ -70,7 +75,41 @@ struct MetaSession {
     ceph_assert(unsafe_requests.empty());
   }
 
-  xlist<Inode*> &get_dirty_list() { return dirty_list; }
+  template <typename Func>
+  decltype(auto) with_caps_list(Func&& func) {
+    std::unique_lock lock(session_lock);
+    return std::forward<Func>(func)(caps);
+  }
+
+  template <typename Func>
+  decltype(auto) with_dirty_list(Func&& func) {
+    std::unique_lock lock(session_lock);
+    return std::forward<Func>(func)(dirty_list);
+  }
+
+  template <typename Func>
+  decltype(auto) with_flushing_caps(Func&& func) {
+    std::unique_lock lock(session_lock);
+    return std::forward<Func>(func)(flushing_caps);
+  }
+
+  template <typename Func>
+  decltype(auto) with_requests(Func&& func) {
+    std::unique_lock lock(session_lock);
+    return std::forward<Func>(func)(requests);
+  }
+
+  template <typename Func>
+  decltype(auto) with_unsafe_requests(Func&& func) {
+    std::unique_lock lock(session_lock);
+    return std::forward<Func>(func)(unsafe_requests);
+  }
+
+  template <typename Func>
+  decltype(auto) with_flushing_caps_tids(Func&& func) {
+    std::unique_lock lock(session_lock);
+    return std::forward<Func>(func)(flushing_caps_tids);
+  }
 
   const char *get_state_name() const;
 

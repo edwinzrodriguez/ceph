@@ -49,7 +49,9 @@ public:
                                   gen(s->cap_gen),
                                   cap_item(this)
   {
-    s->caps.push_back(&cap_item);
+    s->with_caps_list([this](auto& caps) {
+      caps.push_back(&cap_item);
+    });
   }
   ~Cap() {
     cap_item.remove_myself();
@@ -57,7 +59,9 @@ public:
 
   void touch(void) {
     // move to back of LRU
-    session->caps.push_back(&cap_item);
+    session->with_caps_list([this](auto& caps) {
+      caps.push_back(&cap_item);
+    });
   }
 
   void dump(Formatter *f) const;
