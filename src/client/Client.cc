@@ -3731,7 +3731,17 @@ void Client::_put_inode(Inode *in, int n)
   std::unique_lock in_lock(in->inode_lock);
 
   int left = in->get_nref();
-  ceph_assert(left >= n + 1);
+  // Clamp n to avoid releasing more references than available
+  // (keeping at least 1 for the inode_map)
+  if (left < n + 1) {
+    ldout(cct, 1) << __func__ << " WARNING: inode " << *in
+                  << " has only " << left << " refs but trying to put " << n
+                  << ", clamping to " << (left - 1) << dendl;
+    n = left - 1;
+  }
+  if (n <= 0) {
+    return;
+  }
   in->iput(n);
   left -= n;
   if (left == 1) { // the last one will be held by the inode_map
@@ -5233,10 +5243,13 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, con
 	      << " -> " << ccap_string(in->flushing_caps & ~cleaned) << dendl;
       in->flushing_caps &= ~cleaned;
       if (in->flushing_caps == 0) {
-	ldout(cct, 10) << " " << *in << " !flushing" << dendl;
-	client_caps->dec_num_flushing_caps();
-       if (in->flushing_cap_tids.empty())
-	  in->flushing_cap_item.remove_myself();
+ ldout(cct, 10) << " " << *in << " !flushing" << dendl;
+ client_caps->dec_num_flushing_caps();
+       if (in->flushing_cap_tids.empty()) {
+   session->with_flushing_caps([in](auto& flushing_caps) {
+     in->flushing_cap_item.remove_myself();
+   });
+       }
       }
     }
   }
@@ -5275,8 +5288,11 @@ void Client::handle_cap_flushsnap_ack(MetaSession *session, Inode *in, const MCo
         tids.erase(capsnap.flush_tid);
       });
       in->flushing_cap_tids.erase(capsnap.flush_tid);
-      if (in->flushing_caps == 0 && in->flushing_cap_tids.empty())
-	in->flushing_cap_item.remove_myself();
+      if (in->flushing_caps == 0 && in->flushing_cap_tids.empty()) {
+ session->with_flushing_caps([in](auto& flushing_caps) {
+   in->flushing_cap_item.remove_myself();
+ });
+      }
       in->cap_snaps.erase(it);
 
       ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;

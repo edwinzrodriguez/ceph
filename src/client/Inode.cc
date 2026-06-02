@@ -925,7 +925,13 @@ void Inode::mark_caps_clean()
 
   lsubdout(client->cct, client, 10) << __func__ << " " << *this << dendl;
   dirty_caps = 0;
-  dirty_cap_item.remove_myself();
+  if (auth_cap) {
+    auth_cap->session->with_dirty_list([this](auto& dirty_list) {
+      dirty_cap_item.remove_myself();
+    });
+  } else {
+    dirty_cap_item.remove_myself();
+  }
 }
 
 #if defined(__linux__)

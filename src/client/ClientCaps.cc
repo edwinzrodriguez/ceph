@@ -178,6 +178,11 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session,
         if (in->dirty_cap_item.is_on_list()) {
           ldout(cct, 10) << __func__ << " changing auth cap: "
                          << "add myself to new auth MDS' dirty caps list" << dendl;
+          // Need to remove from old session's dirty_list with its lock held,
+          // then add to new session's dirty_list with its lock held
+          in->auth_cap->session->with_dirty_list([in](auto& old_dirty_list) {
+            in->dirty_cap_item.remove_myself();
+          });
           mds_session->with_dirty_list([in](auto& dirty_list) {
             dirty_list.push_back(&in->dirty_cap_item);
           });
@@ -248,7 +253,9 @@ void ClientCaps::remove_cap(Cap *cap, bool queue_release)
   if (in.auth_cap == cap) {
     if (in.flushing_cap_item.is_on_list()) {
       ldout(cct, 10) << " removing myself from flushing_cap list" << dendl;
-      in.flushing_cap_item.remove_myself();
+      session->with_flushing_caps([&in](auto& flushing_caps) {
+        in.flushing_cap_item.remove_myself();
+      });
     }
     in.auth_cap = NULL;
   }
@@ -832,9 +839,12 @@ void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
       flush_tid = 0;
     }
 
-    in->delay_cap_item.remove_myself();
+    {
+      std::unique_lock caps_lock_guard(caps_lock);
+      in->delay_cap_item.remove_myself();
+    }
     send_cap(in.get(), session.get(), &cap, msg_flags, cap_used, wanted, retain,
-	     flushing, flush_tid);
+      flushing, flush_tid);
   }
 }
 
