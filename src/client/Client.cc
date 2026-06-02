@@ -910,8 +910,26 @@ void Client::trim_cache(bool trim_kernel_dcache)
 
     // trim!
     Dentry *dn = static_cast<Dentry*>(lru.lru_get_next_expire());
-    if (!dn)
+    if (!dn) {
+      // During unmount, pinned dentries of open-but-empty directories
+      // block progress. Force-close one to unpin its dentry, then retry.
+      if (is_unmounting()) {
+        bool found = false;
+        for (auto& [vino, in] : inode_map) {
+          if (in->dir && in->dir->is_empty()) {
+            ldout(cct, 10) << "trim_cache force-closing empty dir on " << *in << dendl;
+            close_dir(in->dir);
+            found = true;
+            break;
+          }
+        }
+        if (found) {
+          last = 0;  // force the outer while to retry
+          continue;
+        }
+      }
       break;  // done
+    }
 
     trim_dentry(dn);
   }
@@ -1767,7 +1785,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
  */
 Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
 {
-  auto& reply = request->reply;
+  auto reply = request->reply;  // Copy intrusive_ptr to prevent race condition
   int op = request->get_op();
 
   ldout(cct, 10) << "insert_trace from " << request->sent_stamp << " mds." << session->mds_num
@@ -2373,10 +2391,12 @@ int Client::make_request(MetaRequest *request,
     request->success = true;
 
   // kick dispatcher (we've got it!)
-  ceph_assert(request->dispatch_cond);
-  request->dispatch_cond->notify_all();
-  ldout(cct, 20) << "sendrecv kickback on tid " << tid << " " << request->dispatch_cond << dendl;
-  request->dispatch_cond = 0;
+  // dispatch_cond is only set for the first reply (unsafe or safe without unsafe)
+  if (request->dispatch_cond) {
+    request->dispatch_cond->notify_all();
+    ldout(cct, 20) << "sendrecv kickback on tid " << tid << " " << request->dispatch_cond << dendl;
+    request->dispatch_cond = 0;
+  }
   
   if (r >= 0 && ptarget)
     r = verify_reply_trace(r, session.get(), request, reply, ptarget, pcreated, perms);
@@ -3309,22 +3329,6 @@ Dispatcher::dispatch_result_t Client::ms_dispatch2(const MessageRef &m)
     return Dispatcher::UNHANDLED();
   }
 
-  // unmounting?
-  std::scoped_lock cl(client_lock);
-  if (is_unmounting()) {
-    ldout(cct, 10) << "unmounting: trim pass, size was " << lru.lru_get_size() 
-             << "+" << inode_map.size() << dendl;
-    uint64_t size = lru.lru_get_size() + inode_map.size();
-    trim_cache();
-    if (size > lru.lru_get_size() + inode_map.size()) {
-      ldout(cct, 10) << "unmounting: trim pass, cache shrank, poking unmount()" << dendl;
-      mount_cond.notify_all();
-    } else {
-      ldout(cct, 10) << "unmounting: trim pass, size still " << lru.lru_get_size() 
-               << "+" << inode_map.size() << dendl;
-    }
-  }
-
   return Dispatcher::HANDLED();
 }
 
@@ -3741,11 +3745,10 @@ void Client::_put_inode(Inode *in, int n)
                   << ", clamping to " << (left - 1) << dendl;
     n = left - 1;
   }
-  if (n <= 0) {
-    return;
+  if (n > 0) {
+    in->iput(n);
+    left -= n;
   }
-  in->iput(n);
-  left -= n;
   if (left == 1) { // the last one will be held by the inode_map
     // release any caps
     remove_all_caps(in);
@@ -6681,6 +6684,9 @@ void Client::_unmount(bool abort)
 	r == std::cv_status::timeout) {
       dump_cache(NULL);
     }
+    
+    // Process any inodes that were added to delay_i_release by message handlers
+    delay_put_inodes(true);
   }
   ceph_assert(lru.lru_get_size() == 0);
   ceph_assert(inode_map.empty());
