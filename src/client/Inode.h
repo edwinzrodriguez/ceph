@@ -412,6 +412,8 @@ private:
 
 inline Cap::~Cap() {
   ceph_assert(ceph_mutex_is_locked_by_me(inode.inode_lock));
-  cap_item.remove_myself();
+  session->with_caps_list([this](auto& caps) {
+    cap_item.remove_myself();
+  });
 }
 #endif
