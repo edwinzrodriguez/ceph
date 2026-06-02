@@ -315,6 +315,7 @@ public:
   friend class C_Client_CacheRelease; // Asserts on client_lock
   friend class ClientCaps; // Manages capability operations with its own lock
   friend class SyntheticClient;
+  friend class Dentry;
   friend void intrusive_ptr_release(Inode *in);
   template <typename T> friend struct RWRefState;
   template <typename T> friend class RWRef;
@@ -2211,6 +2212,7 @@ private:
   int _lazyio(Fh *fh, int enable);
 
   Dentry *get_or_create(Inode *dir, const std::string& name);
+  void ensure_dentry_lru(Dentry *dn);
 
   int _is_empty_directory(Inode *in, const UserPerm& perms);
 

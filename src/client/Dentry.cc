@@ -5,11 +5,30 @@
 #include "include/utime.h"
 
 #include "Dentry.h"
+#include "Client.h"
 #include "Dir.h"
 #include "Inode.h"
 
 #include "common/Formatter.h"
 #include "common/strescape.h"
+
+void Dentry::get()
+{
+  std::scoped_lock l(client->client_lock);
+  ceph_assert(ref > 0);
+  if (++ref == 2)
+    lru_pin();
+}
+
+void Dentry::put()
+{
+  std::scoped_lock l(client->client_lock);
+  ceph_assert(ref > 0);
+  if (--ref == 1)
+    lru_unpin();
+  if (ref == 0)
+    delete this;
+}
 
 void Dentry::dump(Formatter *f) const
 {

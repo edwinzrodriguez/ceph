@@ -12,7 +12,8 @@
 class Dentry : public LRUObject {
 public:
   explicit Dentry(Dir *_dir, const std::string &_name) :
-    dir(_dir), name(_name), inode_xlist_link(this)
+    dir(_dir), name(_name), client(_dir->parent_inode->client),
+    inode_xlist_link(this)
   {
     auto r = dir->dentries.insert(make_pair(name, this));
     ceph_assert(r.second);
@@ -27,20 +28,8 @@ public:
    * ref==1 -> cached, unused
    * ref >1 -> pinned in lru
    */
-  void get() {
-    ceph_assert(ref > 0);
-    if (++ref == 2)
-      lru_pin();
-    //cout << "dentry.get on " << this << " " << name << " now " << ref << std::endl;
-  }
-  void put() {
-    ceph_assert(ref > 0);
-    if (--ref == 1)
-      lru_unpin();
-    //cout << "dentry.put on " << this << " " << name << " now " << ref << std::endl;
-    if (ref == 0)
-      delete this;
-  }
+  void get();
+  void put();
   void link(InodeRef in) {
     inode = in;
     inode->dentries.push_back(&inode_xlist_link);
@@ -53,8 +42,9 @@ public:
     dir->num_null_dentries--;
   }
   void unlink(void) {
-    if (!inode)
+    if (!inode || !dir)
       return;
+    Dir *d = dir;
     if (inode->is_dir()) {
       if (inode->dir)
         put(); // dir -> dn pin
@@ -66,7 +56,7 @@ public:
       inode_xlist_link.remove_myself();
     }
     inode.reset();
-    dir->num_null_dentries++;
+    d->num_null_dentries++;
   }
   void mark_primary() {
     if (inode && inode->dentries.front() != this)
@@ -102,6 +92,7 @@ public:
 
   Dir	   *dir;
   const std::string name;
+  Client    *client;
   InodeRef inode;
   int	   ref = 1; // 1 if there's a dir beneath me.
   int64_t offset = 0;

@@ -976,6 +976,13 @@ void Client::trim_cache_for_reconnect(MetaSession *s)
 
 void Client::trim_dentry(Dentry *dn)
 {
+  if (!dn->dir) {
+    ldout(cct, 15) << "trim_dentry skipping already-detached dn " << dn->name
+		   << dendl;
+    if (dn->lru_is_cached())
+      lru.lru_remove(dn);
+    return;
+  }
   ldout(cct, 15) << "trim_dentry unlinking dn " << dn->name 
 		 << " in dir "
 		 << std::hex << dn->dir->parent_inode->ino << std::dec
@@ -3847,6 +3854,15 @@ void Client::close_dir(Dir *dir)
   put_inode(in);               // unpin inode
 }
 
+void Client::ensure_dentry_lru(Dentry *dn)
+{
+  if (dn->lru_is_cached())
+    return;
+  std::unique_lock lock(client_lock);
+  if (!dn->lru_is_cached())
+    lru.lru_insert_mid(dn);
+}
+
   /**
    * Don't call this with in==NULL, use get_or_create for that
    * leave dn set to default NULL unless you're trying to add
@@ -3859,24 +3875,10 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
     auto it = dir->dentries.find(name);
     if (it != dir->dentries.end()) {
       dn = it->second;
+      ensure_dentry_lru(dn);
     } else {
       dn = new Dentry(dir, name);
-
-      // LRU maintenance uses client_lock.  Callers such as path_walk may hold
-      // the parent directory's inode_lock; make_request may hold client_lock and
-      // then take inode_lock.  Drop a held parent inode_lock only after the
-      // dentry is in dir->dentries so we never wait for client_lock while
-      // holding inode_lock, and dentry names stay unique.
-      Inode *parent = dir->parent_inode;
-      if (parent && ceph_mutex_is_locked_by_me(parent->inode_lock) &&
-          !ceph_mutex_is_locked_by_me(client_lock)) {
-        unique_unlock parent_unlock(parent->inode_lock);
-        std::unique_lock lock(client_lock);
-        lru.lru_insert_mid(dn);    // mid or top?
-      } else {
-        std::unique_lock lock(client_lock);
-        lru.lru_insert_mid(dn);    // mid or top?
-      }
+      ensure_dentry_lru(dn);
     }
 
     if(in) {
@@ -3890,6 +3892,7 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
     }
   } else {
     ceph_assert(!dn->inode);
+    ensure_dentry_lru(dn);
     ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' to inode " << in
 		   << " dn " << *dn << " (old dn)" << dendl;
   }
@@ -3917,6 +3920,18 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
 
 void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 {
+  std::unique_lock cl(client_lock);
+
+  if (!keepdentry && !dn->dir) {
+    if (dn->lru_is_cached())
+      lru.lru_remove(dn);
+    return;
+  }
+
+  // Pin for the duration so Dentry::unlink()'s put() calls cannot delete
+  // the dentry before we detach it from the directory and LRU.
+  dn->get();
+
   InodeRef in(dn->inode);
   ldout(cct, 15) << "unlink dir " << dn->dir->parent_inode << " '" << dn->name << "' dn " << dn
 		 << " inode " << dn->inode << dendl;
@@ -3930,15 +3945,18 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 
   if (keepdentry) {
     dn->lease_mds = -1;
+    dn->put();
   } else {
     ldout(cct, 15) << "unlink  removing '" << dn->name << "' dn " << dn << dendl;
 
-    // unlink from dir
     Dir *dir = dn->dir;
+    ceph_assert(dir);
+
+    lru.lru_remove(dn);
     dn->detach();
 
-    // delete den
-    lru.lru_remove(dn);
+    while (dn->ref > 1)
+      dn->put();
     dn->put();
 
     if (dir->is_empty() && !keepdir)
@@ -7350,16 +7368,25 @@ relookup:
 
 Dentry *Client::get_or_create(Inode *dir, const std::string& name)
 {
-  // lookup
   ldout(cct, 20) << __func__ << " " << *dir << " name " << name << dendl;
-  Dir *d = dir->open_dir();
   std::unique_lock diri_lock(dir->inode_lock);
+  if (!dir->dir) {
+    dir->dir = new Dir(dir);
+    ldout(cct, 15) << "open_dir " << dir->dir << " on " << dir << dendl;
+    ceph_assert(dir->dentries.size() < 2);
+    if (!dir->dentries.empty())
+      dir->get_first_parent()->get();
+    dir->iget();
+  }
+  Dir *d = dir->dir;
   auto it = d->dentries.find(name);
-  if (it != d->dentries.end())
+  if (it != d->dentries.end()) {
+    ensure_dentry_lru(it->second);
     return it->second;
-  // link() drops inode_lock only while updating the LRU, after the dentry
-  // is inserted; keep inode_lock held across find+create like insert_trace.
-  return link(d, name, NULL, NULL);
+  }
+  Dentry *dn = new Dentry(d, name);
+  ensure_dentry_lru(dn);
+  return dn;
 }
 
 int Client::walk(std::string_view path, walk_dentry_result* wdr, const UserPerm& perms, bool followsym)
@@ -7456,9 +7483,8 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
         goto out;
       }
 
-      // get_or_create/link takes client_lock; _lookup/_do_lookup may take
-      // client_lock (make_request) then inode_lock.  Do not hold diri's
-      // inode_lock across dentry creation.
+      // get_or_create takes diri's inode_lock internally; do not hold it here.
+      // _lookup/_do_lookup may take client_lock (make_request) then inode_lock.
       if (i == (path.depth() - 1)) {
         dn = get_or_create(diri.get(), dname.c_str());
       } else {
