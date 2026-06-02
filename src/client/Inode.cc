@@ -372,8 +372,6 @@ bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
 
 int Inode::caps_used()
 {
-  std::unique_lock in_lock(inode_lock);
-
   int w = 0;
   for (const auto &[cap, cnt] : cap_refs)
     if (cnt)

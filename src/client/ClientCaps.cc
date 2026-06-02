@@ -78,8 +78,6 @@ epoch_t ClientCaps::get_cap_epoch_barrier() const
 
 int ClientCaps::get_caps_used(Inode *in)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(in->inode_lock));
-  
   unsigned used = in->caps_used();
   if (!(used & CEPH_CAP_FILE_CACHE)) {
     bool is_empty = client->objectcacher->set_is_empty(&in->oset);

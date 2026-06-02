@@ -2330,7 +2330,13 @@ int Client::make_request(MetaRequest *request,
     }
 
     // send request.
-    send_request(request, session.get());
+    // Release client_lock before calling send_request() to maintain proper lock ordering.
+    // send_request() -> encode_cap_releases() -> encode_inode_release() needs inode_lock,
+    // and the correct lock ordering is: inode_lock first, then client_lock.
+    {
+      unique_unlock c_unlock(client_lock);
+      send_request(request, session.get());
+    }
 
     // wait for signal
     ldout(cct, 20) << "awaiting reply|forward|kick on " << &caller_cond << dendl;
@@ -2439,7 +2445,11 @@ int Client::encode_inode_release(Inode *in, MetaRequest *req,
   auto it = in->caps.find(mds);
   if (it != in->caps.end()) {
     Cap &cap = it->second;
+    // Acquire inode_lock to access inode data (dirty_caps, cap_refs)
+    // Caller must not hold client_lock to maintain lock ordering
+    std::unique_lock inode_lock(in->inode_lock);
     drop &= ~(in->dirty_caps | get_caps_used(in));
+    
     if ((drop & cap.issued) &&
 	!(unless & cap.issued)) {
       ldout(cct, 25) << "dropping caps " << ccap_string(drop) << dendl;
@@ -2468,6 +2478,7 @@ int Client::encode_inode_release(Inode *in, MetaRequest *req,
       rel.dname_seq = 0;
       req->cap_releases.push_back(MClientRequest::Release(rel,""));
     }
+    inode_lock.unlock();
   }
   ldout(cct, 25) << __func__ << " exit(in:" << *in << ") released:"
 	   << released << dendl;
@@ -2481,7 +2492,9 @@ void Client::encode_dentry_release(Dentry *dn, MetaRequest *req,
 	   << dn << ")" << dendl;
   int released = 0;
   if (dn->dir) {
-    std::unique_lock in_lock(dn->dir->parent_inode->inode_lock);
+    // Don't acquire inode_lock here - it violates lock ordering
+    // when called from send_request which may hold client_lock.
+    // The inode_lock should be held by the caller if needed.
     released = encode_inode_release(dn->dir->parent_inode, req,
                                    mds, drop, unless, 1);
   }
