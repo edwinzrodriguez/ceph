@@ -7346,7 +7346,14 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
       }
 
       std::unique_lock diri_lock(diri->inode_lock);
-      dn = get_or_create(diri.get(), dname.c_str());
+      // Only store the dentry for the last component
+      if (i == (path.depth() - 1)) {
+        dn = get_or_create(diri.get(), dname.c_str());
+      } else {
+        // For intermediate components, just ensure the dentry exists
+        // but don't store it in dn to avoid premature deletion
+        (void)get_or_create(diri.get(), dname.c_str());
+      }
 
       /* Get extra requested caps on the last component */
       if (i == (path.depth() - 1)) {
