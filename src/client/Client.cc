@@ -3819,10 +3819,17 @@ void Client::put_inode(Inode *in, int n)
 {
   ldout(cct, 20) << __func__ << " on " << *in << " n = " << n << dendl;
 
-  std::scoped_lock dl(delay_i_lock);
-  delay_i_release[in] += n;
-  if (is_unmounting())
+  bool unmounting = is_unmounting();
+  {
+    std::scoped_lock dl(delay_i_lock);
+    delay_i_release[in] += n;
+  }
+  // During unmount, process delayed puts immediately when the caller
+  // already holds client_lock (mount_cond requires the same mutex).
+  if (unmounting && ceph_mutex_is_locked_by_me(client_lock)) {
+    delay_put_inodes(true);
     mount_cond.notify_all();
+  }
 }
 
 void Client::close_dir(Dir *dir)
@@ -3848,12 +3855,28 @@ void Client::close_dir(Dir *dir)
 Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
 {
   if (!dn) {
-    // create a new Dentry
-    dn = new Dentry(dir, name);
+    // Another thread may have created the dentry while we waited for locks.
+    auto it = dir->dentries.find(name);
+    if (it != dir->dentries.end()) {
+      dn = it->second;
+    } else {
+      dn = new Dentry(dir, name);
 
-    {
-      std::unique_lock lock(client_lock);
-      lru.lru_insert_mid(dn);    // mid or top?
+      // LRU maintenance uses client_lock.  Callers such as path_walk may hold
+      // the parent directory's inode_lock; make_request may hold client_lock and
+      // then take inode_lock.  Drop a held parent inode_lock only after the
+      // dentry is in dir->dentries so we never wait for client_lock while
+      // holding inode_lock, and dentry names stay unique.
+      Inode *parent = dir->parent_inode;
+      if (parent && ceph_mutex_is_locked_by_me(parent->inode_lock) &&
+          !ceph_mutex_is_locked_by_me(client_lock)) {
+        unique_unlock parent_unlock(parent->inode_lock);
+        std::unique_lock lock(client_lock);
+        lru.lru_insert_mid(dn);    // mid or top?
+      } else {
+        std::unique_lock lock(client_lock);
+        lru.lru_insert_mid(dn);    // mid or top?
+      }
     }
 
     if(in) {
@@ -3947,6 +3970,7 @@ public:
     if (client->is_unmounting()) {
       std::scoped_lock cl(client->client_lock);
       client->check_caps(inode, Client::CHECK_CAPS_NODELAY);
+      client->delay_put_inodes(true);
       client->mount_cond.notify_all();
     }
   }
@@ -6708,6 +6732,27 @@ void Client::_unmount(bool abort)
     uint64_t size = lru.lru_get_size() + inode_map.size();
     trim_cache();
     delay_put_inodes(true);
+
+    // Pin inodes before any cap work; do not drop client_lock here or
+    // another thread may delete inodes still listed in inode_map.
+    {
+      std::vector<InodeRef> inodes;
+      for (auto& [vino, in] : inode_map) {
+        if (!in->caps.empty())
+          inodes.emplace_back(in);
+      }
+      for (size_t i = 0; i < inodes.size(); ++i) {
+        unsigned flags = CHECK_CAPS_NODELAY;
+        if (i + 1 == inodes.size())
+          flags |= CHECK_CAPS_SYNCHRONOUS;
+        check_caps(inodes[i], flags);
+      }
+    }
+    flush_caps_sync();
+    wait_sync_caps(last_flush_tid);
+    delay_put_inodes(true);
+    trim_cache();
+
     if (size > lru.lru_get_size() + inode_map.size()) {
       continue;
     }
@@ -7109,8 +7154,15 @@ int Client::_do_lookup(const InodeRef& dir, const string& name, int mask,
 
   ldout(cct, 10) << __func__ << " on " << path << dendl;
 
-  unique_unlock dir_in_unlock(dir->inode_lock);
-  int r = make_request(req, perms, target);
+  // make_nosnap_relative_path() releases inode_lock itself.  Only drop
+  // the lock here if our caller (e.g. _lookup) is still holding it.
+  int r;
+  if (dir->inode_lock.is_locked_by_me()) {
+    unique_unlock dir_in_unlock(dir->inode_lock);
+    r = make_request(req, perms, target);
+  } else {
+    r = make_request(req, perms, target);
+  }
   ldout(cct, 10) << __func__ << " res is " << r << dendl;
   return r;
 }
@@ -7300,12 +7352,14 @@ Dentry *Client::get_or_create(Inode *dir, const std::string& name)
 {
   // lookup
   ldout(cct, 20) << __func__ << " " << *dir << " name " << name << dendl;
-  dir->open_dir();
-  auto it = dir->dir->dentries.find(name);
-  if (it != dir->dir->dentries.end())
+  Dir *d = dir->open_dir();
+  std::unique_lock diri_lock(dir->inode_lock);
+  auto it = d->dentries.find(name);
+  if (it != d->dentries.end())
     return it->second;
-  else // otherwise link up a new one
-    return link(dir->dir, name, NULL, NULL);
+  // link() drops inode_lock only while updating the LRU, after the dentry
+  // is inserted; keep inode_lock held across find+create like insert_trace.
+  return link(d, name, NULL, NULL);
 }
 
 int Client::walk(std::string_view path, walk_dentry_result* wdr, const UserPerm& perms, bool followsym)
@@ -7402,8 +7456,9 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
         goto out;
       }
 
-      std::unique_lock diri_lock(diri->inode_lock);
-      // Only store the dentry for the last component
+      // get_or_create/link takes client_lock; _lookup/_do_lookup may take
+      // client_lock (make_request) then inode_lock.  Do not hold diri's
+      // inode_lock across dentry creation.
       if (i == (path.depth() - 1)) {
         dn = get_or_create(diri.get(), dname.c_str());
       } else {

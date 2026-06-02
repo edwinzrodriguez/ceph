@@ -105,10 +105,15 @@ void Inode::make_long_path(filepath& p)
   if (!dentries.empty()) {
     Dentry *dn = get_first_parent();
     ceph_assert(dn->dir && dn->dir->parent_inode);
-    dn->dir->parent_inode->make_long_path(p);
-    p.push_dentry(dn->name);
+    InodeRef parent = dn->dir->parent_inode;
+    std::string name = dn->name;
+    in_lock.unlock();
+    parent->make_long_path(p);
+    p.push_dentry(name);
   } else if (snapdir_parent) {
-    make_nosnap_relative_path(p);
+    InodeRef snapdir = snapdir_parent;
+    in_lock.unlock();
+    snapdir->make_nosnap_relative_path(p);
   } else
     p = filepath(ino);
 }
@@ -120,9 +125,15 @@ void Inode::make_short_path(filepath& p)
   if (!dentries.empty()) {
     Dentry *dn = get_first_parent();
     ceph_assert(dn->dir && dn->dir->parent_inode);
-    p = filepath(dn->name, dn->dir->parent_inode->ino);
+    InodeRef parent = dn->dir->parent_inode;
+    std::string name = dn->name;
+    inodeno_t parent_ino = parent->ino;
+    in_lock.unlock();
+    p = filepath(name, parent_ino);
   } else if (snapdir_parent) {
-    make_nosnap_relative_path(p);
+    InodeRef snapdir = snapdir_parent;
+    in_lock.unlock();
+    snapdir->make_nosnap_relative_path(p);
   } else
     p = filepath(ino);
 }
@@ -136,13 +147,23 @@ bool Inode::make_path_string(std::string& s)
 
   if (client->_get_root_ino(false) == ino) {
     return true;
-  } else if (!dentries.empty()) {
-    Dentry *dn = get_first_parent();
-    ceph_assert(dn->dir && dn->dir->parent_inode);
-    return dn->make_path_string(s);
+  }
+  if (dentries.empty()) {
+    return false;
   }
 
-  return false;
+  Dentry *dn = get_first_parent();
+  ceph_assert(dn->dir && dn->dir->parent_inode);
+  InodeRef parent = dn->dir->parent_inode;
+  std::string name = dn->name;
+  in_lock.unlock();
+
+  if (!parent->make_path_string(s)) {
+    return false;
+  }
+  s += "/";
+  s.append(name);
+  return true;
 }
 
 /*
@@ -157,14 +178,19 @@ void Inode::make_nosnap_relative_path(filepath& p)
   if (snapid == CEPH_NOSNAP) {
     p = filepath(ino);
   } else if (snapdir_parent) {
-    snapdir_parent->make_nosnap_relative_path(p);
+    InodeRef snapdir = snapdir_parent;
+    in_lock.unlock();
+    snapdir->make_nosnap_relative_path(p);
     string empty;
     p.push_dentry(empty);
   } else if (!dentries.empty()) {
     Dentry *dn = get_first_parent();
     ceph_assert(dn->dir && dn->dir->parent_inode);
-    dn->dir->parent_inode->make_nosnap_relative_path(p);
-    p.push_dentry(dn->name);
+    InodeRef parent = dn->dir->parent_inode;
+    std::string name = dn->name;
+    in_lock.unlock();
+    parent->make_nosnap_relative_path(p);
+    p.push_dentry(name);
   } else {
     p = filepath(ino);
   }

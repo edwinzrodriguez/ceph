@@ -53,14 +53,18 @@ public:
     dir->num_null_dentries--;
   }
   void unlink(void) {
+    if (!inode)
+      return;
     if (inode->is_dir()) {
       if (inode->dir)
         put(); // dir -> dn pin
       if (inode->ll_ref)
         put(); // ll_ref -> dn pin
     }
-    ceph_assert(inode_xlist_link.get_list() == &inode->dentries);
-    inode_xlist_link.remove_myself();
+    if (inode_xlist_link.is_on_list()) {
+      ceph_assert(inode_xlist_link.get_list() == &inode->dentries);
+      inode_xlist_link.remove_myself();
+    }
     inode.reset();
     dir->num_null_dentries++;
   }
