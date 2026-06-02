@@ -3329,6 +3329,24 @@ Dispatcher::dispatch_result_t Client::ms_dispatch2(const MessageRef &m)
     return Dispatcher::UNHANDLED();
   }
 
+  // During unmount, trim the cache after each handled message and wake the
+  // unmount thread when progress is made.
+  std::scoped_lock cl(client_lock);
+  if (is_unmounting()) {
+    ldout(cct, 10) << "unmounting: trim pass, size was " << lru.lru_get_size()
+             << "+" << inode_map.size() << dendl;
+    uint64_t size = lru.lru_get_size() + inode_map.size();
+    trim_cache();
+    if (size > lru.lru_get_size() + inode_map.size()) {
+      ldout(cct, 10) << "unmounting: trim pass, cache shrank, poking unmount()"
+               << dendl;
+      mount_cond.notify_all();
+    } else {
+      ldout(cct, 10) << "unmounting: trim pass, size still " << lru.lru_get_size()
+               << "+" << inode_map.size() << dendl;
+    }
+  }
+
   return Dispatcher::HANDLED();
 }
 
@@ -3803,6 +3821,8 @@ void Client::put_inode(Inode *in, int n)
 
   std::scoped_lock dl(delay_i_lock);
   delay_i_release[in] += n;
+  if (is_unmounting())
+    mount_cond.notify_all();
 }
 
 void Client::close_dir(Dir *dir)
@@ -3923,6 +3943,11 @@ public:
         << " 0x" << std::hex << inode->ino << std::dec
         << ": " << r << "(" << cpp_strerror(r) << ")" << dendl;
       inode->set_async_err(r);
+    }
+    if (client->is_unmounting()) {
+      std::scoped_lock cl(client->client_lock);
+      client->check_caps(inode, Client::CHECK_CAPS_NODELAY);
+      client->mount_cond.notify_all();
     }
   }
 };
@@ -6680,13 +6705,17 @@ void Client::_unmount(bool abort)
 	    << ", waiting (for caps to release?)"
             << dendl;
 
+    uint64_t size = lru.lru_get_size() + inode_map.size();
+    trim_cache();
+    delay_put_inodes(true);
+    if (size > lru.lru_get_size() + inode_map.size()) {
+      continue;
+    }
+
     if (auto r = mount_cond.wait_for(lock, ceph::make_timespan(5));
 	r == std::cv_status::timeout) {
       dump_cache(NULL);
     }
-    
-    // Process any inodes that were added to delay_i_release by message handlers
-    delay_put_inodes(true);
   }
   ceph_assert(lru.lru_get_size() == 0);
   ceph_assert(inode_map.empty());
