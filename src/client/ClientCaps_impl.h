@@ -30,12 +30,11 @@ void ClientCaps::process_delayed_caps(ceph::coarse_mono_time now, bool mount_abo
     while (!p.end()) {
       Inode *in = *p;
       ++p;
-      if (!mount_aborted && in->hold_caps_until > now)
+      if (!mount_aborted && !client->is_unmounting() &&
+	  in->hold_caps_until > now)
         break;
       delayed_list.pop_front();
-      if (!mount_aborted) {
-        to_process.push_back(in);
-      }
+      to_process.push_back(in);
     }
   }
   

@@ -107,6 +107,7 @@ public:
   
   // Capability delay management
   void cap_delay_requeue(Inode *in);
+  void prepare_inode_unmount(Inode *in);
   template<typename Func>
   void process_delayed_caps(ceph::coarse_mono_time now, bool mount_aborted, Func&& func);
   

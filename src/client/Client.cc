@@ -3986,10 +3986,12 @@ public:
       inode->set_async_err(r);
     }
     if (client->is_unmounting()) {
-      std::scoped_lock cl(client->client_lock);
+      {
+        std::scoped_lock cl(client->client_lock);
+        client->delay_put_inodes(true);
+        client->mount_cond.notify_all();
+      }
       client->check_caps(inode, Client::CHECK_CAPS_NODELAY);
-      client->delay_put_inodes(true);
-      client->mount_cond.notify_all();
     }
   }
 };
@@ -4421,14 +4423,24 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
 
 void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
 {
-  // Called from ObjectCacher with cache_lock held, need to acquire client_lock
-  // Use std::scoped_lock to acquire client_lock while avoiding deadlock
+  // Called from ObjectCacher with cache_lock held.  Lock order is inode_lock
+  // then client_lock (see _put_inode).  ObjectCacher writeback may invoke this
+  // via C_ReentrantLock with client_lock already held — drop it first.
   Inode *in = static_cast<Inode *>(oset->parent);
   ceph_assert(in);
-  unique_unlock c_unlock(client_lock);
-  std::unique_lock in_lock(in->inode_lock);
-  std::unique_lock c_lock(client_lock);
-  _flushed(in);
+  if (ceph_mutex_is_locked_by_me(client_lock)) {
+    unique_unlock cl(client_lock);
+    std::unique_lock in_lock(in->inode_lock);
+    std::unique_lock c_lock(client_lock);
+    _flushed(in);
+  } else if (ceph_mutex_is_locked_by_me(in->inode_lock)) {
+    std::unique_lock c_lock(client_lock);
+    _flushed(in);
+  } else {
+    std::unique_lock in_lock(in->inode_lock);
+    std::unique_lock c_lock(client_lock);
+    _flushed(in);
+  }
 }
 
 void Client::_flushed(Inode *in)
@@ -5642,6 +5654,11 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
   // may drop inode's last ref
   if (deleted_inode)
     _try_to_trim_inode(in, true);
+
+  if (is_unmounting()) {
+    delay_put_inodes(true);
+    mount_cond.notify_all();
+  }
 }
 
 int Client::mds_check_access(std::string& path, const UserPerm& perms, int mask)
@@ -6706,11 +6723,14 @@ void Client::_unmount(bool abort)
       // prevent inode from getting freed
       anchor.emplace_back(in);
 
-      if (abort || blocklisted) {
-        objectcacher->purge_set(&in->oset);
-      } else if (!in->caps.empty()) {
-	_release(in);
-	_flush(in, new C_Client_FlushComplete(this, in));
+      if (!in->caps.empty()) {
+	if (abort || blocklisted) {
+	  objectcacher->purge_set(&in->oset);
+	} else {
+	  unique_unlock unlock(client_lock);
+	  client_caps->prepare_inode_unmount(in);
+	  check_caps(in, CHECK_CAPS_NODELAY | CHECK_CAPS_SYNCHRONOUS);
+	}
       }
     }
   }
@@ -6751,11 +6771,16 @@ void Client::_unmount(bool abort)
     trim_cache();
     delay_put_inodes(true);
 
-    // Pin inodes before any cap work; do not drop client_lock here or
-    // another thread may delete inodes still listed in inode_map.
+    // Pin inodes before any cap work.  prepare_inode_unmount uses inode_lock
+    // only (see _put_inode); drop client_lock briefly to avoid ABBA deadlock
+    // with ms_dispatch (inode_lock -> client_lock).
     {
       std::vector<InodeRef> inodes;
       for (auto& [vino, in] : inode_map) {
+	{
+	  unique_unlock unlock(client_lock);
+	  client_caps->prepare_inode_unmount(in);
+	}
         if (!in->caps.empty())
           inodes.emplace_back(in);
       }
@@ -6763,6 +6788,7 @@ void Client::_unmount(bool abort)
         unsigned flags = CHECK_CAPS_NODELAY;
         if (i + 1 == inodes.size())
           flags |= CHECK_CAPS_SYNCHRONOUS;
+        unique_unlock unlock(client_lock);
         check_caps(inodes[i], flags);
       }
     }
@@ -6770,6 +6796,7 @@ void Client::_unmount(bool abort)
     wait_sync_caps(last_flush_tid);
     delay_put_inodes(true);
     trim_cache();
+    mount_cond.notify_all();
 
     if (size > lru.lru_get_size() + inode_map.size()) {
       continue;

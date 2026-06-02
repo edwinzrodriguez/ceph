@@ -469,6 +469,30 @@ void ClientCaps::cap_delay_requeue(Inode *in)
   delayed_list.push_back(&in->delay_cap_item);
 }
 
+void ClientCaps::prepare_inode_unmount(Inode *in)
+{
+  // inode_lock before client_lock (same order as _put_inode) — callers must
+  // not hold client_lock across this function.
+  ceph_assert(ceph_mutex_is_not_locked_by_me(client->client_lock));
+
+  std::unique_lock in_lock(in->inode_lock);
+
+  client->objectcacher->purge_set(&in->oset);
+
+  std::vector<std::pair<int, int>> refs(in->cap_refs.begin(),
+					in->cap_refs.end());
+  for (auto &[cap, cnt] : refs) {
+    for (int i = 0; i < cnt; ++i)
+      put_cap_ref(in, cap);
+  }
+
+  {
+    std::unique_lock caps_lock_guard(caps_lock);
+    in->delay_cap_item.remove_myself();
+  }
+  in->hold_caps_until = ceph::coarse_mono_clock::time_point::min();
+}
+
 void ClientCaps::flush_cap_releases()
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
@@ -711,8 +735,15 @@ int ClientCaps::adjust_caps_used_for_lazyio(int used, int issued, int implemente
 void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
 {
   std::unique_lock in_lock(in->inode_lock);
-  unsigned wanted = in->caps_wanted();
-  unsigned used = get_caps_used(in.get());
+  unsigned wanted;
+  unsigned used;
+  if (client->is_unmounting()) {
+    wanted = 0;
+    used = 0;
+  } else {
+    wanted = in->caps_wanted();
+    used = get_caps_used(in.get());
+  }
   unsigned cap_used;
 
   int implemented;
@@ -765,9 +796,11 @@ void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
   }
 
   for (auto &[mds, cap] : in->caps) {
-    std::unique_lock in_lock(client->client_lock);
-
-    auto session = client->mds_sessions.at(mds);
+    // Use cap.session; do not take client_lock here.  check_caps runs under
+    // inode_lock (e.g. from _close) and nesting inode_lock -> client_lock
+    // deadlocks with flush_set_callback (client_lock -> inode_lock).
+    MetaSession *session = cap.session;
+    ceph_assert(session->mds_num == mds);
 
     cap_used = used;
     if (in->auth_cap && &cap != in->auth_cap)
@@ -822,7 +855,7 @@ void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
       if (in->flags & I_KICK_FLUSH) {
 	ldout(cct, 20) << " reflushing caps (check_caps) on " << *in
 		       << " to mds." << mds << dendl;
-	kick_flushing_caps(in.get(), session.get());
+	kick_flushing_caps(in.get(), session);
       }
       if (!in->cap_snaps.empty() &&
 	  in->cap_snaps.rbegin()->second.flush_tid == 0)
@@ -845,7 +878,7 @@ void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
       std::unique_lock caps_lock_guard(caps_lock);
       in->delay_cap_item.remove_myself();
     }
-    send_cap(in.get(), session.get(), &cap, msg_flags, cap_used, wanted, retain,
+    send_cap(in.get(), session, &cap, msg_flags, cap_used, wanted, retain,
       flushing, flush_tid);
   }
 }
