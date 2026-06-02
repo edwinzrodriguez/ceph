@@ -899,6 +899,7 @@ void Client::update_io_stat_write(utime_t latency) {
 
 void Client::trim_cache(bool trim_kernel_dcache)
 {
+  std::unique_lock lock(client_lock);
   uint64_t max = cct->_conf->client_cache_size;
   ldout(cct, 20) << "trim_cache size " << lru.lru_get_size() << " max " << max << dendl;
   unsigned last = 0;
@@ -1546,6 +1547,7 @@ void Client::update_dir_dist(Inode *in, DirStat *dst, mds_rank_t from)
 
 void Client::clear_dir_complete_and_ordered(Inode *diri, bool complete)
 {
+  std::unique_lock diri_lock(diri->inode_lock);
   if (complete)
     diri->dir_release_count++;
   else
@@ -3781,12 +3783,15 @@ void Client::delay_put_inodes(bool wakeup)
 
   for (auto &[in, cnt] : release) {
     // in->inode_lock.lock();
-    unique_unlock c_unlock(client_lock);
-    _put_inode(in, cnt);
+    {
+      unique_unlock c_unlock(client_lock);
+      _put_inode(in, cnt);
+    }
+    // Signal after each inode release during unmount so the unmount
+    // thread can check if the cache is empty
+    if (wakeup)
+      mount_cond.notify_all();
   }
-
-  if (wakeup)
-    mount_cond.notify_all();
 }
 
 void Client::put_inode(Inode *in, int n)
@@ -5759,6 +5764,7 @@ out:
 
 int Client::may_open(const InodeRef& in, int flags, const UserPerm& perms)
 {
+  std::unique_lock in_lock(in->inode_lock);
   ldout(cct, 20) << __func__ << " " << *in << "; " << perms << dendl;
   unsigned want = 0;
 
@@ -6662,7 +6668,7 @@ void Client::_unmount(bool abort)
   // empty lru cache
   trim_cache();
 
-  delay_put_inodes();
+  delay_put_inodes(true);
 
   while (lru.lru_get_size() > 0 ||
          !inode_map.empty()) {
