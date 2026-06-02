@@ -106,6 +106,7 @@ using namespace std::literals::string_view_literals;
 #include "Client.h"
 #include "ClientCaps.h"
 #include "Inode.h"
+#include "ClientCaps_impl.h"
 #include "Dentry.h"
 #include "Delegation.h"
 #include "Dir.h"
@@ -3921,12 +3922,7 @@ int Client::get_caps_used(Inode *in)
 void Client::cap_delay_requeue(Inode *in)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(in->inode_lock));
-  ldout(cct, 10) << __func__ << " on " << *in << dendl;
-
-  in->hold_caps_until = ceph::coarse_mono_clock::now() + client_caps->get_caps_release_delay();
-  unique_unlock in_unlock(in->inode_lock);
-  std::unique_lock lock(client_lock);
-  delayed_list.push_back(&in->delay_cap_item);
+  client_caps->cap_delay_requeue(in);
 }
 
 void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
@@ -4318,7 +4314,9 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
   // Use std::scoped_lock to acquire client_lock while avoiding deadlock
   Inode *in = static_cast<Inode *>(oset->parent);
   ceph_assert(in);
+  unique_unlock c_unlock(client_lock);
   std::unique_lock in_lock(in->inode_lock);
+  std::unique_lock c_lock(client_lock);
   _flushed(in);
 }
 
@@ -6786,17 +6784,13 @@ void Client::tick()
   }
 
   renew_and_flush_cap_releases();
-
-  // delayed caps
-  xlist<Inode*>::iterator p = delayed_list.begin();
-  while (!p.end()) {
-    Inode *in = *p;
-    ++p;
-    if (!mount_aborted && in->hold_caps_until > now)
-      break;
-    delayed_list.pop_front();
-    if (!mount_aborted)
+  {
+    unique_unlock unlock(client_lock);
+    // delayed caps
+    client_caps->process_delayed_caps(now, mount_aborted, [this](Inode *in) {
+      std::unique_lock in_lock(in->inode_lock);
       check_caps(in, CHECK_CAPS_NODELAY);
+    });
   }
 
   if (!mount_aborted)

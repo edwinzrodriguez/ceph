@@ -2381,7 +2381,6 @@ private:
   // cap flushing
   ceph_tid_t last_flush_tid = 1;
 
-  xlist<Inode*> delayed_list;
   std::unordered_map<inodeno_t, SnapRealm*> snap_realms;
   
   // Capability management - separate lock from client_lock

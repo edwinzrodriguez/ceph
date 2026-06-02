@@ -4,7 +4,7 @@
 /*
  * Ceph - scalable distributed file system
  *
- * Copyright (C) 2004-2006 Sage Weil <sage@newdream.net>
+ * CCopyright (C) 2026 IBM, Inc.
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -107,6 +107,8 @@ public:
   
   // Capability delay management
   void cap_delay_requeue(Inode *in);
+  template<typename Func>
+  void process_delayed_caps(ceph::coarse_mono_time now, bool mount_aborted, Func&& func);
   
   // Capability sending
   void send_cap(Inode *in, MetaSession *session, Cap *cap, int flags,
@@ -178,5 +180,3 @@ private:
 };
 
 #endif // CEPH_CLIENT_CAPS_H
-
-// Made with Bob

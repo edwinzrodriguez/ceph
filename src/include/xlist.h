@@ -129,6 +129,7 @@ public:
   }
   void remove(item *i) {
     ceph_assert(i->_list == this);
+    ceph_assert(_size > 0);
     
     if (i->_prev)
       i->_prev->_next = i->_next;
