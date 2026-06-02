@@ -710,7 +710,7 @@ int ClientCaps::adjust_caps_used_for_lazyio(int used, int issued, int implemente
  */
 void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(in->inode_lock));
+  std::unique_lock in_lock(in->inode_lock);
   unsigned wanted = in->caps_wanted();
   unsigned used = get_caps_used(in.get());
   unsigned cap_used;
@@ -765,6 +765,8 @@ void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
   }
 
   for (auto &[mds, cap] : in->caps) {
+    std::unique_lock in_lock(client->client_lock);
+
     auto session = client->mds_sessions.at(mds);
 
     cap_used = used;
