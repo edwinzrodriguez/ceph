@@ -76,6 +76,24 @@ epoch_t ClientCaps::get_cap_epoch_barrier() const
   return cap_epoch_barrier;
 }
 
+int ClientCaps::get_num_flushing_caps() const
+{
+  std::scoped_lock lock(caps_lock);
+  return num_flushing_caps;
+}
+
+void ClientCaps::inc_num_flushing_caps()
+{
+  std::scoped_lock lock(caps_lock);
+  num_flushing_caps++;
+}
+
+void ClientCaps::dec_num_flushing_caps()
+{
+  std::scoped_lock lock(caps_lock);
+  num_flushing_caps--;
+}
+
 int ClientCaps::get_caps_used(Inode *in)
 {
   unsigned used = in->caps_used();
@@ -135,9 +153,14 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session,
                                        std::forward_as_tuple(mds), 
                                        std::forward_as_tuple(*in, mds_session));
   Cap &cap = capem.first->second;
-  if (!capem.second) {
-    if (cap.gen < mds_session->cap_gen)
+  uint64_t session_cap_gen;
+  {
+    std::scoped_lock s_lock(mds_session->session_lock);
+    session_cap_gen = mds_session->cap_gen;
+    if (!capem.second && cap.gen < session_cap_gen)
       cap.issued = cap.implemented = CEPH_CAP_PIN;
+  }
+  if (!capem.second) {
 
     /*
      * auth mds of the inode changed. we received the cap export
@@ -204,7 +227,7 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session,
   cap.seq = seq;
   cap.issue_seq = seq;
   cap.mseq = mseq;
-  cap.gen = mds_session->cap_gen;
+  cap.gen = session_cap_gen;
   cap.latest_perms = cap_perms;
   ldout(cct, 10) << __func__ << " issued " << ccap_string(old_caps) << " -> " << ccap_string(cap.issued)
     << " from mds." << mds
@@ -303,7 +326,7 @@ void ClientCaps::remove_session_caps(MetaSession *s, int err)
     if (dirty_caps) {
       lderr(cct) << __func__ << " still has dirty|flushing caps on " << *in << dendl;
       if (in->flushing_caps) {
-	num_flushing_caps--;
+	dec_num_flushing_caps();
 	in->flushing_cap_tids.clear();
       }
       in->flushing_caps = 0;
@@ -407,7 +430,7 @@ int ClientCaps::mark_caps_flushing(Inode *in, ceph_tid_t* ptid)
   if (!in->flushing_caps) {
     ldout(cct, 10) << __func__ << " " << ccap_string(flushing) 
                    << " " << *in << dendl;
-    num_flushing_caps++;
+    inc_num_flushing_caps();
   } else {
     ldout(cct, 10) << __func__ << " (more) " << ccap_string(flushing) 
                    << " " << *in << dendl;
@@ -558,6 +581,7 @@ void ClientCaps::renew_caps()
 void ClientCaps::renew_caps(MetaSession *session)
 {
   ldout(cct, 10) << "renew_caps mds." << session->mds_num << dendl;
+  std::scoped_lock s_lock(session->session_lock);
   session->last_cap_renew_request = ceph_clock_now();
   uint64_t seq = ++session->cap_renew_seq;
   auto m = make_message<MClientSession>(CEPH_SESSION_REQUEST_RENEWCAPS, seq);

@@ -111,6 +111,12 @@ struct MetaSession {
     return std::forward<Func>(func)(flushing_caps_tids);
   }
 
+  // cap_gen / cap_ttl / cap_renew_seq are protected by session_lock.
+  bool cap_lease_valid(uint64_t gen) const {
+    std::scoped_lock lock(session_lock);
+    return gen <= cap_gen && ceph_clock_now() < cap_ttl;
+  }
+
   const char *get_state_name() const;
 
   void dump(Formatter *f, bool cap_dump=false) const;

@@ -126,10 +126,10 @@ public:
   static constexpr unsigned CHECK_CAPS_SYNCHRONOUS = 0x2;
   void check_caps(const InodeRef& in, unsigned flags);
   
-  // Statistics
-  int get_num_flushing_caps() const { return num_flushing_caps; }
-  void inc_num_flushing_caps() { num_flushing_caps++; }
-  void dec_num_flushing_caps() { num_flushing_caps--; }
+  // Statistics (protected by caps_lock)
+  int get_num_flushing_caps() const;
+  void inc_num_flushing_caps();
+  void dec_num_flushing_caps();
   ceph_tid_t get_last_flush_tid() const { return last_flush_tid; }
   
   // Caps release delay management

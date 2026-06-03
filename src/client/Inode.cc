@@ -288,15 +288,7 @@ bool Inode::is_any_caps()
 
 bool Inode::cap_is_valid(const Cap &cap) const
 {
-  /*cout << "cap_gen     " << cap->session-> cap_gen << std::endl
-    << "session gen " << cap->gen << std::endl
-    << "cap expire  " << cap->session->cap_ttl << std::endl
-    << "cur time    " << ceph_clock_now(cct) << std::endl;*/
-  if ((cap.session->cap_gen <= cap.gen)
-      && (ceph_clock_now() < cap.session->cap_ttl)) {
-    return true;
-  }
-  return false;
+  return cap.session->cap_lease_valid(cap.gen);
 }
 
 int Inode::caps_issued(int *implemented) const

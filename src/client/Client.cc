@@ -2801,20 +2801,26 @@ void Client::handle_client_session(const MConstRef<MClientSession>& m)
     break;
 
   case CEPH_SESSION_RENEWCAPS:
-    if (session->cap_renew_seq == m->get_seq()) {
-      bool was_stale = ceph_clock_now() >= session->cap_ttl;
-      session->cap_ttl =
-	session->last_cap_renew_request + mdsmap->get_session_timeout();
-      if (was_stale)
-	wake_up_session_caps(session.get(), false);
+    {
+      std::scoped_lock s_lock(session->session_lock);
+      if (session->cap_renew_seq == m->get_seq()) {
+	bool was_stale = ceph_clock_now() >= session->cap_ttl;
+	session->cap_ttl =
+	  session->last_cap_renew_request + mdsmap->get_session_timeout();
+	if (was_stale)
+	  wake_up_session_caps(session.get(), false);
+      }
     }
     break;
 
   case CEPH_SESSION_STALE:
-    // invalidate session caps/leases
-    session->cap_gen++;
-    session->cap_ttl = ceph_clock_now();
-    session->cap_ttl -= 1;
+    {
+      // invalidate session caps/leases
+      std::scoped_lock s_lock(session->session_lock);
+      session->cap_gen++;
+      session->cap_ttl = ceph_clock_now();
+      session->cap_ttl -= 1;
+    }
     renew_caps(session.get());
     break;
 
@@ -5559,7 +5565,12 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
   int flags = 0;
 
   const unsigned new_caps = m->get_caps();
-  const bool was_stale = session->cap_gen > cap->gen;
+  uint64_t session_cap_gen;
+  {
+    std::scoped_lock s_lock(session->session_lock);
+    session_cap_gen = session->cap_gen;
+  }
+  const bool was_stale = session_cap_gen > cap->gen;
   ldout(cct, 5) << __func__ << " on in " << m->get_ino() 
 		<< " mds." << mds << " seq " << m->get_seq()
 		<< " caps now " << ccap_string(new_caps)
@@ -5569,7 +5580,7 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
   if (was_stale)
       cap->issued = cap->implemented = CEPH_CAP_PIN;
   cap->seq = m->get_seq();
-  cap->gen = session->cap_gen;
+  cap->gen = session_cap_gen;
 
   check_cap_issue(in, new_caps);
 
@@ -7355,6 +7366,7 @@ void Client::renew_caps()
 void Client::renew_caps(MetaSession *session)
 {
   ldout(cct, 10) << "renew_caps mds." << session->mds_num << dendl;
+  std::scoped_lock s_lock(session->session_lock);
   session->last_cap_renew_request = ceph_clock_now();
   uint64_t seq = ++session->cap_renew_seq;
   auto m = make_message<MClientSession>(CEPH_SESSION_REQUEST_RENEWCAPS, seq);
@@ -7403,11 +7415,12 @@ bool Client::_dentry_valid(const Dentry *dn)
     std::unique_lock lock(client_lock);
     if (auto it = mds_sessions.find(dn->lease_mds); it != mds_sessions.end()) {
       auto s = it->second;
-      if (s->cap_ttl > now && s->cap_gen == dn->lease_gen) {
+      if (s->cap_lease_valid(dn->lease_gen)) {
         dlease_hit();
         return true;
       }
 
+      std::scoped_lock s_lock(s->session_lock);
       ldout(cct, 20) << " bad lease, cap_ttl " << s->cap_ttl << ", cap_gen " << s->cap_gen
                      << " vs lease_gen " << dn->lease_gen << dendl;
     }
