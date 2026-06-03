@@ -1042,7 +1042,8 @@ public:
 
   /* tick thread */
   std::thread upkeeper;
-  ceph::reentrant_condition_variable upkeep_cond;
+  ceph::mutex upkeep_lock = ceph::make_mutex("Client::upkeep_lock");
+  ceph::condition_variable upkeep_cond;
   bool tick_thread_stopped = false;
 
   std::unique_ptr<PerfCounters> logger;

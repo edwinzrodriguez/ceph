@@ -1293,7 +1293,9 @@ void ObjectCacher::bh_write_commit(int64_t poolid, sobject_t oid,
   if (flush_set_callback &&
       was_dirty_or_tx > 0 &&
       oset->dirty_or_tx == 0) {        // nothing dirty/tx
+    cl.unlock();
     flush_set_callback(flush_set_callback_arg, oset);
+    cl.lock();
   }
 
   if (!ls.empty())

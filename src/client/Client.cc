@@ -482,7 +482,7 @@ Client::~Client()
   // If the task is crashed or aborted and doesn't
   // get any chance to run the umount and shutdow.
   {
-    std::scoped_lock l{client_lock};
+    std::scoped_lock l{upkeep_lock};
     tick_thread_stopped = true;
     upkeep_cond.notify_one();
   }
@@ -770,8 +770,11 @@ void Client::shutdown()
     // destructing the Client, just in case like the _mount()
     // failed but didn't not get a chance to stop the tick
     // thread
-    tick_thread_stopped = true;
-    upkeep_cond.notify_one();
+    {
+      std::scoped_lock l{upkeep_lock};
+      tick_thread_stopped = true;
+      upkeep_cond.notify_one();
+    }
 
     _close_sessions();
   }
@@ -3830,17 +3833,21 @@ void Client::delay_put_inodes(bool wakeup)
   if (release.empty())
     return;
 
-  for (auto &[in, cnt] : release) {
-    // *in.lock();
-    {
-      unique_unlock c_unlock(client_lock);
-      _put_inode(in, cnt);
-    }
-    // Signal after each inode release during unmount so the unmount
-    // thread can check if the cache is empty
-    if (wakeup)
-      mount_cond.notify_all();
+  int depth = 0;
+  while (client_lock.is_locked_by_me()) {
+    client_lock.unlock();
+    ++depth;
   }
+
+  for (auto &[in, cnt] : release) {
+    _put_inode(in, cnt);
+  }
+
+  while (depth-- > 0) {
+    client_lock.lock();
+  }
+  if (wakeup)
+    mount_cond.notify_all();
 }
 
 void Client::put_inode(Inode *in, int n)
@@ -4444,9 +4451,9 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
 
 void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
 {
-  // Called from ObjectCacher with cache_lock held.  Lock order is inode_lock
-  // then client_lock (see _put_inode).  ObjectCacher writeback may invoke this
-  // via C_ReentrantLock with client_lock already held — drop it first.
+  // Called from ObjectCacher without cache_lock (see purge_set et al.).
+  // Lock order is inode_lock then client_lock (_put_inode); _flushed needs
+  // only inode_lock.  Drop client_lock if writeback held it via C_ReentrantLock.
   Inode *in = static_cast<Inode *>(oset->parent);
   ceph_assert(in);
 
@@ -4457,11 +4464,9 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
   }
 
   if (ceph_mutex_is_locked_by_me(*in)) {
-    std::scoped_lock c_lock(client_lock);
     _flushed(in);
   } else {
     std::scoped_lock in_lock(*in);
-    std::scoped_lock c_lock(client_lock);
     _flushed(in);
   }
 
@@ -6862,8 +6867,11 @@ void Client::_unmount(bool abort)
   }
 
   // stop the tick thread
-  tick_thread_stopped = true;
-  upkeep_cond.notify_one();
+  {
+    std::scoped_lock l{upkeep_lock};
+    tick_thread_stopped = true;
+    upkeep_cond.notify_one();
+  }
 
   _close_sessions();
 
@@ -7080,8 +7088,8 @@ void Client::start_tick_thread()
 
       ldout(cct, 20) << "upkeep thread waiting interval " << interval << dendl;
       if (!tick_thread_stopped) {
-	std::unique_lock cl(client_lock);
-	upkeep_cond.wait_for(cl, interval);
+	std::unique_lock ul(upkeep_lock);
+	upkeep_cond.wait_for(ul, interval);
       }
     }
   });
