@@ -4492,7 +4492,7 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
 
 void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
 {
-  // Called from ObjectCacher without cache_lock (see purge_set et al.).
+  // Called from ObjectCacher's finisher (see _schedule_flush_set_callback).
   // Lock order is inode_lock then client_lock (_put_inode); _flushed needs
   // only inode_lock.  Drop client_lock if writeback held it via C_ReentrantLock.
   Inode *in = static_cast<Inode *>(oset->parent);

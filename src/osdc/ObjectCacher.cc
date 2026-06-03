@@ -1063,6 +1063,24 @@ void ObjectCacher::bh_write_adjacencies(BufferHead *bh, ceph::real_time cutoff,
   bh_write_scattered(blist);
 }
 
+class ObjectCacher::C_FlushSetCallback : public Context {
+  ObjectCacher *oc;
+  ObjectSet *oset;
+public:
+  C_FlushSetCallback(ObjectCacher *c, ObjectSet *o) : oc(c), oset(o) {}
+  void finish(int r) override {
+    oc->flush_set_callback(oc->flush_set_callback_arg, oset);
+  }
+};
+
+void ObjectCacher::_schedule_flush_set_callback(ObjectSet *oset)
+{
+  if (!flush_set_callback) {
+    return;
+  }
+  finisher.queue(new C_FlushSetCallback(this, oset));
+}
+
 class ObjectCacher::C_WriteCommit : public Context {
   ObjectCacher *oc;
   int64_t poolid;
@@ -1290,12 +1308,14 @@ void ObjectCacher::bh_write_commit(int64_t poolid, sobject_t oid,
   ObjectSet *oset = ob->oset;
   ob->put();
 
+  if (get_stat_dirty_waiting() > 0) {
+    stat_cond.notify_all();
+  }
+
   if (flush_set_callback &&
       was_dirty_or_tx > 0 &&
       oset->dirty_or_tx == 0) {        // nothing dirty/tx
-    cl.unlock();
-    flush_set_callback(flush_set_callback_arg, oset);
-    cl.lock();
+    _schedule_flush_set_callback(oset);
   }
 
   if (!ls.empty())
@@ -1915,9 +1935,7 @@ void ObjectCacher::_maybe_wait_for_writeback(uint64_t len,
     flusher_cond.notify_all();
     stat_dirty_waiting += len;
     ++stat_nr_dirty_waiters;
-    std::unique_lock l{cache_lock, std::adopt_lock};
-    stat_cond.wait(l);
-    l.release();
+    stat_cond.wait(cl);
     stat_dirty_waiting -= len;
     --stat_nr_dirty_waiters;
     ++blocked;
@@ -2386,9 +2404,7 @@ void ObjectCacher::purge_set(ObjectSet *oset)
   // drop any resources associate with dirty data.
   ceph_assert(oset->dirty_or_tx == 0);
   if (flush_set_callback && were_dirty) {
-    cl.unlock();
-    flush_set_callback(flush_set_callback_arg, oset);
-    cl.lock();
+    _schedule_flush_set_callback(oset);
   }
 }
 
@@ -2564,9 +2580,7 @@ void ObjectCacher::discard_writeback(ObjectSet *oset,
 	std::unique_lock cl(cache_lock);
 
 	if (flushed && flush_set_callback) {
-	  cl.unlock();
-	  flush_set_callback(flush_set_callback_arg, oset);
-	  cl.lock();
+	  _schedule_flush_set_callback(oset);
 	}
 	if (on_finish)
 	  on_finish->complete(0);
@@ -2607,9 +2621,7 @@ void ObjectCacher::_discard_finish(ObjectSet *oset, bool was_dirty,
 
   // did we truncate off dirty data?
   if (flush_set_callback && was_dirty && oset->dirty_or_tx == 0) {
-    cl.unlock();
-    flush_set_callback(flush_set_callback_arg, oset);
-    cl.lock();
+    _schedule_flush_set_callback(oset);
   }
 
   // notify that in-flight writeback has completed
@@ -2743,6 +2755,9 @@ void ObjectCacher::bh_stat_sub(BufferHead *bh)
     break;
   default:
     ceph_abort_msg("bh_stat_sub: invalid bufferhead state");
+  }
+  if (get_stat_dirty_waiting() > 0) {
+    stat_cond.notify_all();
   }
 }
 

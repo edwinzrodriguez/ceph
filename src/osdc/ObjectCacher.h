@@ -538,6 +538,7 @@ class ObjectCacher {
 
   flush_set_callback_t flush_set_callback;
   void *flush_set_callback_arg;
+  void _schedule_flush_set_callback(ObjectSet *oset);
 
   // indexed by pool_id
   std::vector<std::unordered_map<sobject_t, Object*>> objects;
@@ -701,6 +702,7 @@ class ObjectCacher {
 
   class C_WriteCommit;
   class C_WaitForWrite;
+  class C_FlushSetCallback;
 
   void perf_start();
   void perf_stop();
