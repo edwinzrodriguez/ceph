@@ -1935,9 +1935,15 @@ private:
 
 void ObjectCacher::C_WaitForWrite::finish(int r)
 {
-  std::lock_guard l(m_oc->cache_lock);
-  m_oc->_maybe_wait_for_writeback(m_len, &m_trace);
-  m_onfinish->complete(r);
+  Context *onfinish = m_onfinish;
+  m_onfinish = nullptr;
+  {
+    std::lock_guard l(m_oc->cache_lock);
+    m_oc->_maybe_wait_for_writeback(m_len, &m_trace);
+  }
+  if (onfinish) {
+    onfinish->complete(r);
+  }
 }
 
 void ObjectCacher::_maybe_wait_for_writeback(uint64_t len,
