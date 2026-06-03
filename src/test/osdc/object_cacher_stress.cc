@@ -334,9 +334,10 @@ int correctness_test(uint64_t delay_ns)
     std::cout << "unclean buffers left over!" << std::endl;
     vector<ObjectExtent> discard_extents;
     int i = 0;
-    for (auto oi = object_set.objects.begin(); !oi.end(); ++oi) {
+    object_set.for_each_object([&](ObjectCacher::Object *ob) {
       discard_extents.emplace_back(oid, i++, 0, 1<<22, 0);
-    }
+      return true;  // continue iteration
+    });
     obc.discard_set(&object_set, discard_extents);
     lock.unlock();
     obc.stop();
