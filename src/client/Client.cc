@@ -1309,9 +1309,18 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
 
   if (need_snapdir_attr_refresh && in->is_dir() && in->snapid == CEPH_NOSNAP) {
     vinodeno_t vino(in->ino, CEPH_SNAPDIR);
-    auto it = inode_map.find(vino);
-    if (it != inode_map.end()) {
-      refresh_snapdir_attrs(it->second, in);
+    Inode *snapdir = nullptr;
+    in_lock.unlock();
+    {
+      std::scoped_lock cl(client_lock);
+      auto it = inode_map.find(vino);
+      if (it != inode_map.end())
+        snapdir = it->second;
+    }
+    if (snapdir) {
+      std::unique_lock snapdir_lock(*snapdir);
+      std::unique_lock in_lock_again(*in);
+      refresh_snapdir_attrs(snapdir, in);
     }
   }
 
@@ -1941,9 +1950,12 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
     // fake it for snap lookup
     vinodeno_t vino = ist.vino;
     vino.snapid = CEPH_SNAPDIR;
-    auto it = inode_map.find(vino);
-    ceph_assert(it != inode_map.end());
-    diri = it->second;
+    {
+      std::scoped_lock cl(client_lock);
+      auto it = inode_map.find(vino);
+      ceph_assert(it != inode_map.end());
+      diri = it->second;
+    }
     
     string dname = request->path.last_dentry();
     
