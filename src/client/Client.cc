@@ -6189,7 +6189,7 @@ int Client::_getattr_for_perm(const InodeRef& in, const UserPerm& perms)
 vinodeno_t Client::_get_vino(Inode *in)
 {
   /* The caller must hold the client lock */
-  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  std::unique_lock in_lock(*in);
   return vinodeno_t(in->ino, in->snapid);
 }
 
@@ -10755,7 +10755,7 @@ int Client::_release_fh(Fh *f)
   //ldout(cct, 3) << "op: open_files.erase( " << fh << " );" << dendl;
   Inode *in = f->inode.get();
   ldout(cct, 8) << __func__ << " " << f << " mode " << f->mode << " on " << *in << dendl;
-  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  std::unique_lock in_lock(*in);
 
   in->unset_deleg(f);
 
@@ -12128,7 +12128,7 @@ void Client::C_Write_Finisher::finish_io(int r)
 {
   bool fini;
 
-  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  std::unique_lock in_lock(*in);
   clnt->put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
   if (r >= 0) {
@@ -18310,7 +18310,7 @@ out:
 int Client::_posix_acl_create(const InodeRef& dir, mode_t *mode, bufferlist& xattrs_bl,
 			      const UserPerm& perms)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(*dir));
+  std::unique_lock dir_lock(*dir);
   if (acl_type == NO_ACL)
     return 0;
 
