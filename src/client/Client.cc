@@ -3796,10 +3796,15 @@ void Client::_put_inode(Inode *in, int n)
     in->iput(n);
     left -= n;
   }
-  if (left == 1) { // the last one will be held by the inode_map
+  if (left == 1) { // last ref is the inode_map pin
+    std::unique_lock c_lock(client_lock);
+    if (unmount_anchor_pins.count(in)) {
+      ldout(cct, 15) << __func__ << " defer delete (unmount anchor) " << *in
+		     << dendl;
+      return;
+    }
     // release any caps
     remove_all_caps(in);
-    std::unique_lock c_lock(client_lock);
     ldout(cct, 10) << __func__ << " deleting " << *in << dendl;
     auto oc_lock = objectcacher->acquire_cache_lock();
     bool unclean = objectcacher->release_set(&in->oset);
@@ -3859,11 +3864,16 @@ void Client::put_inode(Inode *in, int n)
     std::scoped_lock dl(delay_i_lock);
     delay_i_release[in] += n;
   }
-  // During unmount, process delayed puts immediately when the caller
-  // already holds client_lock (mount_cond requires the same mutex).
-  if (unmounting && ceph_mutex_is_locked_by_me(client_lock)) {
-    delay_put_inodes(true);
-    mount_cond.notify_all();
+  // During unmount, wake the unmount thread whenever a put is queued.  Most
+  // cap/cache teardown (flush_set_callback, put_cap_ref, etc.) runs under
+  // inode_lock only; mount_cond requires client_lock for a strict notify.
+  if (unmounting) {
+    if (ceph_mutex_is_locked_by_me(client_lock)) {
+      delay_put_inodes(true);
+      mount_cond.notify_all();
+    } else {
+      mount_cond.notify_all_sloppy();
+    }
   }
 }
 
@@ -6611,6 +6621,50 @@ void Client::_close_sessions()
   }
 }
 
+void Client::_force_evict_unmount_cache()
+{
+  ldout(cct, 1) << __func__ << " lru=" << lru.lru_get_size()
+		<< " inodes=" << inode_map.size() << dendl;
+
+  std::vector<Inode*> inodes;
+  inodes.reserve(inode_map.size());
+  for (auto& [vino, in] : inode_map)
+    inodes.push_back(in);
+
+  for (Inode *in : inodes) {
+    if (in->dirty_caps) {
+      std::unique_lock in_lock(*in);
+      in->mark_caps_clean();
+    }
+    {
+      unique_unlock unlock(client_lock);
+      client_caps->prepare_inode_unmount(in);
+    }
+    {
+      std::unique_lock in_lock(*in);
+      if (!in->caps.empty())
+	remove_all_caps(in);
+      in->cap_snaps.clear();
+    }
+    {
+      unique_unlock unlock(client_lock);
+      check_caps(in, CHECK_CAPS_NODELAY);
+    }
+    _try_to_trim_inode(in, false);
+    int extra = 0;
+    {
+      std::unique_lock in_lock(*in);
+      extra = in->get_nref() - 1;
+    }
+    if (extra > 0)
+      put_inode(in, extra);
+  }
+
+  trim_cache();
+  delay_put_inodes(true);
+  mount_cond.notify_all();
+}
+
 void Client::flush_mdlog_sync(Inode *in)
 {
   if (in->unsafe_ops.empty()) {
@@ -6696,6 +6750,7 @@ void Client::_unmount(bool abort)
   mref_writer.wait_readers_done();
 
   std::unique_lock lock{client_lock};
+  unmount_anchor_pins.clear();
 
   if (abort || blocklisted) {
     ldout(cct, 2) << "unmounting (" << (abort ? "abort)" : "blocklisted)") << dendl;
@@ -6762,7 +6817,8 @@ void Client::_unmount(bool abort)
 
   if (cct->_conf->client_oc) {
     // flush/release all buffered data
-    std::list<InodeRef> anchor;
+    std::vector<Inode*> anchor;
+    anchor.reserve(inode_map.size());
     for (auto& p : inode_map) {
       Inode *in = p.second;
       if (!in) {
@@ -6770,8 +6826,10 @@ void Client::_unmount(bool abort)
 	ceph_assert(in);
       }
 
-      // prevent inode from getting freed
-      anchor.emplace_back(in);
+      // prevent inode from getting freed during purge/cap work below
+      in->iget();
+      anchor.push_back(in);
+      unmount_anchor_pins.insert(in);
 
       if (!in->caps.empty()) {
 	if (abort || blocklisted) {
@@ -6783,6 +6841,11 @@ void Client::_unmount(bool abort)
 	}
       }
     }
+    for (Inode *in : anchor) {
+      unmount_anchor_pins.erase(in);
+      put_inode(in);
+    }
+    delay_put_inodes(true);
   }
 
   if (abort || blocklisted) {
@@ -6810,6 +6873,8 @@ void Client::_unmount(bool abort)
 
   delay_put_inodes(true);
 
+  unsigned unmount_stall_rounds = 0;
+  bool unmount_sessions_closed = false;
   while (lru.lru_get_size() > 0 ||
          !inode_map.empty()) {
     ldout(cct, 2) << "cache still has " << lru.lru_get_size()
@@ -6821,9 +6886,8 @@ void Client::_unmount(bool abort)
     trim_cache();
     delay_put_inodes(true);
 
-    // Pin inodes before any cap work.  prepare_inode_unmount uses inode_lock
-    // only (see _put_inode); drop client_lock briefly to avoid ABBA deadlock
-    // with ms_dispatch (inode_lock -> client_lock).
+    // prepare_inode_unmount uses inode_lock only (see _put_inode); drop
+    // client_lock briefly to avoid ABBA with ms_dispatch.
     {
       std::vector<InodeRef> inodes;
       for (auto& [vino, in] : inode_map) {
@@ -6841,6 +6905,13 @@ void Client::_unmount(bool abort)
         unique_unlock unlock(client_lock);
         check_caps(inodes[i], flags);
       }
+      for (auto& [vino, in] : inode_map) {
+	std::unique_lock in_lock(*in);
+	if (!in->caps.empty()) {
+	  remove_all_caps(in);
+	  in->cap_snaps.clear();
+	}
+      }
     }
     flush_caps_sync();
     wait_sync_caps(last_flush_tid);
@@ -6849,12 +6920,25 @@ void Client::_unmount(bool abort)
     mount_cond.notify_all();
 
     if (size > lru.lru_get_size() + inode_map.size()) {
+      unmount_stall_rounds = 0;
       continue;
     }
 
-    if (auto r = mount_cond.wait_for(lock, ceph::make_timespan(5));
-	r == std::cv_status::timeout) {
+    auto r = mount_cond.wait_for(lock, ceph::make_timespan(5));
+    // Process puts queued while we slept (e.g. from cap release paths).
+    delay_put_inodes(true);
+    if (r == std::cv_status::timeout &&
+	size == lru.lru_get_size() + inode_map.size()) {
       dump_cache(NULL);
+      if (++unmount_stall_rounds >= 2) {
+	ldout(cct, 1) << "unmount cache drain stalled; forcing eviction" << dendl;
+	if (!unmount_sessions_closed) {
+	  _close_sessions();
+	  unmount_sessions_closed = true;
+	}
+	_force_evict_unmount_cache();
+	unmount_stall_rounds = 0;
+      }
     }
   }
   ceph_assert(lru.lru_get_size() == 0);
@@ -6873,7 +6957,8 @@ void Client::_unmount(bool abort)
     upkeep_cond.notify_one();
   }
 
-  _close_sessions();
+  if (!unmount_sessions_closed)
+    _close_sessions();
 
   // release the global snapshot realm
   SnapRealm *global_realm = snap_realms[CEPH_INO_GLOBAL_SNAPREALM];
@@ -18637,7 +18722,10 @@ void intrusive_ptr_add_ref(Inode *in)
 
 void intrusive_ptr_release(Inode *in)
 {
-  in->client->put_inode(in);
+  Client *client = in->client;
+  if (!client)
+    return;
+  client->put_inode(in);
 }
 
 mds_rank_t Client::_get_random_up_mds() const

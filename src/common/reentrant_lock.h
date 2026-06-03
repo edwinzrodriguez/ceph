@@ -183,6 +183,10 @@ public:
 
   void notify_one() noexcept { cv.notify_one(); }
   void notify_all() noexcept { cv.notify_all(); }
+  // Wake waiters without holding the associated lock (pthread-safe; skips
+  // lockdep's waiter_mutex check).  Use only when the signaller cannot take
+  // the waiter lock without risking deadlock.
+  void notify_all_sloppy() noexcept { cv.notify_all(true); }
 };
 
 using reentrant_condition_variable = reentrant_condition_variable_impl<ReentrantLock>;

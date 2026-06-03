@@ -2386,7 +2386,9 @@ void ObjectCacher::purge_set(ObjectSet *oset)
   // drop any resources associate with dirty data.
   ceph_assert(oset->dirty_or_tx == 0);
   if (flush_set_callback && were_dirty) {
+    cl.unlock();
     flush_set_callback(flush_set_callback_arg, oset);
+    cl.lock();
   }
 }
 
@@ -2436,6 +2438,8 @@ loff_t ObjectCacher::release(Object *ob)
 
 loff_t ObjectCacher::release_set(ObjectSet *oset)
 {
+  std::unique_lock cl(cache_lock);
+
   // return # bytes not clean (and thus not released).
   loff_t unclean = 0;
 
@@ -2559,8 +2563,11 @@ void ObjectCacher::discard_writeback(ObjectSet *oset,
       [this, oset, flushed, on_finish](int) {
 	std::unique_lock cl(cache_lock);
 
-	if (flushed && flush_set_callback)
+	if (flushed && flush_set_callback) {
+	  cl.unlock();
 	  flush_set_callback(flush_set_callback_arg, oset);
+	  cl.lock();
+	}
 	if (on_finish)
 	  on_finish->complete(0);
       }));
@@ -2600,7 +2607,9 @@ void ObjectCacher::_discard_finish(ObjectSet *oset, bool was_dirty,
 
   // did we truncate off dirty data?
   if (flush_set_callback && was_dirty && oset->dirty_or_tx == 0) {
+    cl.unlock();
     flush_set_callback(flush_set_callback_arg, oset);
+    cl.lock();
   }
 
   // notify that in-flight writeback has completed

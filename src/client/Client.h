@@ -1337,6 +1337,7 @@ protected:
   void _handle_full_flag(int64_t pool);
 
   void _close_sessions();
+  void _force_evict_unmount_cache();
 
   void _pre_init();
 
@@ -2445,6 +2446,8 @@ private:
 
   ceph::spinlock delay_i_lock;
   std::map<Inode*,int> delay_i_release;
+  // Inodes pinned by the unmount oset anchor; defer _put_inode map removal.
+  std::unordered_set<Inode*> unmount_anchor_pins;
 
   std::atomic<uint64_t> nr_metadata_request = 0;
   std::atomic<uint64_t> nr_read_request = 0;
