@@ -38,6 +38,23 @@ public:
     recursion_count.store(1, std::memory_order_relaxed);
   }
 
+  bool try_lock() {
+    auto tid = std::this_thread::get_id();
+
+    if (owner.load(std::memory_order_acquire) == tid) {
+      ++recursion_count;
+      return true;
+    }
+
+    if (!mtx.try_lock()) {
+      return false;
+    }
+
+    owner.store(tid, std::memory_order_release);
+    recursion_count.store(1, std::memory_order_relaxed);
+    return true;
+  }
+
   void unlock() {
     ceph_assert(owner == std::this_thread::get_id());
     // Assert or handle error in debug: owner == tid
