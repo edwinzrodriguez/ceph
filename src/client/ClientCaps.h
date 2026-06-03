@@ -130,7 +130,8 @@ public:
   int get_num_flushing_caps() const;
   void inc_num_flushing_caps();
   void dec_num_flushing_caps();
-  ceph_tid_t get_last_flush_tid() const { return last_flush_tid; }
+  ceph_tid_t get_last_flush_tid() const;
+  ceph_tid_t allocate_flush_tid();
   
   // Caps release delay management
   std::chrono::seconds get_caps_release_delay() const { return caps_release_delay; }

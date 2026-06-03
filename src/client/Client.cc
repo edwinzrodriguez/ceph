@@ -7186,12 +7186,21 @@ void Client::tick()
 
 void Client::start_tick_thread()
 {
+  {
+    std::scoped_lock l(upkeep_lock);
+    tick_thread_stopped = false;
+  }
   upkeeper = std::thread([this]() {
     using sec = std::chrono::seconds;
 
     auto last_tick = clock::zero();
 
-    while (!tick_thread_stopped) {
+    while (true) {
+      {
+	std::scoped_lock l(upkeep_lock);
+	if (tick_thread_stopped)
+	  break;
+      }
       auto now = clock::now();
       auto since = now - last_tick;
 
@@ -7207,10 +7216,10 @@ void Client::start_tick_thread()
       }
 
       ldout(cct, 20) << "upkeep thread waiting interval " << interval << dendl;
-      if (!tick_thread_stopped) {
-	std::unique_lock ul(upkeep_lock);
-	upkeep_cond.wait_for(ul, interval);
-      }
+      std::unique_lock ul(upkeep_lock);
+      if (tick_thread_stopped)
+	break;
+      upkeep_cond.wait_for(ul, interval);
     }
   });
 }

@@ -94,6 +94,18 @@ void ClientCaps::dec_num_flushing_caps()
   num_flushing_caps--;
 }
 
+ceph_tid_t ClientCaps::get_last_flush_tid() const
+{
+  std::scoped_lock lock(caps_lock);
+  return last_flush_tid;
+}
+
+ceph_tid_t ClientCaps::allocate_flush_tid()
+{
+  std::scoped_lock lock(caps_lock);
+  return ++last_flush_tid;
+}
+
 int ClientCaps::get_caps_used(Inode *in)
 {
   unsigned used = in->caps_used();
@@ -424,7 +436,7 @@ int ClientCaps::mark_caps_flushing(Inode *in, ceph_tid_t* ptid)
   int flushing = in->dirty_caps;
   ceph_assert(flushing);
 
-  ceph_tid_t flush_tid = ++last_flush_tid;
+  ceph_tid_t flush_tid = allocate_flush_tid();
   in->flushing_cap_tids[flush_tid] = flushing;
 
   if (!in->flushing_caps) {
@@ -1256,7 +1268,7 @@ void ClientCaps::flush_snaps(Inode *in)
     if (capsnap.dirty_data || capsnap.writing)
       break;
 
-    capsnap.flush_tid = ++last_flush_tid;
+    capsnap.flush_tid = allocate_flush_tid();
     session->with_flushing_caps_tids([&capsnap](auto& tids) {
       tids.insert(capsnap.flush_tid);
     });
