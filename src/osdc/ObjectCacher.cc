@@ -2434,8 +2434,6 @@ loff_t ObjectCacher::release(Object *ob)
 
 loff_t ObjectCacher::release_set(ObjectSet *oset)
 {
-  std::unique_lock cl(cache_lock);
-
   // return # bytes not clean (and thus not released).
   loff_t unclean = 0;
 
