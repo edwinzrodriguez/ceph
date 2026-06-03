@@ -778,6 +778,13 @@ public:
   loff_t release_set(ObjectSet *oset);
   uint64_t release_all();
 
+  // Hold cache_lock across inode teardown so no ObjectCacher I/O uses oset_lock
+  // while ObjectSet is destroyed.
+  std::unique_lock<ceph::ReentrantLock> acquire_cache_lock()
+  {
+    return std::unique_lock<ceph::ReentrantLock>(cache_lock);
+  }
+
   void discard_set(ObjectSet *oset, const std::vector<ObjectExtent>& ex);
   void discard_writeback(ObjectSet *oset, const std::vector<ObjectExtent>& ex,
                          Context* on_finish);

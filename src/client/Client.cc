@@ -3812,6 +3812,7 @@ void Client::_put_inode(Inode *in, int n)
     remove_all_caps(in);
     std::unique_lock c_lock(client_lock);
     ldout(cct, 10) << __func__ << " deleting " << *in << dendl;
+    auto oc_lock = objectcacher->acquire_cache_lock();
     bool unclean = objectcacher->release_set(&in->oset);
     ceph_assert(!unclean);
     inode_map.erase(in->vino());
@@ -3826,6 +3827,7 @@ void Client::_put_inode(Inode *in, int n)
 
     in_lock.unlock();
     in->iput();
+    // oc_lock released here, after ObjectSet is destroyed
   }
 }
 
