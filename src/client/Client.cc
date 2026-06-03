@@ -2939,6 +2939,7 @@ void Client::send_request(MetaRequest *request, MetaSession *session,
 
   Inode *in = request->inode();
   if (in) {
+    std::unique_lock in_lock(*in);
     auto it = in->caps.find(mds);
     if (it != in->caps.end()) {
       request->sent_on_mseq = it->second.mseq;
