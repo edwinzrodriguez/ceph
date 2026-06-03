@@ -3140,16 +3140,14 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
     ldout(cct, 20) << __func__ << " signalling caller " << (void*)request->caller_cond << dendl;
     request->caller_cond->notify_all();
 
-    // wake for kick back
-    std::unique_lock l{client_lock, std::adopt_lock};
-    cond.wait(l, [tid, request, &cond, this] {
+    // wake for kick back (use cl; a second unique_lock would desync reentrancy)
+    cond.wait(cl, [tid, request, &cond, this] {
       if (request->dispatch_cond) {
         ldout(cct, 20) << "handle_client_reply awaiting kickback on tid "
 		       << tid << " " << &cond << dendl;
       }
       return !request->dispatch_cond;
     });
-    l.release();
   }
 
   if (is_safe) {
@@ -4463,18 +4461,24 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
   // via C_ReentrantLock with client_lock already held — drop it first.
   Inode *in = static_cast<Inode *>(oset->parent);
   ceph_assert(in);
-  if (ceph_mutex_is_locked_by_me(client_lock)) {
-    unique_unlock cl(client_lock);
-    std::unique_lock in_lock(*in);
-    std::unique_lock c_lock(client_lock);
-    _flushed(in);
-  } else if (ceph_mutex_is_locked_by_me(*in)) {
-    std::unique_lock c_lock(client_lock);
+
+  int client_lock_depth = 0;
+  while (client_lock.is_locked_by_me()) {
+    client_lock.unlock();
+    ++client_lock_depth;
+  }
+
+  if (ceph_mutex_is_locked_by_me(*in)) {
+    std::scoped_lock c_lock(client_lock);
     _flushed(in);
   } else {
-    std::unique_lock in_lock(*in);
-    std::unique_lock c_lock(client_lock);
+    std::scoped_lock in_lock(*in);
+    std::scoped_lock c_lock(client_lock);
     _flushed(in);
+  }
+
+  while (client_lock_depth-- > 0) {
+    client_lock.lock();
   }
 }
 
@@ -5965,7 +5969,7 @@ out:
 filepath Client::walk_dentry_result::getpath() const
 {
   ceph_assert(diri);
-  std::unique_lock diri_lock(*diri);
+  ceph_assert(ceph_mutex_is_locked_by_me(*diri));
 
   auto path = filepath(diri->ino);
   if (dname.size()) {
@@ -6531,11 +6535,12 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
   }
 
   ceph_assert(root);
+  cl.unlock();
   {
-    unique_unlock unlock(client_lock);
     std::unique_lock root_lock(*root);
     _ll_get(root.get());
   }
+  cl.lock();
 
   // trace?
   if (!cct->_conf->client_trace.empty()) {
@@ -6994,26 +6999,45 @@ void Client::tick()
 
   auto now = ceph::coarse_mono_clock::now();
 
-  /*
-   * If the mount() is not finished
-   */
-  if (is_mounting() && !mds_requests.empty()) {
-    MetaRequest *req = mds_requests.begin()->second;
+  {
+    std::scoped_lock cl(client_lock);
 
-    if (req->created + mount_timeout < now) {
-      req->abort(-ETIMEDOUT);
-      if (req->caller_cond) {
-        req->kick = true;
-        req->caller_cond->notify_all();
+    /*
+     * If the mount() is not finished
+     */
+    if (is_mounting() && !mds_requests.empty()) {
+      MetaRequest *req = mds_requests.begin()->second;
+
+      if (req->created + mount_timeout < now) {
+	req->abort(-ETIMEDOUT);
+	if (req->caller_cond) {
+	  req->kick = true;
+	  req->caller_cond->notify_all();
+	}
+	signal_cond_list(waiting_for_mdsmap);
+	for (auto &p : mds_sessions) {
+	  signal_context_list(p.second->waiting_for_open);
+	}
       }
-      signal_cond_list(waiting_for_mdsmap);
-      for (auto &p : mds_sessions) {
-        signal_context_list(p.second->waiting_for_open);
-      }
+    }
+
+    renew_and_flush_cap_releases();
+    delay_put_inodes(is_unmounting());
+
+    if (!mount_aborted)
+      collect_and_send_metrics();
+
+    if (blocklisted && (is_mounted() || is_unmounting()) &&
+	last_auto_reconnect + std::chrono::seconds(30 * 60) < now &&
+	cct->_conf.get_val<bool>("client_reconnect_stale")) {
+      messenger->client_reset();
+      fd_gen++; // invalidate open files
+      blocklisted = false;
+      _kick_stale_sessions();
+      last_auto_reconnect = now;
     }
   }
 
-  renew_and_flush_cap_releases();
   {
     unique_unlock unlock(client_lock);
     // delayed caps
@@ -7023,21 +7047,7 @@ void Client::tick()
     });
   }
 
-  if (!mount_aborted)
-    collect_and_send_metrics();
-
-  delay_put_inodes(is_unmounting());
   trim_cache(true);
-
-  if (blocklisted && (is_mounted() || is_unmounting()) &&
-      last_auto_reconnect + std::chrono::seconds(30 * 60) < now &&
-      cct->_conf.get_val<bool>("client_reconnect_stale")) {
-    messenger->client_reset();
-    fd_gen++; // invalidate open files
-    blocklisted = false;
-    _kick_stale_sessions();
-    last_auto_reconnect = now;
-  }
 }
 
 void Client::start_tick_thread()
@@ -7047,7 +7057,6 @@ void Client::start_tick_thread()
 
     auto last_tick = clock::zero();
 
-    std::unique_lock cl(client_lock);
     while (!tick_thread_stopped) {
       auto now = clock::now();
       auto since = now - last_tick;
@@ -7057,15 +7066,17 @@ void Client::start_tick_thread()
 
       auto interval = std::max(t_interval, d_interval);
       if (likely(since >= interval*.90)) {
-        tick();
-        last_tick = clock::now();
+	tick();
+	last_tick = clock::now();
       } else {
-        interval -= since;
+	interval -= since;
       }
 
       ldout(cct, 20) << "upkeep thread waiting interval " << interval << dendl;
-      if (!tick_thread_stopped)
-        upkeep_cond.wait_for(cl, interval);
+      if (!tick_thread_stopped) {
+	std::unique_lock cl(client_lock);
+	upkeep_cond.wait_for(cl, interval);
+      }
     }
   });
 }
@@ -7692,7 +7703,9 @@ int Client::unlinkat(int dirfd, const char *relpath, int flags, const UserPerm& 
     return r;
   }
 
-  std::unique_lock dirinode_lock(*dirinode);
+  // Do not hold inode_lock across make_request: the MDS reply is handled on
+  // ms_dispatch and needs the same inode_lock to run insert_trace and signal
+  // caller_cond.
   if (flags & AT_REMOVEDIR) {
     r = _rmdir(dirinode.get(), relpath, perm);
   } else {

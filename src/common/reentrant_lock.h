@@ -252,6 +252,14 @@ public:
     return m_released;
   }
 
+  // Call when client_lock is re-acquired before scope end and the destructor
+  // must not restore the saved recursion depth (e.g. flush_set_callback).
+  void abandon() noexcept
+  {
+    m_released = false;
+    m_saved = 0;
+  }
+
   ~unique_unlock() noexcept(false)
   {
     if (!m_released || m_saved <= 0) {
