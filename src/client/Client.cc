@@ -2971,7 +2971,8 @@ ref_t<MClientRequest> Client::build_client_request(MetaRequest *request, mds_ran
     if ((old_version && request->retry_attempt >= old_max_retry) ||
         (uint32_t)request->retry_attempt >= UINT32_MAX) {
       request->abort(-EMULTIHOP);
-      request->caller_cond->notify_all();
+      if (request->caller_cond)
+        request->caller_cond->notify_all();
       ldout(cct, 1) << __func__ << " request tid " << request->tid
                     << " retry seq overflow" << ", abort it" << dendl;
       return nullptr;
@@ -3050,7 +3051,8 @@ void Client::handle_client_request_forward(const MConstRef<MClientRequestForward
   auto num_fwd = fwd->get_num_fwd();
   if (num_fwd <= request->num_fwd || (uint32_t)num_fwd >= UINT32_MAX) {
     request->abort(-EMULTIHOP);
-    request->caller_cond->notify_all();
+    if (request->caller_cond)
+      request->caller_cond->notify_all();
     ldout(cct, 0) << __func__ << " request tid " << tid << " new num_fwd "
       << num_fwd << " old num_fwd " << request->num_fwd << ", fwd seq overflow"
       << ", abort it" << dendl;
@@ -3074,7 +3076,8 @@ void Client::handle_client_request_forward(const MConstRef<MClientRequestForward
   });
   request->num_fwd = num_fwd;
   request->resend_mds = fwd->get_dest_mds();
-  request->caller_cond->notify_all();
+  if (request->caller_cond)
+    request->caller_cond->notify_all();
 }
 
 bool Client::is_dir_operation(MetaRequest *req)
@@ -3127,8 +3130,18 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
   }
 
   ceph_assert(!request->reply);
+
+  // Only signal the caller once (on the first reply): either an unsafe reply,
+  // or a safe reply with no prior unsafe reply.  Set dispatch_cond before
+  // insert_trace: that path drops client_lock and make_request may wake on
+  // request->reply, clear caller_cond, and kick dispatch_cond.
+  const bool signal_caller = !is_safe || !request->got_unsafe;
+  ceph::reentrant_condition_variable cond;
+  if (signal_caller)
+    request->dispatch_cond = &cond;
+
   request->reply = reply;
-  
+
   // Release client_lock before calling insert_trace to avoid lock ordering issues
   // insert_trace -> add_update_inode acquires inode_lock
   {
@@ -3155,15 +3168,15 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
     }
   }
 
-  // Only signal the caller once (on the first reply):
-  // Either its an unsafe reply, or its a safe reply and no unsafe reply was sent.
-  if (!is_safe || !request->got_unsafe) {
-    ceph::reentrant_condition_variable cond;
-    request->dispatch_cond = &cond;
-
-    // wake up waiter
-    ldout(cct, 20) << __func__ << " signalling caller " << (void*)request->caller_cond << dendl;
-    request->caller_cond->notify_all();
+  if (signal_caller) {
+    if (request->caller_cond) {
+      ldout(cct, 20) << __func__ << " signalling caller "
+		       << (void*)request->caller_cond << dendl;
+      request->caller_cond->notify_all();
+    } else {
+      ldout(cct, 20) << __func__ << " caller already done on tid " << tid
+		       << dendl;
+    }
 
     // wake for kick back (use cl; a second unique_lock would desync reentrancy)
     cond.wait(cl, [tid, request, &cond, this] {
