@@ -1277,6 +1277,7 @@ protected:
    */
   Dentry* link(Dir *dir, const std::string& name, Inode *in, Dentry *dn);
   void unlink(Dentry *dn, bool keepdir, bool keepdentry);
+  void unlink_locked(Dentry *dn, bool keepdir, bool keepdentry);
 
   int fill_stat(Inode *in, struct stat *st, frag_info_t *dirstat=0, nest_info_t *rstat=0);
   int fill_stat(const InodeRef& in, struct stat *st, frag_info_t *dirstat=0, nest_info_t *rstat=0) {

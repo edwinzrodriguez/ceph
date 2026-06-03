@@ -979,6 +979,7 @@ void Client::trim_cache_for_reconnect(MetaSession *s)
 
 void Client::trim_dentry(Dentry *dn)
 {
+  std::unique_lock lock(client_lock);
   if (!dn->dir) {
     ldout(cct, 15) << "trim_dentry skipping already-detached dn " << dn->name
 		   << dendl;
@@ -994,7 +995,7 @@ void Client::trim_dentry(Dentry *dn)
     Inode *diri = dn->dir->parent_inode;
     clear_dir_complete_and_ordered(diri, true);
   }
-  unlink(dn, false, false);  // drop dir, drop dentry
+  unlink_locked(dn, false, false);  // drop dir, drop dentry
 }
 
 
@@ -4007,11 +4008,12 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
   return dn;
 }
 
-void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
+void Client::unlink_locked(Dentry *dn, bool keepdir, bool keepdentry)
 {
   std::unique_lock cl(client_lock);
 
-  // Capture the parent dir now; a concurrent trim may detach this dentry.
+  // Capture the parent dir now; another trim may detach this dentry before
+  // we finish, but only while client_lock is held.
   Dir *dir = dn->dir;
 
   if (!keepdentry && !dir) {
@@ -4038,14 +4040,13 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
   } else {
     ldout(cct, 15) << "unlink  removing '" << dn->name << "' dn " << dn << dendl;
 
-    if (!dir || !dn->dir) {
+    if (!dir) {
       // Already detached; drop any LRU pin only.
       if (dn->lru_is_cached())
 	lru.lru_remove(dn);
       if (dn->ref > 0)
 	dn->put();
     } else {
-      dir = dn->dir;
       dn->detach();
       lru.lru_remove(dn);
       dn->put();
@@ -4057,6 +4058,12 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 	close_dir(dir);
     }
   }
+}
+
+void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
+{
+  std::unique_lock cl(client_lock);
+  unlink_locked(dn, keepdir, keepdentry);
 }
 
 /**
@@ -7248,7 +7255,8 @@ void Client::tick()
     });
   }
 
-  trim_cache(true);
+  if (!is_unmounting())
+    trim_cache(true);
 }
 
 void Client::start_tick_thread()
