@@ -399,6 +399,7 @@ struct Inode : RefCountedObject {
   void dump(Formatter *f) const;
   void print(std::ostream&) const;
 
+  // Caller must hold inode_lock (reads optmetadata).
   bool has_charmap() const {
     return optmetadata.has_opt(optkind_t::CHARMAP);
   }

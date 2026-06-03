@@ -1379,6 +1379,7 @@ bool Client::_wrap_name(Inode& diri, std::string& dname, std::string& alternate_
     return true;
   }
 
+  std::unique_lock diri_lock(diri);
   if (diri.has_charmap()) {
     auto& cs = diri.get_charmap();
     ldout(cct, 25) << __func__ << ":  " << cs << dendl;
@@ -1487,6 +1488,7 @@ std::string Client::_unwrap_name(Inode& diri, const std::string& dname, const st
   std::string newdname = dname;
   std::string newaltn = alternate_name;
 
+  std::unique_lock diri_lock(diri);
 #if defined(__linux__)
   auto fscrypt_denc = fscrypt->get_fname_denc(diri.fscrypt_ctx, &diri.fscrypt_key_validator, true);
   if (fscrypt_denc) {
