@@ -4862,6 +4862,7 @@ void Client::invalidate_snaprealm_and_children(SnapRealm *realm)
 
 SnapRealm *Client::get_snap_realm(inodeno_t r)
 {
+  std::scoped_lock lock(client_lock);
   SnapRealm *realm = snap_realms[r];
 
   ldout(cct, 20) << __func__ << " " << r << " " << realm << ", nref was "
@@ -4882,6 +4883,7 @@ SnapRealm *Client::get_snap_realm(inodeno_t r)
 
 SnapRealm *Client::get_snap_realm_maybe(inodeno_t r)
 {
+  std::scoped_lock lock(client_lock);
   auto it = snap_realms.find(r);
   if ( it == snap_realms.end()) {
     ldout(cct, 20) << __func__ << " " << r << " fail" << dendl;
@@ -4895,6 +4897,7 @@ SnapRealm *Client::get_snap_realm_maybe(inodeno_t r)
 
 void Client::put_snap_realm(SnapRealm *realm)
 {
+  std::scoped_lock lock(client_lock);
   ldout(cct, 20) << __func__ << " " << realm->ino << " " << realm
 		 << " " << realm->nref << " -> " << (realm->nref - 1) << dendl;
   if (--realm->nref == 0) {
@@ -4960,6 +4963,7 @@ static std::pair<SnapRealmInfo, std::optional<SnapRealmInfoMeta>> get_snap_realm
 
 void Client::update_snap_trace(MetaSession *session, const bufferlist& bl, SnapRealm **realm_ret, bool flush)
 {
+  std::scoped_lock lock(client_lock);
   SnapRealm *first_realm = NULL;
   ldout(cct, 10) << __func__ << " len " << bl.length() << dendl;
 
