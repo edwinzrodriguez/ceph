@@ -6,6 +6,7 @@
 #include "InodeRef.h"
 #include "UserPerm.h"
 #include "mds/flock.h"
+#include "common/reentrant_lock.h"
 
 class Inode;
 
@@ -26,7 +27,7 @@ struct Fh {
   int       mode;       // the mode i opened the file with
 
   bool pos_locked = false;           // pos is currently in use
-  std::list<ceph::reentrant_condition_variable*> pos_waiters;   // waiters for pos
+  std::list<ceph::reentrant_condition_variable_impl<Inode>*> pos_waiters;   // waiters for pos
 
   Readahead readahead;
 

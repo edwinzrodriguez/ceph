@@ -316,6 +316,7 @@ public:
   friend class ClientCaps; // Manages capability operations with its own lock
   friend class SyntheticClient;
   friend class Dentry;
+  friend class Inode;
   friend void intrusive_ptr_release(Inode *in);
   template <typename T> friend struct RWRefState;
   template <typename T> friend class RWRef;

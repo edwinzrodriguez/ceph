@@ -131,8 +131,24 @@ struct Inode : RefCountedObject {
   Client *client;
 
   // mutable ceph::mutex inode_lock = ceph::make_mutex("Inode::inode_lock");
-  mutable ceph::ReentrantLock inode_lock = ceph::make_reentrant("Inode::inode_lock", false); // disable deadlock detection
+  mutable ceph::ReentrantLock m_inode_lock = ceph::make_reentrant("Inode::inode_lock", false); // disable deadlock detection
 
+  void lock() const;
+  bool try_lock() const;
+  void unlock() const;
+  bool is_locked() const;
+  bool is_locked_by_me() const;
+  // Called by reentrant_condition_variable before blocking: saves recursion
+  // depth and marks the lock as released so other threads can acquire it.
+  int release_for_wait() noexcept;
+
+  // Called by reentrant_condition_variable after waking: restores the saved
+  // recursion depth and re-establishes ownership for the current thread.
+  void restore_after_wait(int saved) noexcept;
+
+  // For condition_variable access to the underlying native mutex
+  ceph::mutex& native_mutex() const { return m_inode_lock.native_mutex(); }
+  
   // -- the actual inode --
   inodeno_t ino; // ORDER DEPENDENCY: oset
   snapid_t  snapid;
@@ -411,7 +427,7 @@ private:
 };
 
 inline Cap::~Cap() {
-  ceph_assert(ceph_mutex_is_locked_by_me(inode.inode_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(inode));
   session->with_caps_list([this](auto& caps) {
     cap_item.remove_myself();
   });

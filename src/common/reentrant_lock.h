@@ -105,24 +105,26 @@ ReentrantLock make_reentrant(Args&& ...args) {
   return ReentrantLock(std::forward<Args>(args)...);
 }
 
-// condition_variable that accepts std::unique_lock<ReentrantLock>.
+// condition_variable that accepts std::unique_lock<LockType> where LockType
+// provides a reentrant lock interface (lock/unlock/release_for_wait/restore_after_wait).
 //
 // On wait, the lock's full recursion depth is saved and the underlying native
 // mutex is handed to the real condition_variable.  On wakeup the recursion
 // depth is restored, so the caller re-emerges holding the lock with the same
 // count as before the wait.
-class reentrant_condition_variable {
+template <typename LockType = ReentrantLock>
+class reentrant_condition_variable_impl {
   ceph::condition_variable cv;
 
   // RAII helper: releases all recursion levels before a wait and restores
   // them afterwards.  Keeps a unique_lock on the native mutex so the
   // real condition_variable can atomically unlock+sleep.
   struct Guard {
-    ReentrantLock& rl;
+    LockType& rl;
     int saved;
     std::unique_lock<ceph::mutex> nl;
 
-    explicit Guard(std::unique_lock<ReentrantLock>& lock)
+    explicit Guard(std::unique_lock<LockType>& lock)
       : rl(*lock.mutex()),
         saved(rl.release_for_wait()),
         nl(rl.native_mutex(), std::adopt_lock) {}
@@ -134,25 +136,25 @@ class reentrant_condition_variable {
   };
 
 public:
-  void wait(std::unique_lock<ReentrantLock>& lock) {
+  void wait(std::unique_lock<LockType>& lock) {
     Guard g(lock);
     cv.wait(g.nl);
   }
 
   template <class Predicate>
-  void wait(std::unique_lock<ReentrantLock>& lock, Predicate pred) {
+  void wait(std::unique_lock<LockType>& lock, Predicate pred) {
     while (!pred()) wait(lock);
   }
 
   template <class Rep, class Period>
-  std::cv_status wait_for(std::unique_lock<ReentrantLock>& lock,
+  std::cv_status wait_for(std::unique_lock<LockType>& lock,
                           const std::chrono::duration<Rep, Period>& rel_time) {
     Guard g(lock);
     return cv.wait_for(g.nl, rel_time);
   }
 
   template <class Rep, class Period, class Predicate>
-  bool wait_for(std::unique_lock<ReentrantLock>& lock,
+  bool wait_for(std::unique_lock<LockType>& lock,
                 const std::chrono::duration<Rep, Period>& rel_time,
                 Predicate pred) {
     return wait_until(lock,
@@ -161,14 +163,14 @@ public:
   }
 
   template <class Clock, class Duration>
-  std::cv_status wait_until(std::unique_lock<ReentrantLock>& lock,
+  std::cv_status wait_until(std::unique_lock<LockType>& lock,
                             const std::chrono::time_point<Clock, Duration>& abs_time) {
     Guard g(lock);
     return cv.wait_until(g.nl, abs_time);
   }
 
   template <class Clock, class Duration, class Predicate>
-  bool wait_until(std::unique_lock<ReentrantLock>& lock,
+  bool wait_until(std::unique_lock<LockType>& lock,
                   const std::chrono::time_point<Clock, Duration>& abs_time,
                   Predicate pred) {
     while (!pred()) {
@@ -182,6 +184,8 @@ public:
   void notify_one() noexcept { cv.notify_one(); }
   void notify_all() noexcept { cv.notify_all(); }
 };
+
+using reentrant_condition_variable = reentrant_condition_variable_impl<ReentrantLock>;
 
 struct C_ReentrantLock : public Context {
   ceph::ReentrantLock *lock;
@@ -199,12 +203,13 @@ struct C_ReentrantLock : public Context {
   }
 };
 
+template <typename LockType = ReentrantLock>
 class C_ReentrantCond : public Context {
-  reentrant_condition_variable& cond;   ///< Cond to signal
+  reentrant_condition_variable_impl<LockType>& cond;   ///< Cond to signal
   bool *done;   ///< true if finish() has been called
   int *rval;    ///< return value
 public:
-  C_ReentrantCond(reentrant_condition_variable &c, bool *d, int *r) : cond(c), done(d), rval(r) {
+  C_ReentrantCond(reentrant_condition_variable_impl<LockType> &c, bool *d, int *r) : cond(c), done(d), rval(r) {
     *done = false;
   }
   void finish(int r) override {
