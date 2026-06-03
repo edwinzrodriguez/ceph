@@ -1008,81 +1008,17 @@ void Inode::set_effective_size(uint64_t size)
   *(ceph_le64 *)fscrypt_file.data() = size;
 }
 
-void Inode::hierarchy_lock_begin(bool& released_client,
-				 bool& acquired_inode) const
-{
-  released_client = ceph_mutex_is_locked_by_me(client->client_lock);
-  if (released_client) {
-    client->client_lock.unlock();
-  }
-  if (is_locked_by_me()) {
-    acquired_inode = false;
-  } else {
-    lock();
-    acquired_inode = true;
-  }
-  if (released_client) {
-    client->client_lock.lock();
-  }
-}
-
-bool Inode::hierarchy_try_lock_begin(bool& released_client,
-				     bool& acquired_inode) const
-{
-  released_client = ceph_mutex_is_locked_by_me(client->client_lock);
-  if (released_client) {
-    client->client_lock.unlock();
-  }
-  if (is_locked_by_me()) {
-    acquired_inode = false;
-  } else if (!try_lock()) {
-    if (released_client) {
-      client->client_lock.lock();
-      released_client = false;
-    }
-    return false;
-  } else {
-    acquired_inode = true;
-  }
-  if (released_client) {
-    client->client_lock.lock();
-  }
-  return true;
-}
-
-void Inode::hierarchy_lock_end(bool released_client,
-			      bool acquired_inode) const
-{
-  if (released_client) {
-    client->client_lock.unlock();
-  }
-  if (acquired_inode) {
-    unlock();
-  }
-  if (released_client) {
-    client->client_lock.lock();
-  }
-}
-
-void Inode::lock() const {
-  ceph_assert(ceph_mutex_is_not_locked_by_me(client->client_lock));
-  m_inode_lock.lock();
-}
-
-bool Inode::try_lock() const {
-  return m_inode_lock.try_lock();
-}
-
-void Inode::unlock() const {
-  m_inode_lock.unlock();
-}
-
 bool Inode::is_locked() const {
   return m_inode_lock.is_locked();
 }
 
 bool Inode::is_locked_by_me() const {
   return m_inode_lock.is_locked_by_me();
+}
+
+ceph::ReentrantLock& Inode::get_client_lock() const
+{
+  return client->client_lock;
 }
 
 int Inode::release_for_wait() noexcept {

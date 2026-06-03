@@ -252,15 +252,33 @@ ceph::containers::tiny_vector<LockT> make_lock_container(
 template<typename Mutex>
 class unique_unlock {
 public:
-  explicit unique_unlock(Mutex& m) : m_mutex(m) {
-    m_mutex.unlock();   // release on construction
-    m_owns = false;
+  explicit unique_unlock(Mutex& m)
+    : m_mutex(m), m_released(true)
+  {
+    m_mutex.unlock();
   }
 
-  ~unique_unlock() noexcept(false) {
-    if (!m_owns) {
-      m_mutex.lock();     // acquire on destruction
-      m_owns = true;
+  unique_unlock(Mutex& m, std::defer_lock_t)
+    : m_mutex(m), m_released(false)
+  {}
+
+  void release()
+  {
+    if (!m_released) {
+      m_mutex.unlock();
+      m_released = true;
+    }
+  }
+
+  bool released() const
+  {
+    return m_released;
+  }
+
+  ~unique_unlock() noexcept(false)
+  {
+    if (m_released) {
+      m_mutex.lock();
     }
   }
 
@@ -269,7 +287,7 @@ public:
 
 private:
   Mutex& m_mutex;
-  bool m_owns = false;
+  bool m_released;
 };
 } // namespace ceph
 

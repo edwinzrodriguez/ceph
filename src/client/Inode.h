@@ -133,25 +133,17 @@ template <> class unique_lock<Inode>;
 template <> class scoped_lock<Inode>;
 }
 
-namespace ceph {
-template <typename Mutex> class unique_unlock;
-}
-
 struct Inode : RefCountedObject {
   friend class std::unique_lock<Inode>;
   friend class std::scoped_lock<Inode>;
-  friend class ceph::unique_unlock<Inode>;
 
   ceph::coarse_mono_time hold_caps_until;
   Client *client;
 
+  ceph::ReentrantLock& get_client_lock() const;
+
   // mutable ceph::mutex inode_lock = ceph::make_mutex("Inode::inode_lock");
   mutable ceph::ReentrantLock m_inode_lock = ceph::make_reentrant("Inode::inode_lock", false); // disable deadlock detection
-
-  // Used by std::unique_lock<Inode> to respect inode_lock -> client_lock ordering.
-  void hierarchy_lock_begin(bool& released_client, bool& acquired_inode) const;
-  bool hierarchy_try_lock_begin(bool& released_client, bool& acquired_inode) const;
-  void hierarchy_lock_end(bool released_client, bool acquired_inode) const;
 
   bool is_locked() const;
   bool is_locked_by_me() const;
@@ -441,12 +433,6 @@ private:
 
   void break_deleg(bool skip_read);
   bool delegations_broken(bool skip_read);
-
-  // Private so the primary std::unique_lock<Inode> template (which calls
-  // lock()/unlock()) is ill-formed; use std::unique_lock<Inode> from inode_lock.h.
-  void lock() const;
-  bool try_lock() const;
-  void unlock() const;
 };
 
 inline Cap::~Cap() {

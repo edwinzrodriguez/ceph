@@ -229,13 +229,42 @@ template <class Mutex>
 class unique_unlock<ReentrantLockImpl<Mutex>> {
 public:
   explicit unique_unlock(ReentrantLockImpl<Mutex>& rl)
-    : m_lock(rl),
-      m_saved(rl.release_for_wait()) {
-    rl.native_mutex().unlock();
+    : m_lock(rl), m_saved(0), m_released(false)
+  {
+    release();
   }
 
-  ~unique_unlock() noexcept(false) {
-    m_lock.native_mutex().lock();
+  unique_unlock(ReentrantLockImpl<Mutex>& rl, std::defer_lock_t)
+    : m_lock(rl), m_saved(0), m_released(false)
+  {}
+
+  void release()
+  {
+    if (!m_released && m_lock.is_locked_by_me()) {
+      m_saved = m_lock.release_for_wait();
+      m_lock.native_mutex().unlock();
+      m_released = true;
+    }
+  }
+
+  bool released() const
+  {
+    return m_released;
+  }
+
+  ~unique_unlock() noexcept(false)
+  {
+    if (!m_released || m_saved <= 0) {
+      return;
+    }
+    if (!m_lock.is_locked_by_me()) {
+      // The native mutex may already be held if this thread re-acquired
+      // client_lock while the lock was released (e.g. during monclient I/O).
+#ifdef CEPH_DEBUG_MUTEX
+      if (!ceph_mutex_is_locked_by_me(m_lock.native_mutex()))
+#endif
+        m_lock.native_mutex().lock();
+    }
     m_lock.restore_after_wait(m_saved);
   }
 
@@ -245,6 +274,7 @@ public:
 private:
   ReentrantLockImpl<Mutex>& m_lock;
   int m_saved;
+  bool m_released;
 };
 
 } // namespace ceph
