@@ -7659,10 +7659,13 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
     ldout(cct, 10) << " " << i << " " << *diri << " " << binstrprint(dname) << dendl;
     ldout(cct, 20) << "  (path is " << binstrprint(trimmed_path) << ")" << dendl;
     InodeRef next;
-    if (!diri.get()->is_dir()) {
-      ldout(cct, 20) << diri.get() << " is not a dir inode, name " << dname.c_str() << dendl;
-      rc = -ENOTDIR;
-      goto out;
+    {
+      std::unique_lock diri_lock(*diri);
+      if (!diri->is_dir()) {
+	ldout(cct, 20) << diri.get() << " is not a dir inode, name " << dname.c_str() << dendl;
+	rc = -ENOTDIR;
+	goto out;
+      }
     }
     {
       if (should_check_perms()) {
@@ -7714,55 +7717,65 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
     }
     // only follow trailing symlink if followsym.  always follow
     // 'directory' symlinks.
-    if (next && next->is_symlink()) {
-      symlinks++;
-      ldout(cct, 20) << " symlink count " << symlinks << ", value is '" << next->symlink << "'" << dendl;
-      if (symlinks > MAXSYMLINKS) {
-        rc = -ELOOP;
-        goto out;
-      }
-
+    if (next) {
       std::string symlink;
+      bool follow_symlink = false;
+      {
+	std::unique_lock next_lock(*next);
+	if (next->is_symlink()) {
+	  follow_symlink = true;
+	  symlinks++;
+	  ldout(cct, 20) << " symlink count " << symlinks << ", value is '"
+			 << next->symlink << "'" << dendl;
+	  if (symlinks > MAXSYMLINKS) {
+	    rc = -ELOOP;
+	    goto out;
+	  }
 #if defined(__linux__)
-      auto fscrypt_denc = fscrypt->get_fname_denc(next->fscrypt_ctx, &next->fscrypt_key_validator, true);
+	  auto fscrypt_denc = fscrypt->get_fname_denc(next->fscrypt_ctx,
+						      &next->fscrypt_key_validator, true);
 
-      if (fscrypt_denc) {
-        int ret = fscrypt_denc->get_decrypted_symlink(next->symlink, &symlink);
-        if (ret < 0) {
-          ldout(cct, 0) << __FILE__ << ":" << __LINE__ << ": failed to decrypt symlink (r=" << ret << ")" << dendl;
-          ret = -EPERM;
-          goto out;
-        }
-        ldout(cct, 25) << "decrypted symlink is: " << binstrprint(symlink) << dendl;
-      } else
+	  if (fscrypt_denc) {
+	    int ret = fscrypt_denc->get_decrypted_symlink(next->symlink, &symlink);
+	    if (ret < 0) {
+	      ldout(cct, 0) << __FILE__ << ":" << __LINE__
+			    << ": failed to decrypt symlink (r=" << ret << ")" << dendl;
+	      rc = -EPERM;
+	      goto out;
+	    }
+	    ldout(cct, 25) << "decrypted symlink is: " << binstrprint(symlink) << dendl;
+	  } else
 #endif
-        symlink = next->symlink;
-
-      if (i < path.depth() - 1) {
-	// dir symlink
-	// replace consumed components of path with symlink dir target
-	if (symlink[0] == '/') {
-	  diri = root;
+	    symlink = next->symlink;
 	}
-	filepath resolved(std::move(symlink));
-	resolved.append(path.postfixpath(i + 1));
-	path = std::move(resolved);
-	i = 0;
-	continue;
-      } else if (extra_options.followsym) {
-	if (symlink[0] == '/') {
-	  path = filepath(std::move(symlink));
+      }
+      if (follow_symlink) {
+	if (i < path.depth() - 1) {
+	  // dir symlink
+	  // replace consumed components of path with symlink dir target
+	  if (symlink[0] == '/') {
+	    diri = root;
+	  }
+	  filepath resolved(std::move(symlink));
+	  resolved.append(path.postfixpath(i + 1));
+	  path = std::move(resolved);
 	  i = 0;
-	  // reset position
-	  diri = root;
-	} else {
-	  // we need to remove the symlink component from off of the path
-	  // before adding the target that the symlink points to.  remain
-	  // at the same position in the path.
-	  path.pop_dentry();
-	  path.append(filepath(std::move(symlink)));
+	  continue;
+	} else if (extra_options.followsym) {
+	  if (symlink[0] == '/') {
+	    path = filepath(std::move(symlink));
+	    i = 0;
+	    // reset position
+	    diri = root;
+	  } else {
+	    // we need to remove the symlink component from off of the path
+	    // before adding the target that the symlink points to.  remain
+	    // at the same position in the path.
+	    path.pop_dentry();
+	    path.append(filepath(std::move(symlink)));
+	  }
+	  continue;
 	}
-	continue;
       }
     }
     if (i == (path.depth() - 1)) {
@@ -10397,11 +10410,18 @@ int Client::create_and_open(int dirfd, const char *relpath, int flags,
     return -EEXIST;
 
 #if defined(__linux__) && defined(O_PATH)
-  if (in && in->is_symlink() && (flags & O_NOFOLLOW) && !(flags & O_PATH))
+  if (in) {
+    std::unique_lock in_lock(*in);
+    if (in->is_symlink() && (flags & O_NOFOLLOW) && !(flags & O_PATH))
+      return -ELOOP;
+  }
 #else
-    if (in && in->is_symlink() && (flags & O_NOFOLLOW))
+  if (in) {
+    std::unique_lock in_lock(*in);
+    if (in->is_symlink() && (flags & O_NOFOLLOW))
+      return -ELOOP;
+  }
 #endif
-    return -ELOOP;
 
   if (!in && (flags & O_CREAT)) {
     if (should_check_perms()) {
