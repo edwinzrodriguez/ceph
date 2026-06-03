@@ -6008,7 +6008,7 @@ out:
 filepath Client::walk_dentry_result::getpath() const
 {
   ceph_assert(diri);
-  ceph_assert(ceph_mutex_is_locked_by_me(*diri));
+  std::unique_lock diri_lock(*diri);
 
   auto path = filepath(diri->ino);
   if (dname.size()) {
