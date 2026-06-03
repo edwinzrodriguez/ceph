@@ -4104,7 +4104,7 @@ void Client::get_cap_ref(Inode *in, int cap)
 
 void Client::put_cap_ref(Inode *in, int cap)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  std::unique_lock in_lock(*in);
   client_caps->put_cap_ref(in, cap);
 
 }
@@ -8976,7 +8976,7 @@ void Client::fill_statx(Inode *in, unsigned int mask, struct ceph_statx *stx)
 	   << " mode 0" << oct << in->mode << dec
 	   << " mtime " << in->mtime << " ctime " << in->ctime << " change_attr " << in->change_attr << dendl;
   memset(stx, 0, sizeof(struct ceph_statx));
-  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  std::unique_lock in_lock(*in);
 
   /*
    * If mask is 0, then the caller set AT_STATX_DONT_SYNC. Reset the mask
@@ -14315,7 +14315,7 @@ int Client::ll_walk(const char* name, Inode **out, struct ceph_statx *stx,
 
 void Client::_ll_get(Inode *in)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  std::unique_lock in_lock(*in);
   if (in->ll_ref == 0) {
     in->iget();
     if (in->is_dir() && !in->dentries.empty()) {
