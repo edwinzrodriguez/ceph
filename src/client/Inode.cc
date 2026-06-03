@@ -44,7 +44,7 @@ Inode::~Inode()
 
 void Inode::print(std::ostream& out) const
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
   out << vino() << "("
       << "faked_ino=" << faked_ino
       << " nref=" << get_nref()
@@ -100,7 +100,7 @@ void Inode::print(std::ostream& out) const
 
 void Inode::make_long_path(filepath& p)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (!dentries.empty()) {
     Dentry *dn = get_first_parent();
@@ -120,7 +120,7 @@ void Inode::make_long_path(filepath& p)
 
 void Inode::make_short_path(filepath& p)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (!dentries.empty()) {
     Dentry *dn = get_first_parent();
@@ -143,7 +143,7 @@ void Inode::make_short_path(filepath& p)
  */
 bool Inode::make_path_string(std::string& s)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (client->_get_root_ino(false) == ino) {
     return true;
@@ -173,7 +173,7 @@ bool Inode::make_path_string(std::string& s)
  */
 void Inode::make_nosnap_relative_path(filepath& p)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (snapid == CEPH_NOSNAP) {
     p = filepath(ino);
@@ -198,7 +198,7 @@ void Inode::make_nosnap_relative_path(filepath& p)
 
 void Inode::get_open_ref(int mode)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (open_by_mode[mode] == 0) {
     client->inc_opened_inodes();
@@ -210,7 +210,7 @@ void Inode::get_open_ref(int mode)
 
 bool Inode::put_open_ref(int mode)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   //cout << "open_by_mode[" << mode << "] " << open_by_mode[mode] << " -> " << (open_by_mode[mode]-1) << std::endl;
   auto& ref = open_by_mode.at(mode);
@@ -225,7 +225,7 @@ bool Inode::put_open_ref(int mode)
 
 void Inode::get_cap_ref(int cap)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   int n = 0;
   while (cap) {
@@ -241,7 +241,7 @@ void Inode::get_cap_ref(int cap)
 
 bool Inode::is_last_cap_ref(int c)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (c != CEPH_CAP_FILE_BUFFER) {
     return cap_refs[c] == 0;
@@ -257,7 +257,7 @@ bool Inode::is_last_cap_ref(int c)
 
 int Inode::put_cap_ref(int cap)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   int last = 0;
   int n = 0;
@@ -281,7 +281,7 @@ int Inode::put_cap_ref(int cap)
 
 bool Inode::is_any_caps()
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   return !caps.empty() || snap_caps;
 }
@@ -301,7 +301,7 @@ bool Inode::cap_is_valid(const Cap &cap) const
 
 int Inode::caps_issued(int *implemented) const
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   int c = snap_caps;
   int i = 0;
@@ -324,7 +324,7 @@ int Inode::caps_issued(int *implemented) const
 
 void Inode::try_touch_cap(mds_rank_t mds)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   auto it = caps.find(mds);
   if (it != caps.end()) {
@@ -351,7 +351,7 @@ void Inode::try_touch_cap(mds_rank_t mds)
  */
 bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   int c = snap_caps;
   int i = 0;
@@ -407,7 +407,7 @@ int Inode::caps_used()
 
 int Inode::caps_file_wanted()
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   int want = 0;
   for (const auto &[mode, cnt] : open_by_mode)
@@ -434,7 +434,7 @@ int Inode::caps_wanted()
 
 int Inode::caps_mds_wanted()
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   int want = 0;
   for (const auto &pair : caps) {
@@ -445,14 +445,14 @@ int Inode::caps_mds_wanted()
 
 int Inode::caps_dirty()
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   return dirty_caps | flushing_caps;
 }
 
 const UserPerm* Inode::get_best_perms()
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   const UserPerm *perms = NULL;
   for (const auto &pair : caps) {
@@ -484,7 +484,7 @@ bool Inode::have_valid_size()
 // open Dir for an inode.  if it's not open, allocated it (and pin dentry in memory).
 Dir *Inode::open_dir()
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (!dir) {
     dir = new Dir(this);
@@ -512,7 +512,7 @@ bool Inode::check_mode(const UserPerm& perms, unsigned want)
 
 void Inode::dump(Formatter *f) const
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   f->dump_stream("ino") << ino;
   f->dump_stream("snapid") << snapid;
@@ -714,7 +714,7 @@ void CapSnap::dump(Formatter *f) const
 
 void Inode::set_async_err(int r)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   for (const auto &fh : fhs) {
     fh->async_err = r;
@@ -723,7 +723,7 @@ void Inode::set_async_err(int r)
 
 bool Inode::has_recalled_deleg()
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (delegations.empty())
     return false;
@@ -735,7 +735,7 @@ bool Inode::has_recalled_deleg()
 
 bool Inode::is_write_delegated()
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (delegations.empty()) {
     return false;
@@ -752,7 +752,7 @@ bool Inode::is_write_delegated()
 
 void Inode::recall_deleg(bool skip_read)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (delegations.empty())
     return;
@@ -768,7 +768,7 @@ void Inode::recall_deleg(bool skip_read)
 
 bool Inode::delegations_broken(bool skip_read)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (delegations.empty()) {
     lsubdout(client->cct, client, 10) <<
@@ -813,7 +813,7 @@ void Inode::break_deleg(bool skip_read)
  */
 int Inode::set_deleg(Fh *fh, unsigned type, ceph_deleg_cb_t cb, void *priv)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   lsubdout(client->cct, client, 10) <<
 	  __func__ << ": inode " << *this << dendl;
@@ -893,7 +893,7 @@ int Inode::set_deleg(Fh *fh, unsigned type, ceph_deleg_cb_t cb, void *priv)
  */
 void Inode::unset_deleg(Fh *fh)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   for (list<Delegation>::iterator d = delegations.begin();
        d != delegations.end(); ++d) {
@@ -915,7 +915,7 @@ void Inode::unset_deleg(Fh *fh)
 */
 void Inode::mark_caps_dirty(int caps)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   /*
    * If auth_cap is nullptr means the reonnecting is not finished or
@@ -947,7 +947,7 @@ void Inode::mark_caps_dirty(int caps)
 */
 void Inode::mark_caps_clean()
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   lsubdout(client->cct, client, 10) << __func__ << " " << *this << dendl;
   dirty_caps = 0;
@@ -968,7 +968,7 @@ FSCryptContextRef Inode::init_fscrypt_ctx(FSCrypt *fscrypt)
 
 void Inode::gen_inherited_fscrypt_auth(std::vector<uint8_t> *fsa)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (!fscrypt_ctx) {
     //TODO:Revisit to make sure that we do not skip entire subtree somehow
@@ -988,7 +988,7 @@ void Inode::gen_inherited_fscrypt_auth(std::vector<uint8_t> *fsa)
 #endif
 uint64_t Inode::effective_size() const
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (fscrypt_file.size() < sizeof(uint64_t) || !client->get_fscrypt_as()) {
     return size;
@@ -999,13 +999,69 @@ uint64_t Inode::effective_size() const
 
 void Inode::set_effective_size(uint64_t size)
 {
-  std::unique_lock in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this);
 
   if (fscrypt_file.size() < sizeof(uint64_t)) {
     fscrypt_file.resize(sizeof(uint64_t));
   }
 
   *(ceph_le64 *)fscrypt_file.data() = size;
+}
+
+void Inode::hierarchy_lock_begin(bool& released_client,
+				 bool& acquired_inode) const
+{
+  released_client = ceph_mutex_is_locked_by_me(client->client_lock);
+  if (released_client) {
+    client->client_lock.unlock();
+  }
+  if (is_locked_by_me()) {
+    acquired_inode = false;
+  } else {
+    lock();
+    acquired_inode = true;
+  }
+  if (released_client) {
+    client->client_lock.lock();
+  }
+}
+
+bool Inode::hierarchy_try_lock_begin(bool& released_client,
+				     bool& acquired_inode) const
+{
+  released_client = ceph_mutex_is_locked_by_me(client->client_lock);
+  if (released_client) {
+    client->client_lock.unlock();
+  }
+  if (is_locked_by_me()) {
+    acquired_inode = false;
+  } else if (!try_lock()) {
+    if (released_client) {
+      client->client_lock.lock();
+      released_client = false;
+    }
+    return false;
+  } else {
+    acquired_inode = true;
+  }
+  if (released_client) {
+    client->client_lock.lock();
+  }
+  return true;
+}
+
+void Inode::hierarchy_lock_end(bool released_client,
+			      bool acquired_inode) const
+{
+  if (released_client) {
+    client->client_lock.unlock();
+  }
+  if (acquired_inode) {
+    unlock();
+  }
+  if (released_client) {
+    client->client_lock.lock();
+  }
 }
 
 void Inode::lock() const {
