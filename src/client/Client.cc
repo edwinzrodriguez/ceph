@@ -1607,8 +1607,8 @@ void Client::clear_dir_complete_and_ordered(Inode *diri, bool complete)
 void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
                                     Inode *diri, Inode *diri_other) {
 
-  auto& reply = request->reply;
-  ConnectionRef con = request->reply->get_connection();
+  auto reply = request->reply;
+  ConnectionRef con = reply->get_connection();
   uint64_t features;
   if(session->mds_features.test(CEPHFS_FEATURE_REPLY_ENCODING)) {
     features = (uint64_t)-1;
@@ -1844,7 +1844,7 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
     return NULL;
   }
 
-  ConnectionRef con = request->reply->get_connection();
+  ConnectionRef con = reply->get_connection();
   uint64_t features;
   if (session->mds_features.test(CEPHFS_FEATURE_REPLY_ENCODING)) {
     features = (uint64_t)-1;
