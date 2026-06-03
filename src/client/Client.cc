@@ -1135,34 +1135,38 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
 {
   Inode *in;
   bool was_new = false;
-  auto [it, b] = inode_map.try_emplace(st->vino);
-  ldout(cct, 25) << __func__ << ": " << *st << dendl;
-  if (!b) {
-    in = it->second;
-    ldout(cct, 12) << __func__ << " had " << *in << " caps " << ccap_string(st->cap.caps) << dendl;
-  } else {
-    in = new Inode(this, st->vino, &st->layout);
-    it->second = in;
+  // inode_map and mount root state are protected by client_lock, not inode_lock.
+  {
+    std::scoped_lock cl(client_lock);
+    auto [it, b] = inode_map.try_emplace(st->vino);
+    ldout(cct, 25) << __func__ << ": " << *st << dendl;
+    if (!b) {
+      in = it->second;
+      ldout(cct, 12) << __func__ << " had " << *in << " caps " << ccap_string(st->cap.caps) << dendl;
+    } else {
+      in = new Inode(this, st->vino, &st->layout);
+      it->second = in;
 
-    if (use_faked_inos())
-      _assign_faked_ino(in);
-
-    if (!root) {
-      root = in;
       if (use_faked_inos())
-        _assign_faked_root(root.get());
-      root_ancestor = in;
-      cwd = root;
-    } else if (is_mounting()) {
-      root_parents[root_ancestor] = in;
-      root_ancestor = in;
-    }
+        _assign_faked_ino(in);
 
-    // immutable bits
-    in->ino = st->vino.ino;
-    in->snapid = st->vino.snapid;
-    in->mode = st->mode & S_IFMT;
-    was_new = true;
+      if (!root) {
+        root = in;
+        if (use_faked_inos())
+          _assign_faked_root(root.get());
+        root_ancestor = in;
+        cwd = root;
+      } else if (is_mounting()) {
+        root_parents[root_ancestor] = in;
+        root_ancestor = in;
+      }
+
+      // immutable bits
+      in->ino = st->vino.ino;
+      in->snapid = st->vino.snapid;
+      in->mode = st->mode & S_IFMT;
+      was_new = true;
+    }
   }
   std::unique_lock in_lock(*in);
 
@@ -17956,6 +17960,7 @@ bool Client::ms_handle_refused(Connection *con)
 
 Inode *Client::get_quota_root(Inode *in, const UserPerm& perms, quota_max_t type)
 {
+  std::scoped_lock cl(client_lock);
   Inode *quota_in = root_ancestor;
   SnapRealm *realm = in->snaprealm;
 
