@@ -6527,6 +6527,7 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
 
   ceph_assert(root);
   {
+    unique_unlock unlock(client_lock);
     std::unique_lock root_lock(*root);
     _ll_get(root.get());
   }
