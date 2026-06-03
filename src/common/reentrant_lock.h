@@ -16,11 +16,16 @@ class ReentrantLockImpl {
   std::atomic<std::thread::id> owner{};
   std::atomic<int> recursion_count{0};  // Or plain int + proper fencing
 
+  template <typename ...Args>
+  static Mutex make_mutex(Args&& ...args) {
+    return ceph::make_mutex(std::forward<Args>(args)...);
+  }
+
 public:
   ReentrantLockImpl() = default;
 
   template <typename ...Args>
-  explicit ReentrantLockImpl(Args&& ...args) : mtx(std::forward<Args>(args)...) {}
+  explicit ReentrantLockImpl(Args&& ...args) : mtx(make_mutex(std::forward<Args>(args)...)) {}
 
   void lock() {
     auto tid = std::this_thread::get_id();
@@ -186,7 +191,13 @@ public:
   // Wake waiters without holding the associated lock (pthread-safe; skips
   // lockdep's waiter_mutex check).  Use only when the signaller cannot take
   // the waiter lock without risking deadlock.
-  void notify_all_sloppy() noexcept { cv.notify_all(true); }
+  void notify_all_sloppy() noexcept {
+#ifdef CEPH_DEBUG_MUTEX
+    cv.notify_all(true);
+#else
+    cv.notify_all();
+#endif
+  }
 };
 
 using reentrant_condition_variable = reentrant_condition_variable_impl<ReentrantLock>;
