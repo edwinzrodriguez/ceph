@@ -3882,7 +3882,12 @@ void Client::close_dir(Dir *dir)
   Inode *in = dir->parent_inode;
   ldout(cct, 15) << __func__ << " dir " << dir << " on " << in << dendl;
   ceph_assert(dir->is_empty());
-  ceph_assert(in->dir == dir);
+  if (!in || in->dir != dir) {
+    // Already closed (e.g. trim_cache and unlink racing during unmount).
+    ldout(cct, 10) << __func__ << " dir " << dir << " already closed on "
+		   << in << dendl;
+    return;
+  }
   ceph_assert(in->dentries.size() < 2);     // dirs can't be hard-linked
   if (!in->dentries.empty())
     in->get_first_parent()->put();   // unpin dentry
@@ -3960,19 +3965,20 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 {
   std::unique_lock cl(client_lock);
 
-  if (!keepdentry && !dn->dir) {
+  // Capture the parent dir now; a concurrent trim may detach this dentry.
+  Dir *dir = dn->dir;
+
+  if (!keepdentry && !dir) {
     if (dn->lru_is_cached())
       lru.lru_remove(dn);
     return;
   }
 
-  // Pin for the duration so Dentry::unlink()'s put() calls cannot delete
-  // the dentry before we detach it from the directory and LRU.
-  dn->get();
-
   InodeRef in(dn->inode);
-  ldout(cct, 15) << "unlink dir " << dn->dir->parent_inode << " '" << dn->name << "' dn " << dn
-		 << " inode " << dn->inode << dendl;
+  if (dir) {
+    ldout(cct, 15) << "unlink dir " << dir->parent_inode << " '" << dn->name
+		   << "' dn " << dn << " inode " << dn->inode << dendl;
+  }
 
   // unlink from inode
   if (dn->inode) {
@@ -3983,22 +3989,27 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 
   if (keepdentry) {
     dn->lease_mds = -1;
-    dn->put();
   } else {
     ldout(cct, 15) << "unlink  removing '" << dn->name << "' dn " << dn << dendl;
 
-    Dir *dir = dn->dir;
-    ceph_assert(dir);
-
-    lru.lru_remove(dn);
-    dn->detach();
-
-    while (dn->ref > 1)
+    if (!dir || !dn->dir) {
+      // Already detached; drop any LRU pin only.
+      if (dn->lru_is_cached())
+	lru.lru_remove(dn);
+      if (dn->ref > 0)
+	dn->put();
+    } else {
+      dir = dn->dir;
+      dn->detach();
+      lru.lru_remove(dn);
       dn->put();
-    dn->put();
+    }
 
-    if (dir->is_empty() && !keepdir)
-      close_dir(dir);
+    if (dir && dir->is_empty() && !keepdir) {
+      Inode *diri = dir->parent_inode;
+      if (diri && diri->dir == dir)
+	close_dir(dir);
+    }
   }
 }
 
