@@ -2385,7 +2385,12 @@ int Client::make_request(MetaRequest *request,
     ceph_assert(request->aborted());
     ceph_assert(!request->got_unsafe);
     r = request->get_abort_code();
-    request->item.remove_myself();
+    if (request->item.is_on_list()) {
+      ceph_assert(session);
+      session->with_requests([&](auto&) {
+        request->item.remove_myself();
+      });
+    }
     unregister_request(request);
     put_request(request);
     return r;
@@ -3039,7 +3044,9 @@ void Client::handle_client_request_forward(const MConstRef<MClientRequestForward
 	   << dendl;
   
   request->mds = -1;
-  request->item.remove_myself();
+  session->with_requests([&](auto&) {
+    request->item.remove_myself();
+  });
   request->num_fwd = num_fwd;
   request->resend_mds = fwd->get_dest_mds();
   request->caller_cond->notify_all();
@@ -3113,10 +3120,12 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
     if (is_dir_operation(request)) {
       Inode *dir = request->inode();
       ceph_assert(dir);
+      std::unique_lock dir_lock(dir->inode_lock);
       dir->unsafe_ops.push_back(&request->unsafe_dir_item);
     }
     if (request->target) {
       InodeRef &in = request->target;
+      std::unique_lock target_lock(in->inode_lock);
       in->unsafe_ops.push_back(&request->unsafe_target_item);
     }
   }
@@ -3147,12 +3156,24 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
     // the filesystem change is committed to disk
     // we're done, clean up
     if (request->got_unsafe) {
-      request->unsafe_item.remove_myself();
-      request->unsafe_dir_item.remove_myself();
-      request->unsafe_target_item.remove_myself();
+      session->with_unsafe_requests([&](auto&) {
+        request->unsafe_item.remove_myself();
+      });
+      if (is_dir_operation(request)) {
+        Inode *dir = request->inode();
+        ceph_assert(dir);
+        std::unique_lock dir_lock(dir->inode_lock);
+        request->unsafe_dir_item.remove_myself();
+      }
+      if (request->target) {
+        std::unique_lock target_lock(request->target->inode_lock);
+        request->unsafe_target_item.remove_myself();
+      }
       signal_context_list(request->waitfor_safe);
     }
-    request->item.remove_myself();
+    session->with_requests([&](auto&) {
+      request->item.remove_myself();
+    });
     unregister_request(request);
   }
   if (is_unmounting())
@@ -3659,16 +3680,21 @@ void Client::kick_requests_closed(MetaSession *session)
 	req->kick = true;
 	req->caller_cond->notify_all();
       }
-      req->item.remove_myself();
+      session->with_requests([&](auto&) {
+        req->item.remove_myself();
+      });
       if (req->got_unsafe) {
 	lderr(cct) << __func__ << " removing unsafe request " << req->get_tid() << dendl;
-	req->unsafe_item.remove_myself();
+	session->with_unsafe_requests([&](auto&) {
+	  req->unsafe_item.remove_myself();
+	});
 	if (is_dir_operation(req)) {
 	  Inode *dir = req->inode();
 	  ceph_assert(dir);
 	  dir->set_async_err(-EIO);
 	  lderr(cct) << "kick_requests_closed drop req of inode(dir) : "
 		     <<  dir->ino  << " " << req->get_tid() << dendl;
+	  std::unique_lock dir_lock(dir->inode_lock);
 	  req->unsafe_dir_item.remove_myself();
 	}
 	if (req->target) {
@@ -3676,6 +3702,7 @@ void Client::kick_requests_closed(MetaSession *session)
 	  in->set_async_err(-EIO);
 	  lderr(cct) << "kick_requests_closed drop req of inode : "
 		     <<  in->ino  << " " << req->get_tid() << dendl;
+	  std::unique_lock target_lock(in->inode_lock);
 	  req->unsafe_target_item.remove_myself();
 	}
 	signal_context_list(req->waitfor_safe);
@@ -5966,23 +5993,32 @@ int Client::may_delete(const walk_dentry_result& wdr, const UserPerm& perms, boo
   ldout(cct, 20) << __func__ << " " << wdr << "; " << perms << dendl;
   auto* diri = wdr.diri.get();
   auto* in = wdr.target.get();
-  std::unique_lock diri_lock(diri->inode_lock);
-  std::unique_lock in_lock(in->inode_lock, std::defer_lock);
-  if (in && in != diri)
-    in_lock.lock();
-  int r = _getattr_for_perm(diri, perms);
-  if (r < 0)
-    goto out;
+  auto check = [&]() -> int {
+    int r = _getattr_for_perm(diri, perms);
+    if (r < 0)
+      return r;
 
-  r = inode_permission(diri, perms, CLIENT_MAY_EXEC | CLIENT_MAY_WRITE);
-  if (r < 0)
-    goto out;
+    r = inode_permission(diri, perms, CLIENT_MAY_EXEC | CLIENT_MAY_WRITE);
+    if (r < 0)
+      return r;
 
-  if (in && check_perms && perms.uid() != 0 && (diri->mode & S_ISVTX)) {
-    if (diri->uid != perms.uid() && in->uid != perms.uid())
-      r = -EPERM;
+    if (in && check_perms && perms.uid() != 0 && (diri->mode & S_ISVTX)) {
+      if (diri->uid != perms.uid() && in->uid != perms.uid())
+        return -EPERM;
+    }
+    return 0;
+  };
+
+  int r;
+  if (in && in != diri) {
+    std::unique_lock diri_lock(diri->inode_lock, std::defer_lock);
+    std::unique_lock in_lock(in->inode_lock, std::defer_lock);
+    std::lock(diri_lock, in_lock);
+    r = check();
+  } else {
+    std::unique_lock diri_lock(diri->inode_lock);
+    r = check();
   }
-out:
   ldout(cct, 3) << __func__ << " " << *diri << " = " << r <<  dendl;
   return r;
 }
