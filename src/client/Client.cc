@@ -3826,22 +3826,23 @@ void Client::_put_inode(Inode *in, int n)
     // release any caps
     remove_all_caps(in);
     ldout(cct, 10) << __func__ << " deleting " << *in << dendl;
-    auto oc_lock = objectcacher->acquire_cache_lock();
-    bool unclean = objectcacher->release_set(&in->oset);
-    ceph_assert(!unclean);
-    inode_map.erase(in->vino());
-    if (use_faked_inos())
-      _release_faked_ino(in);
+    {
+      auto oc_lock = objectcacher->acquire_cache_lock();
+      bool unclean = objectcacher->release_set(&in->oset);
+      ceph_assert(!unclean);
+      inode_map.erase(in->vino());
+      if (use_faked_inos())
+        _release_faked_ino(in);
 
-    if (root == nullptr) {
-      root_ancestor = 0;
-      while (!root_parents.empty())
-        root_parents.erase(root_parents.begin());
+      if (root == nullptr) {
+        root_ancestor = 0;
+        while (!root_parents.empty())
+          root_parents.erase(root_parents.begin());
+      }
     }
-
     in_lock.unlock();
+    objectcacher->wait_for_flush_callbacks();
     in->iput();
-    // oc_lock released here, after ObjectSet is destroyed
   }
 }
 
@@ -4495,14 +4496,31 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
   // Called from ObjectCacher's finisher (see _schedule_flush_set_callback).
   // Lock order is inode_lock then client_lock (_put_inode); _flushed needs
   // only inode_lock.  Drop client_lock if writeback held it via C_ReentrantLock.
-  Inode *in = static_cast<Inode *>(oset->parent);
-  ceph_assert(in);
-
   int client_lock_depth = 0;
   while (client_lock.is_locked_by_me()) {
     client_lock.unlock();
     ++client_lock_depth;
   }
+
+  if (is_unmounting()) {
+    while (client_lock_depth-- > 0) {
+      client_lock.lock();
+    }
+    return;
+  }
+
+  {
+    auto oc_lock = objectcacher->acquire_cache_lock();
+    if (oset->invalidated) {
+      while (client_lock_depth-- > 0) {
+        client_lock.lock();
+      }
+      return;
+    }
+  }
+
+  Inode *in = static_cast<Inode *>(oset->parent);
+  ceph_assert(in);
 
   // ObjectCacher may coalesce multiple commits into one callback; only drop
   // cap refs if the oset is still fully clean (no new writes dirtied it).
@@ -6672,6 +6690,8 @@ void Client::_force_evict_unmount_cache()
   ldout(cct, 1) << __func__ << " lru=" << lru.lru_get_size()
 		<< " inodes=" << inode_map.size() << dendl;
 
+  // Raw pointers only: InodeRef would call put_inode from ~intrusive_ptr
+  // after delay_put_inodes may already have deleted the inode.
   std::vector<Inode*> inodes;
   inodes.reserve(inode_map.size());
   for (auto& [vino, in] : inode_map)
@@ -6694,7 +6714,7 @@ void Client::_force_evict_unmount_cache()
     }
     {
       unique_unlock unlock(client_lock);
-      check_caps(in, CHECK_CAPS_NODELAY);
+      check_caps(InodeRef(in), CHECK_CAPS_NODELAY);
     }
     _try_to_trim_inode(in, false);
     int extra = 0;
@@ -6933,31 +6953,42 @@ void Client::_unmount(bool abort)
     delay_put_inodes(true);
 
     // prepare_inode_unmount uses inode_lock only (see _put_inode); drop
-    // client_lock briefly to avoid ABBA with ms_dispatch.
+    // client_lock briefly to avoid ABBA with ms_dispatch.  Pin inodes first:
+    // delay_put_inodes/trim_cache may delete map entries while client_lock
+    // is dropped.
     {
-      std::vector<InodeRef> inodes;
+      std::vector<Inode*> pinned;
+      pinned.reserve(inode_map.size());
       for (auto& [vino, in] : inode_map) {
+	in->iget();
+	pinned.push_back(in);
+      }
+
+      std::vector<Inode*> caps_inodes;
+      for (Inode *in : pinned) {
 	{
 	  unique_unlock unlock(client_lock);
 	  client_caps->prepare_inode_unmount(in);
 	}
         if (!in->caps.empty())
-          inodes.emplace_back(in);
+          caps_inodes.push_back(in);
       }
-      for (size_t i = 0; i < inodes.size(); ++i) {
+      for (size_t i = 0; i < caps_inodes.size(); ++i) {
         unsigned flags = CHECK_CAPS_NODELAY;
-        if (i + 1 == inodes.size())
+        if (i + 1 == caps_inodes.size())
           flags |= CHECK_CAPS_SYNCHRONOUS;
         unique_unlock unlock(client_lock);
-        check_caps(inodes[i], flags);
+        check_caps(InodeRef(caps_inodes[i]), flags);
       }
-      for (auto& [vino, in] : inode_map) {
+      for (Inode *in : pinned) {
 	std::unique_lock in_lock(*in);
 	if (!in->caps.empty()) {
 	  remove_all_caps(in);
 	  in->cap_snaps.clear();
 	}
       }
+      for (Inode *in : pinned)
+	put_inode(in, 1);
     }
     flush_caps_sync();
     wait_sync_caps(last_flush_tid);

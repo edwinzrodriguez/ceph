@@ -1069,11 +1069,15 @@ class ObjectCacher::C_FlushSetCallback : public Context {
 public:
   C_FlushSetCallback(ObjectCacher *c, ObjectSet *o) : oc(c), oset(o) {}
   void finish(int r) override {
+    bool call = false;
     {
       std::lock_guard l(oc->cache_lock);
       oset->flush_callback_pending = false;
+      call = !oset->invalidated;
     }
-    oc->flush_set_callback(oc->flush_set_callback_arg, oset);
+    if (call) {
+      oc->flush_set_callback(oc->flush_set_callback_arg, oset);
+    }
   }
 };
 
@@ -2474,6 +2478,8 @@ loff_t ObjectCacher::release_set(ObjectSet *oset)
   }
 
   ldout(cct, 10) << "release_set " << oset << dendl;
+
+  oset->invalidated = true;
 
   oset->for_each_object_safe([this, &unclean, oset](Object *ob) {
     loff_t o_unclean = release(ob);

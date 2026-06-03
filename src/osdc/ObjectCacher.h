@@ -402,6 +402,7 @@ class ObjectCacher {
 
     std::atomic<int> dirty_or_tx;
     bool flush_callback_pending = false;
+    bool invalidated = false;
 
     void push_back(xlist<Object*>::item* obj) { std::scoped_lock lock(oset_lock); objects.push_back(obj); }
     size_t size() const { std::scoped_lock lock(oset_lock); return objects.size(); }
@@ -786,6 +787,10 @@ public:
   std::unique_lock<ceph::ReentrantLock> acquire_cache_lock()
   {
     return std::unique_lock<ceph::ReentrantLock>(cache_lock);
+  }
+
+  void wait_for_flush_callbacks() {
+    finisher.wait_for_empty();
   }
 
   void discard_set(ObjectSet *oset, const std::vector<ObjectExtent>& ex);
