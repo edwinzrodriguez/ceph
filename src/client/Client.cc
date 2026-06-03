@@ -2431,6 +2431,8 @@ int Client::make_request(MetaRequest *request,
 void Client::unregister_request(MetaRequest *req)
 {
   mds_requests.erase(req->tid);
+  if (is_unmounting())
+    mount_cond.notify_all();
   if (req->tid == oldest_tid) {
     map<ceph_tid_t, MetaRequest*>::iterator p = mds_requests.upper_bound(oldest_tid);
     while (true) {
@@ -3355,28 +3357,13 @@ Dispatcher::dispatch_result_t Client::ms_dispatch2(const MessageRef &m)
     return Dispatcher::UNHANDLED();
   }
 
-  // During unmount, trim the cache after each handled message and wake the
-  // unmount thread when progress is made.  trim_cache() takes client_lock.
+  // During unmount, wake the unmount thread when a message is handled (e.g. a
+  // write reply).  Do not call trim_cache() here: it can block on cache_lock
+  // while holding work in the dispatch thread and stall replies.
   if (is_unmounting()) {
-    uint64_t size = 0;
-    {
-      std::scoped_lock cl(client_lock);
-      ldout(cct, 10) << "unmounting: trim pass, size was " << lru.lru_get_size()
-               << "+" << inode_map.size() << dendl;
-      size = lru.lru_get_size() + inode_map.size();
-    }
-    trim_cache();
-    {
-      std::scoped_lock cl(client_lock);
-      if (size > lru.lru_get_size() + inode_map.size()) {
-        ldout(cct, 10) << "unmounting: trim pass, cache shrank, poking unmount()"
-                 << dendl;
-        mount_cond.notify_all();
-      } else {
-        ldout(cct, 10) << "unmounting: trim pass, size still " << lru.lru_get_size()
-                 << "+" << inode_map.size() << dendl;
-      }
-    }
+    std::scoped_lock cl(client_lock);
+    delay_put_inodes(true);
+    mount_cond.notify_all();
   }
 
   return Dispatcher::HANDLED();
@@ -3716,6 +3703,7 @@ void Client::kick_requests_closed(MetaSession *session)
   }
   ceph_assert(session->requests.empty());
   ceph_assert(session->unsafe_requests.empty());
+  mount_cond.notify_all();
 }
 
 
@@ -6679,6 +6667,7 @@ void Client::_abort_mds_sessions(int err)
   // Any requests that were on a waiting_for_open session waitlist
   // will get kicked during close session below.
   signal_cond_list(waiting_for_mdsmap);
+  mount_cond.notify_all();
 
   // Force-close all sessions
   while(!mds_sessions.empty()) {
@@ -6723,9 +6712,11 @@ void Client::_unmount(bool abort)
   }
 
   mount_cond.wait(lock, [this] {
-    // Only wait for write OPs
+    // Only wait for outstanding write OPs (skip aborted).
     for (auto& [tid, req] : mds_requests) {
-      if (req->is_write()) {
+      if (req->aborted())
+        continue;
+      if (req->is_write() && !(req->reply && req->reply->is_safe())) {
         ldout(cct, 10) << "waiting for write request '" << tid
                        << "' to complete, currently there are "
                        << mds_requests.size()
@@ -7019,6 +7010,21 @@ void Client::tick()
 	  signal_context_list(p.second->waiting_for_open);
 	}
       }
+    }
+
+    if (is_unmounting() && !mds_requests.empty()) {
+      for (auto& [tid, req] : mds_requests) {
+	if (req->aborted())
+	  continue;
+	if (req->is_write() && req->created + mount_timeout < now) {
+	  req->abort(-ETIMEDOUT);
+	  if (req->caller_cond) {
+	    req->kick = true;
+	    req->caller_cond->notify_all();
+	  }
+	}
+      }
+      mount_cond.notify_all();
     }
 
     renew_and_flush_cap_releases();
