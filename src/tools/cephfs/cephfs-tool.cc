@@ -544,6 +544,7 @@ bench_async_write_worker(
     std::stringstream& ss,
     steady_clock::time_point phase_start_time)
 {
+  ceph_pthread_setname(("wr-worker-" + std::to_string(thread_id)).c_str());
   auto duration_limit = std::chrono::seconds(config.duration);
 
   // Semaphore for queue depth management
@@ -741,7 +742,6 @@ bench_read_worker(
   struct ceph_mount_info *cmount = shared_cmount;
   ceph_pthread_setname(("rd-worker-" + std::to_string(thread_id)).c_str());
   auto duration_limit = std::chrono::seconds(config.duration);
-  ceph_pthread_setname(("rd-worker-" + std::to_string(thread_id)).c_str());
 
   if (config.per_thread_mount) {
     if (int rc = setup_mount(&cmount, config, ss); rc < 0) {
@@ -844,6 +844,7 @@ bench_async_read_worker(
     std::stringstream& ss,
     steady_clock::time_point phase_start_time)
 {
+  ceph_pthread_setname(("rd-worker-" + std::to_string(thread_id)).c_str());
   auto duration_limit = std::chrono::seconds(config.duration);
 
   // Semaphore for queue depth management
