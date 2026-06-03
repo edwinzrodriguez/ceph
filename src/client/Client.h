@@ -1052,6 +1052,18 @@ public:
 #endif
   bool _collect_and_send_global_metrics;
 
+  void lock() const;
+  bool try_lock() const;
+  void unlock() const;
+  bool is_locked() const;
+  bool is_locked_by_me() const;
+  // Called by reentrant_condition_variable before blocking: saves recursion
+  // depth and marks the lock as released so other threads can acquire it.
+  int release_for_wait() noexcept;
+
+  // Called by reentrant_condition_variable after waking: restores the saved
+  // recursion depth and re-establishes ownership for the current thread.
+  void restore_after_wait(int saved) noexcept;
 
 protected:
   struct FSCrypt_Options {

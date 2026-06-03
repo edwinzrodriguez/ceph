@@ -18831,6 +18831,33 @@ int Client::fcopyfile(const char *spath, const char *dpath, UserPerm& perms, mod
   return 0;
 }
 
+void Client::lock() const {
+  client_lock.lock();
+}
+
+bool Client::try_lock() const {
+  return client_lock.try_lock();
+}
+
+void Client::unlock() const {
+  client_lock.unlock();
+}
+
+bool Client::is_locked() const {
+  return client_lock.is_locked();
+}
+bool Client::is_locked_by_me() const {
+  return client_lock.is_locked_by_me();
+}
+
+int Client::release_for_wait() noexcept {
+  return client_lock.release_for_wait();
+}
+
+void Client::restore_after_wait(int saved) noexcept {
+  client_lock.restore_after_wait(saved);
+}
+
 StandaloneClient::StandaloneClient(Messenger *m, MonClient *mc,
 				   boost::asio::io_context& ictx)
   : Client(m, mc, new Objecter(m->cct, m, mc, ictx))
