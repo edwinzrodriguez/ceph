@@ -1663,6 +1663,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
     unsigned last_hash = 0;
     if (hash_order) {
       if (!readdir_start.empty()) {
+	std::unique_lock diri_lock(*diri);
 	last_hash = ceph_frag_value(diri->hash_dentry_name(readdir_start));
       } else if (flags & CEPH_READDIR_OFFSET_HASH) {
 	/* mds understands offset_hash */
@@ -1741,6 +1742,7 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
 
       update_dentry_lease(dn, &dlease, request->sent_stamp, session);
       if (hash_order) {
+	std::unique_lock diri_lock(*effective_diri);
 	unsigned hash = ceph_frag_value(effective_diri->hash_dentry_name(dname));
 	if (hash != last_hash)
 	  readdir_offset = 2;
@@ -2015,6 +2017,7 @@ mds_rank_t Client::choose_target_mds(MetaRequest *req, Inode** phash_diri)
   if (in) {
     ldout(cct, 20) << __func__ << " starting with req->inode " << *in << dendl;
     if (req->path.depth()) {
+      std::unique_lock in_lock(*in);
       hash = in->hash_dentry_name(req->path[0]);
       ldout(cct, 20) << __func__ << " inode dir hash is " << (int)in->dir_layout.dl_dir_hash
 	       << " on " << req->path[0]
@@ -2027,6 +2030,7 @@ mds_rank_t Client::choose_target_mds(MetaRequest *req, Inode** phash_diri)
       ldout(cct, 20) << __func__ << " starting with req->dentry inode " << *in << dendl;
     } else {
       in = de->dir->parent_inode;
+      std::unique_lock in_lock(*in);
       hash = in->hash_dentry_name(de->name);
       ldout(cct, 20) << __func__ << " dentry dir hash is " << (int)in->dir_layout.dl_dir_hash
 	       << " on " << de->name
@@ -2056,41 +2060,44 @@ mds_rank_t Client::choose_target_mds(MetaRequest *req, Inode** phash_diri)
     ldout(cct, 20) << __func__ << " " << *in << " is_hash=" << is_hash
              << " hash=" << hash << dendl;
   
-    if (req->get_op() == CEPH_MDS_OP_GETATTR)
-      issued = req->inode()->caps_issued();
+    {
+      std::unique_lock in_lock(*in);
+      if (req->get_op() == CEPH_MDS_OP_GETATTR)
+	issued = req->inode()->caps_issued();
 
-    if (is_hash && S_ISDIR(in->mode) && (!in->fragmap.empty() || !in->frag_repmap.empty())) {
-      frag_t fg = in->dirfragtree[hash];
-      if (!req->auth_is_best(issued)) {
-        auto repmapit = in->frag_repmap.find(fg);
-        if (repmapit != in->frag_repmap.end()) {
-          auto& repmap = repmapit->second;
-          auto r = ceph::util::generate_random_number<uint64_t>(0, repmap.size()-1);
-          mds = repmap.at(r);
-        }
-      } else {
-        auto it = in->fragmap.find(fg);
-        if (it != in->fragmap.end()) {
-	  mds = it->second;
-	  if (phash_diri)
-	    *phash_diri = in;
-        } else if (in->auth_cap) {
-	  req->send_to_auth = true;
-	  mds = in->auth_cap->session->mds_num;
+      if (is_hash && S_ISDIR(in->mode) && (!in->fragmap.empty() || !in->frag_repmap.empty())) {
+	frag_t fg = in->dirfragtree[hash];
+	if (!req->auth_is_best(issued)) {
+	  auto repmapit = in->frag_repmap.find(fg);
+	  if (repmapit != in->frag_repmap.end()) {
+	    auto& repmap = repmapit->second;
+	    auto r = ceph::util::generate_random_number<uint64_t>(0, repmap.size()-1);
+	    mds = repmap.at(r);
+	  }
+	} else {
+	  auto it = in->fragmap.find(fg);
+	  if (it != in->fragmap.end()) {
+	    mds = it->second;
+	    if (phash_diri)
+	      *phash_diri = in;
+	  } else if (in->auth_cap) {
+	    req->send_to_auth = true;
+	    mds = in->auth_cap->session->mds_num;
+	  }
+	}
+	if (mds >= 0) {
+	  ldout(cct, 10) << __func__ << " from dirfragtree hash" << dendl;
+	  goto out;
 	}
       }
-      if (mds >= 0) {
-	ldout(cct, 10) << __func__ << " from dirfragtree hash" << dendl;
-	goto out;
+
+      if (in->auth_cap && req->auth_is_best(issued)) {
+	mds = in->auth_cap->session->mds_num;
+      } else if (!in->caps.empty()) {
+	mds = in->caps.begin()->second.session->mds_num;
+      } else {
+	goto random_mds;
       }
-    }
-  
-    if (in->auth_cap && req->auth_is_best(issued)) {
-      mds = in->auth_cap->session->mds_num;
-    } else if (!in->caps.empty()) {
-      mds = in->caps.begin()->second.session->mds_num;
-    } else {
-      goto random_mds;
     }
     ldout(cct, 10) << __func__ << " from caps on inode " << *in << dendl;
   
@@ -5983,7 +5990,7 @@ out:
 filepath Client::walk_dentry_result::getpath() const
 {
   ceph_assert(diri);
-  std::unique_lock diri_lock(*diri);
+  ceph_assert(ceph_mutex_is_locked_by_me(*diri));
 
   auto path = filepath(diri->ino);
   if (dname.size()) {
