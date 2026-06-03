@@ -1094,6 +1094,22 @@ void ObjectCacher::_schedule_flush_set_callback(ObjectSet *oset)
   finisher.queue(new C_FlushSetCallback(this, oset));
 }
 
+// Run commit waiters without cache_lock (and without the writeback path's
+// client_lock from C_ReentrantLock).  In-thread finish_contexts from
+// bh_write_commit caused cache_lock -> inode_lock inversions with
+// C_Client_FlushComplete::check_caps.
+class ObjectCacher::C_BHWriteCommitWaiters : public Context {
+  CephContext *cct;
+  std::list<Context*> waiters;
+  int r;
+public:
+  C_BHWriteCommitWaiters(CephContext *c, std::list<Context*>&& ls, int _r)
+    : cct(c), waiters(std::move(ls)), r(_r) {}
+  void finish(int) override {
+    finish_contexts(cct, waiters, r);
+  }
+};
+
 class ObjectCacher::C_WriteCommit : public Context {
   ObjectCacher *oc;
   int64_t poolid;
@@ -1331,8 +1347,13 @@ void ObjectCacher::bh_write_commit(int64_t poolid, sobject_t oid,
     _schedule_flush_set_callback(oset);
   }
 
-  if (!ls.empty())
-    finish_contexts(cct, ls, r);
+  std::list<Context*> waiters;
+  waiters.swap(ls);
+  cl.unlock();
+
+  if (!waiters.empty()) {
+    finisher.queue(new C_BHWriteCommitWaiters(cct, std::move(waiters), r));
+  }
 }
 
 void ObjectCacher::flush(ZTracer::Trace *trace, loff_t amount, int max_bhs)
