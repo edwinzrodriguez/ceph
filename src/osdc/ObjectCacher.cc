@@ -1069,6 +1069,10 @@ class ObjectCacher::C_FlushSetCallback : public Context {
 public:
   C_FlushSetCallback(ObjectCacher *c, ObjectSet *o) : oc(c), oset(o) {}
   void finish(int r) override {
+    {
+      std::lock_guard l(oc->cache_lock);
+      oset->flush_callback_pending = false;
+    }
     oc->flush_set_callback(oc->flush_set_callback_arg, oset);
   }
 };
@@ -1078,6 +1082,11 @@ void ObjectCacher::_schedule_flush_set_callback(ObjectSet *oset)
   if (!flush_set_callback) {
     return;
   }
+  ceph_assert(cache_lock.is_locked_by_me());
+  if (oset->flush_callback_pending) {
+    return;
+  }
+  oset->flush_callback_pending = true;
   finisher.queue(new C_FlushSetCallback(this, oset));
 }
 

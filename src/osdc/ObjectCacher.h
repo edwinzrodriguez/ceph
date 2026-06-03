@@ -401,6 +401,7 @@ class ObjectCacher {
     std::atomic<uint64_t> truncate_size;
 
     std::atomic<int> dirty_or_tx;
+    bool flush_callback_pending = false;
 
     void push_back(xlist<Object*>::item* obj) { std::scoped_lock lock(oset_lock); objects.push_back(obj); }
     size_t size() const { std::scoped_lock lock(oset_lock); return objects.size(); }

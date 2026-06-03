@@ -4504,11 +4504,17 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
     ++client_lock_depth;
   }
 
+  // ObjectCacher may coalesce multiple commits into one callback; only drop
+  // cap refs if the oset is still fully clean (no new writes dirtied it).
   if (ceph_mutex_is_locked_by_me(*in)) {
-    _flushed(in);
+    if (!in->oset.dirty_or_tx) {
+      _flushed(in);
+    }
   } else {
     std::scoped_lock in_lock(*in);
-    _flushed(in);
+    if (!in->oset.dirty_or_tx) {
+      _flushed(in);
+    }
   }
 
   while (client_lock_depth-- > 0) {
