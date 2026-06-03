@@ -1024,6 +1024,7 @@ void Inode::unlock() const {
 bool Inode::is_locked() const {
   return m_inode_lock.is_locked();
 }
+
 bool Inode::is_locked_by_me() const {
   return m_inode_lock.is_locked_by_me();
 }
@@ -1031,7 +1032,6 @@ bool Inode::is_locked_by_me() const {
 int Inode::release_for_wait() noexcept {
   return m_inode_lock.release_for_wait();
 }
-
 
 void Inode::restore_after_wait(int saved) noexcept {
   m_inode_lock.restore_after_wait(saved);
