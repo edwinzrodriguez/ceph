@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 
+#include "common/ceph_mutex.h"
 #include "common/reentrant_lock.h"
 
 // Included from Inode.h after struct Inode is defined.
@@ -159,5 +160,61 @@ private:
 };
 
 } // namespace std
+
+namespace ceph {
+
+/**
+ * Temporarily drop the inode lock (one reentrant nesting level) while the
+ * current thread holds it, and restore it on destruction.  Does not change
+ * client_lock; mirrors std::unique_lock<Inode>::unlock().
+ */
+template <>
+class unique_unlock<Inode> {
+public:
+  explicit unique_unlock(Inode& in)
+    : _in(&in), _released(false), _inode_released(false)
+  {
+    release();
+  }
+
+  unique_unlock(Inode& in, std::defer_lock_t)
+    : _in(&in), _released(false), _inode_released(false)
+  {}
+
+  void release()
+  {
+    if (_released) {
+      return;
+    }
+    if (_in->is_locked_by_me()) {
+      _in->m_inode_lock.unlock();
+      _inode_released = true;
+    }
+    _released = true;
+  }
+
+  bool released() const
+  {
+    return _released;
+  }
+
+  ~unique_unlock() noexcept(false)
+  {
+    if (_released && _inode_released) {
+      _in->m_inode_lock.lock();
+      _inode_released = false;
+    }
+  }
+
+  unique_unlock(const unique_unlock&) = delete;
+  unique_unlock& operator=(const unique_unlock&) = delete;
+
+private:
+  Inode *_in;
+  bool _released;
+  bool _inode_released;
+};
+
+} // namespace ceph
 
 #endif // CEPH_CLIENT_INODE_LOCK_H
