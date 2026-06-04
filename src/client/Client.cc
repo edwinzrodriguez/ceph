@@ -5136,6 +5136,7 @@ void Client::handle_snap(const MConstRef<MClientSnap>& m)
       auto it = inode_map.find(vino);
       if (it != inode_map.end()) {
 	Inode *in = it->second;
+        std::unique_lock in_lock(*in);
 	if (!in->snaprealm || in->snaprealm == realm)
 	  continue;
 	if (in->snaprealm->created > info.created()) {
