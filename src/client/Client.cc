@@ -4330,13 +4330,10 @@ void Client::flush_snaps(Inode *in)
 
 void Client::wait_on_list(list<ceph::reentrant_condition_variable*>& ls)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
-
+  std::unique_lock l{client_lock};
   ceph::reentrant_condition_variable cond;
   ls.push_back(&cond);
-  std::unique_lock l{client_lock, std::adopt_lock};
   cond.wait(l);
-  l.release();
   ls.remove(&cond);
 }
 
@@ -4349,14 +4346,12 @@ void Client::signal_cond_list(list<ceph::reentrant_condition_variable*>& ls)
 
 void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  std::unique_lock l{client_lock};
   ceph::reentrant_condition_variable cond;
   bool done = false;
   int r;
   ls.push_back(new C_ReentrantCond(cond, &done, &r));
-  std::unique_lock l{client_lock, std::adopt_lock};
   cond.wait(l, [&done] { return done;});
-  l.release();
 }
 
 void Client::signal_caps_inode(Inode *in)
@@ -4849,6 +4844,7 @@ void Client::flush_caps_sync()
 
 void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
 {
+  std::unique_lock l{client_lock};
   while (in->flushing_caps) {
     map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
     ceph_assert(it != in->flushing_cap_tids.end());
@@ -4863,6 +4859,7 @@ void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
 
 void Client::wait_sync_caps(ceph_tid_t want)
 {
+  std::unique_lock l{client_lock};
  retry:
   ldout(cct, 10) << __func__ << " want " << want  << " (last is " << last_flush_tid << ", "
     << client_caps->get_num_flushing_caps() << " total flushing)" << dendl;
@@ -4874,9 +4871,7 @@ void Client::wait_sync_caps(ceph_tid_t want)
     if (oldest_tid <= want) {
       ldout(cct, 10) << " waiting on mds." << p.first << " tid " << oldest_tid
 		     << " (want " << want << ")" << dendl;
-      std::unique_lock l{client_lock, std::adopt_lock};
       sync_cond.wait(l);
-      l.release();
       goto retry;
     }
   }
@@ -13142,7 +13137,7 @@ int Client::_fsync(Inode *in, bool syncdataonly)
     ldout(cct, 15) << "waiting on unsafe requests, last tid " << req->get_tid() <<  dendl;
 
     req->get();
-    wait_on_context_list(req->waitfor_safe);
+    client_caps->wait_on_context_list(req->waitfor_safe);
     put_request(req);
   }
 
@@ -13156,7 +13151,7 @@ int Client::_fsync(Inode *in, bool syncdataonly)
     while (!in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
       ldout(cct, 10) << "ino " << in->ino << " has " << in->cap_refs[CEPH_CAP_FILE_BUFFER]
 		     << " uncommitted, waiting" << dendl;
-      wait_on_context_list(in->waitfor_commit);
+      client_caps->wait_on_context_list(in->waitfor_commit);
     }
   }
 

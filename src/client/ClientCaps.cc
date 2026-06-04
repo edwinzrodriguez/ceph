@@ -624,13 +624,12 @@ int ClientCaps::get_caps_issued(const char *path, const UserPerm& perms)
 
 void ClientCaps::wait_on_context_list(std::vector<Context*>& ls)
 {
+  std::unique_lock l{caps_lock};
   reentrant_condition_variable cond;
   bool done = false;
   int r;
   ls.push_back(new C_ReentrantCond(cond, &done, &r));
-  std::unique_lock l{caps_lock, std::adopt_lock};
   cond.wait(l, [&done] { return done;});
-  l.release();
 }
 
 void ClientCaps::signal_caps_inode(Inode *in)
@@ -1033,10 +1032,18 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	in->flags &= ~I_CAP_DROPPED;
     }
 
-    if (waitfor_caps)
-      client->wait_on_context_list(in->waitfor_caps);
-    else if (waitfor_commit)
-      client->wait_on_context_list(in->waitfor_commit);
+    if (waitfor_caps || waitfor_commit) {
+      auto& wait_list = waitfor_caps ? in->waitfor_caps : in->waitfor_commit;
+      // Do not hold the inode lock while sleeping: cap grants (ms_dispatch)
+      // and inode cleanup (tick -> _put_inode) also need it.
+      const bool had_inode = in->is_locked_by_me();
+      if (had_inode) {
+	ceph::unique_unlock<Inode> in_unlock(*in);
+	wait_on_context_list(wait_list);
+      } else {
+	wait_on_context_list(wait_list);
+      }
+    }
   }
 }
 
@@ -1294,13 +1301,11 @@ void ClientCaps::submit_sync_caps(Inode *in, ceph_tid_t want, Context *onfinish)
 
 void ClientCaps::wait_sync_caps(Inode *in, ceph_tid_t want)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   client->wait_sync_caps(in, want);
 }
 
 void ClientCaps::wait_sync_caps(ceph_tid_t want)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   client->wait_sync_caps(want);
 }
 

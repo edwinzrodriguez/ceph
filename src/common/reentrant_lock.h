@@ -230,7 +230,9 @@ public:
   void finish(int r) override {
     *done = true;
     *rval = r;
-    cond.notify_all();
+    // finish() often runs from another thread that does not hold the
+    // waiter's lock (e.g. cap grant on ms_dispatch waking get_caps).
+    cond.notify_all_sloppy();
   }
 };
 
