@@ -4528,7 +4528,7 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
                                    offset, size, &onflush);
   if (!ret) {
     // wait for flush
-    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+    ceph::unique_unlock<Inode> in_unlock(*in);
     onflush.wait();
   }
 }
@@ -12360,7 +12360,7 @@ int Client::WriteEncMgr::read_modify_write(Context *_iofinish)
 
   if (need_read && !async) {
 
-    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+    ceph::unique_unlock<Inode> in_unlock(*in);
     if (finish_read_start_ctx) {
       finish_read_start_ctx->wait();
     }
@@ -12764,7 +12764,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
     auto delay = get_injected_write_delay_secs();
     if (unlikely(delay > 0)) {
       ldout(cct, 20) << __func__ << ": delaying write for " << delay << " seconds" << dendl;
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+      ceph::unique_unlock<Inode> in_unlock(*in);
       sleep(delay);
     }
 
@@ -12785,7 +12785,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
     }
 
     {
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+      unique_unlock<Inode> in_unlock(*in);
 
       r = cond_iofinish->wait();
     }
@@ -12815,7 +12815,7 @@ done:
   if (nullptr != onuninline) {
     int uninline_ret = 0;
     {
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+      ceph::unique_unlock<Inode> in_unlock(*in);
 
       uninline_ret = onuninline->wait();
     }
@@ -13159,7 +13159,7 @@ int Client::_fsync(Inode *in, bool syncdataonly)
   }
 
   if (nullptr != object_cacher_completion) { // wait on a real reply instead of guessing
-    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+    ceph::unique_unlock<Inode> in_unlock(*in);
     ldout(cct, 15) << "waiting on data to flush" << dendl;
     r = object_cacher_completion->wait();
     ldout(cct, 15) << "got " << r << " from flush writeback" << dendl;
@@ -13383,7 +13383,7 @@ int Client::_statfs(Inode *in, struct statvfs *stbuf,
 
   int rval = 0;
   {
-    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+    ceph::unique_unlock<Inode> in_unlock(*in);
     rval = cond.wait();
   }
 
@@ -17299,7 +17299,7 @@ int64_t Client::ll_preadv_pwritev(struct Fh *fh, const struct iovec *iov,
     if (retval < 0) {
       if (onfinish != nullptr) {
         //async io failed
-        ceph::unique_unlock<ceph::ReentrantLock> in_unlock(fh->inode->m_inode_lock);
+        ceph::unique_unlock<Inode> in_unlock(*(fh->inode));
         onfinish->complete(retval);
         /* async call should always return zero to caller and allow the
         caller to wait on callback for the actual errno/retval. */
@@ -17486,7 +17486,7 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
       in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
       {
-        ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+        ceph::unique_unlock<Inode> in_unlock(*in);
         onfinish.wait();
       }
       put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
@@ -17516,7 +17516,7 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
   if (nullptr != onuninline) {
     int ret = 0;
     {
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+      ceph::unique_unlock<Inode> in_unlock(*in);
       ret = onuninline->wait();
     }
 
@@ -18232,7 +18232,7 @@ int Client::check_pool_perm(Inode *in, int need)
     int wr_ret = 0;
     {
       unique_unlock client_unlock(client_lock);
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+      unique_unlock<Inode> in_unlock(*in);
 
       rd_ret = rd_cond.wait();
       wr_ret = wr_cond.wait();
