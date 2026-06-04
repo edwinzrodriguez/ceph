@@ -423,6 +423,7 @@ void ClientCaps::trim_caps(MetaSession *s, uint64_t max)
   }
   ldout(cct, 20) << " trimming dentries for " << to_trim.size() 
                  << " inodes" << dendl;
+  std::scoped_lock cl(client->client_lock);
   for (auto dn : to_trim)
     client->trim_dentry(dn);
 }
@@ -1034,6 +1035,16 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 
     if (waitfor_caps || waitfor_commit) {
       auto& wait_list = waitfor_caps ? in->waitfor_caps : in->waitfor_commit;
+      if (waitfor_caps) {
+	// We may have already sent a max_size request (requested_max_size ==
+	// wanted_max_size) but the MDS grant was still too small.  Allow
+	// check_caps to re-send instead of sleeping with no in-flight request.
+	if (in->wanted_max_size > in->max_size &&
+	    in->wanted_max_size <= in->requested_max_size) {
+	  in->requested_max_size = 0;
+	}
+	check_caps(in, Client::CHECK_CAPS_NODELAY);
+      }
       // Do not hold the inode lock while sleeping: cap grants (ms_dispatch)
       // and inode cleanup (tick -> _put_inode) also need it.
       const bool had_inode = in->is_locked_by_me();

@@ -902,7 +902,11 @@ void Client::update_io_stat_write(utime_t latency) {
 
 void Client::trim_cache(bool trim_kernel_dcache)
 {
-  std::unique_lock lock(client_lock);
+  const bool held = ceph_mutex_is_locked_by_me(client_lock);
+  std::unique_lock lock(client_lock, std::defer_lock);
+  if (!held) {
+    lock.lock();
+  }
   uint64_t max = cct->_conf->client_cache_size;
   ldout(cct, 20) << "trim_cache size " << lru.lru_get_size() << " max " << max << dendl;
   unsigned last = 0;
@@ -949,6 +953,7 @@ void Client::trim_cache(bool trim_kernel_dcache)
 
 void Client::trim_cache_for_reconnect(MetaSession *s)
 {
+  std::scoped_lock lock(client_lock);
   mds_rank_t mds = s->mds_num;
   ldout(cct, 20) << __func__ << " mds." << mds << dendl;
 
@@ -979,7 +984,7 @@ void Client::trim_cache_for_reconnect(MetaSession *s)
 
 void Client::trim_dentry(Dentry *dn)
 {
-  std::unique_lock lock(client_lock);
+  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
   if (!dn->dir) {
     ldout(cct, 15) << "trim_dentry skipping already-detached dn " << dn->name
 		   << dendl;
@@ -2355,7 +2360,10 @@ int Client::make_request(MetaRequest *request,
 	}
       } else {
 	ldout(cct, 10) << " target mds." << mds << " not active, waiting for new mdsmap" << dendl;
-	wait_on_list(waiting_for_mdsmap);
+	ceph::reentrant_condition_variable mdsmap_cond;
+	waiting_for_mdsmap.push_back(&mdsmap_cond);
+	mdsmap_cond.wait(l);
+	waiting_for_mdsmap.remove(&mdsmap_cond);
       }
       continue;
     }
@@ -2370,7 +2378,12 @@ int Client::make_request(MetaRequest *request,
       // wait
       if (session->state == MetaSession::STATE_OPENING) {
 	ldout(cct, 10) << "waiting for session to mds." << mds << " to open" << dendl;
-	wait_on_context_list(session->waiting_for_open);
+	ceph::reentrant_condition_variable open_cond;
+	bool open_done = false;
+	int open_r = 0;
+	session->waiting_for_open.push_back(
+	  new C_ReentrantCond(open_cond, &open_done, &open_r));
+	open_cond.wait(l, [&open_done] { return open_done; });
 	continue;
       }
 
@@ -3186,19 +3199,23 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
       ldout(cct, 20) << __func__ << " signalling caller "
 		       << (void*)request->caller_cond << dendl;
       request->caller_cond->notify_all();
+
+      // wake for kick back (use cl; a second unique_lock would desync reentrancy)
+      cond.wait(cl, [tid, request, &cond, this] {
+	if (request->dispatch_cond) {
+	  ldout(cct, 20) << "handle_client_reply awaiting kickback on tid "
+			 << tid << " " << &cond << dendl;
+	}
+	return !request->dispatch_cond;
+      });
     } else {
+      // make_request already returned (cleared caller_cond) but we still got a
+      // reply; do not wait on dispatch_cond or we pin client_lock until the
+      // (nonexistent) caller clears it.
       ldout(cct, 20) << __func__ << " caller already done on tid " << tid
 		       << dendl;
+      request->dispatch_cond = nullptr;
     }
-
-    // wake for kick back (use cl; a second unique_lock would desync reentrancy)
-    cond.wait(cl, [tid, request, &cond, this] {
-      if (request->dispatch_cond) {
-        ldout(cct, 20) << "handle_client_reply awaiting kickback on tid "
-		       << tid << " " << &cond << dendl;
-      }
-      return !request->dispatch_cond;
-    });
   }
 
   if (is_safe) {
@@ -3885,19 +3902,16 @@ void Client::delay_put_inodes(bool wakeup)
   if (release.empty())
     return;
 
-  int depth = 0;
-  while (client_lock.is_locked_by_me()) {
-    client_lock.unlock();
-    ++depth;
+  // Drop client_lock for _put_inode (inode_lock only).  Use unique_unlock so we
+  // save/restore the full reentrant depth in one step; the old per-level
+  // unlock()/lock() loop desynced outer std::unique_lock guards on _unmount.
+  {
+    unique_unlock ulock(client_lock);
+    for (auto &[in, cnt] : release) {
+      _put_inode(in, cnt);
+    }
   }
 
-  for (auto &[in, cnt] : release) {
-    _put_inode(in, cnt);
-  }
-
-  while (depth-- > 0) {
-    client_lock.lock();
-  }
   if (wakeup)
     mount_cond.notify_all();
 }
@@ -3914,9 +3928,10 @@ void Client::put_inode(Inode *in, int n)
   // During unmount, wake the unmount thread whenever a put is queued.  Most
   // cap/cache teardown (flush_set_callback, put_cap_ref, etc.) runs under
   // inode_lock only; mount_cond requires client_lock for a strict notify.
+  // The unmount path batches delay_put_inodes() itself — do not drain here
+  // while a std::unique_lock<client_lock> is still active on the stack.
   if (unmounting) {
     if (ceph_mutex_is_locked_by_me(client_lock)) {
-      delay_put_inodes(true);
       mount_cond.notify_all();
     } else {
       mount_cond.notify_all_sloppy();
@@ -4010,7 +4025,7 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
 
 void Client::unlink_locked(Dentry *dn, bool keepdir, bool keepdentry)
 {
-  std::unique_lock cl(client_lock);
+  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
 
   // Capture the parent dir now; another trim may detach this dentry before
   // we finish, but only while client_lock is held.
@@ -4844,7 +4859,11 @@ void Client::flush_caps_sync()
 
 void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
 {
-  std::unique_lock l{client_lock};
+  const bool held = ceph_mutex_is_locked_by_me(client_lock);
+  std::unique_lock l(client_lock, std::defer_lock);
+  if (!held) {
+    l.lock();
+  }
   while (in->flushing_caps) {
     map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
     ceph_assert(it != in->flushing_cap_tids.end());
@@ -4859,7 +4878,11 @@ void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
 
 void Client::wait_sync_caps(ceph_tid_t want)
 {
-  std::unique_lock l{client_lock};
+  const bool held = ceph_mutex_is_locked_by_me(client_lock);
+  std::unique_lock l(client_lock, std::defer_lock);
+  if (!held) {
+    l.lock();
+  }
  retry:
   ldout(cct, 10) << __func__ << " want " << want  << " (last is " << last_flush_tid << ", "
     << client_caps->get_num_flushing_caps() << " total flushing)" << dendl;
@@ -7474,15 +7497,9 @@ int Client::_do_lookup(const InodeRef& dir, const string& name, int mask,
 
   ldout(cct, 10) << __func__ << " on " << path << dendl;
 
-  // make_nosnap_relative_path() releases inode_lock itself.  Only drop
-  // the lock here if our caller (e.g. _lookup) is still holding it.
-  int r;
-  if (dir->is_locked_by_me()) {
-    ceph::unique_unlock<ceph::ReentrantLock> dir_in_unlock(dir->m_inode_lock);
-    r = make_request(req, perms, target);
-  } else {
-    r = make_request(req, perms, target);
-  }
+  // make_nosnap_relative_path() takes/releases inode_lock itself.  Callers
+  // holding std::unique_lock<Inode> must unlock it before make_request().
+  int r = make_request(req, perms, target);
   ldout(cct, 10) << __func__ << " res is " << r << dendl;
   return r;
 }
@@ -7532,7 +7549,7 @@ int Client::_lookup(const InodeRef& dir, const std::string& name, std::string& a
       req->set_filepath(path);
 
       InodeRef tmptarget;
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(dir->m_inode_lock);
+      dir_lock.unlock();
       int r = make_request(req, perms, &tmptarget, NULL, rand() % mdsmap->get_num_in_mds());
 
       if (r == 0) {
@@ -7641,7 +7658,9 @@ relookup:
     goto done;
   }
 
+  dir_lock.unlock();
   r = _do_lookup(dir, dname, mask, target, perms);
+  dir_lock.lock();
 
   did_lookup_request = true;
   if (r == 0) {
@@ -10534,12 +10553,9 @@ int Client::create_and_open(int dirfd, const char *relpath, int flags,
     if (alternate_name.empty()) {
       alternate_name = wdr.alternate_name;
     }
-    {
-      std::unique_lock diri_lock(*wdr.diri);
-      r = _create(wdr, flags, mode, &in, &fh, stripe_unit,
-                      stripe_count, object_size, data_pool, &created, perms,
-                      std::move(alternate_name), fscrypt_options);
-    }
+    r = _create(wdr, flags, mode, &in, &fh, stripe_unit,
+                stripe_count, object_size, data_pool, &created, perms,
+                std::move(alternate_name), fscrypt_options);
     if (r < 0)
       goto out;
   }
@@ -15903,19 +15919,22 @@ int Client::_create(const walk_dentry_result& wdr, int flags, mode_t mode,
 
   mode |= S_IFREG;
   bufferlist xattrs_bl;
-  int res = _posix_acl_create(wdr.diri.get(), &mode, xattrs_bl, perms);
-  if (res < 0) {
-    put_request(req);
-    return res;
-  }
-  req->head.args.open.mode = mode;
-  if (xattrs_bl.length() > 0)
-    req->set_data(xattrs_bl);
-
+  int res = 0;
   {
-    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(wdr.diri->m_inode_lock);
-    res = make_request(req, perms, inp, created);
+    std::unique_lock diri_lock(*wdr.diri);
+    res = _posix_acl_create(wdr.diri.get(), &mode, xattrs_bl, perms);
+    if (res < 0) {
+      put_request(req);
+      return res;
+    }
+    req->head.args.open.mode = mode;
+    if (xattrs_bl.length() > 0) {
+      req->set_data(xattrs_bl);
+    }
   }
+
+  // Callers holding std::unique_lock<Inode> must release it before make_request().
+  res = make_request(req, perms, inp, created);
   if (res < 0) {
     goto reply_error;
   }
@@ -15933,7 +15952,6 @@ int Client::_create(const walk_dentry_result& wdr, int flags, mode_t mode,
     }
 #endif
 
-    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(wdr.diri->m_inode_lock);
     std::unique_lock inp_lock(**inp);
     (*inp)->get_open_ref(cmode);
     *fhp = _create_fh(inp->get(), flags, cmode, perms);
