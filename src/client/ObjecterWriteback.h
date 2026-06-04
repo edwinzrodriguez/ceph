@@ -41,7 +41,7 @@ class ObjecterWriteback : public WritebackHandler {
                            const ZTracer::Trace &parent_trace,
 			   Context *oncommit) override {
     // Do not run oncommit under client_lock: bh_write_commit takes cache_lock
-    // and must not nest with client_lock (see flush_set_callback).
+    // and must not nest with client_lock (flush_set_callback uses scoped_drop).
     return m_objecter->write_trunc(oid, oloc, off, len, snapc, bl, mtime, 0,
 				   trunc_size, trunc_seq,
 				   new C_OnFinisher(oncommit, m_finisher));

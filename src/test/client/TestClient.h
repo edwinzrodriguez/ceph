@@ -58,7 +58,7 @@ public:
       if (!mref_reader.is_state_satisfied()) {
         return -ENOTCONN;
       }
-      std::scoped_lock l(client_lock);
+      std::scoped_lock<Client> l(*this);
       MetaRequest *req = new MetaRequest(CEPH_MDS_OP_DUMMY);
       int res = make_request(req, perms);
       ldout(cct, 10) << __func__ << " result=" << res << dendl;
@@ -69,7 +69,7 @@ public:
       if (!mref_reader.is_state_satisfied()) {
         return -ENOTCONN;
       }
-      std::scoped_lock l(client_lock);
+      std::scoped_lock<Client> l(*this);
       auto session = _get_or_open_mds_session(0);
       auto msg = make_message<MClientSession>(op, session->seq);
       int res = session->con->send_message2(std::move(msg));
@@ -81,7 +81,7 @@ public:
       if (!mref_reader.is_state_satisfied()) {
         return -ENOTCONN;
       }
-      std::scoped_lock l(client_lock);
+      std::scoped_lock<Client> l(*this);
       bs::error_code ec;
       ldout(cct, 20) << __func__ << ": waiting for latest osdmap" << dendl;
       objecter->wait_for_latest_osdmap(ca::use_blocked[ec]);
@@ -94,7 +94,7 @@ public:
       if (!mref_reader.is_state_satisfied()) {
         return -ENOTCONN;
       }
-      std::scoped_lock l(client_lock);
+      std::scoped_lock<Client> l(*this);
       char uuid[256];
       sprintf(uuid, "unknownreclaimflag:%x", getpid());
       auto session = _get_or_open_mds_session(0);

@@ -14,7 +14,7 @@
 
 void Dentry::get()
 {
-  std::scoped_lock l(client->client_lock);
+  std::scoped_lock<Client> l(*client);
   ceph_assert(ref > 0);
   if (++ref == 2)
     lru_pin();
@@ -22,7 +22,7 @@ void Dentry::get()
 
 void Dentry::put()
 {
-  std::scoped_lock l(client->client_lock);
+  std::scoped_lock<Client> l(*client);
   ceph_assert(ref > 0);
   if (--ref == 1)
     lru_unpin();

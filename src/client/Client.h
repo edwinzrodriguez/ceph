@@ -302,8 +302,27 @@ protected:
 };
 
 class ClientCaps;  // Forward declaration
+class Client;
+
+namespace std {
+template <> class unique_lock<Client>;
+template <> class scoped_lock<Client>;
+}
+
+namespace ceph {
+template <> class unique_unlock<Client>;
+namespace client_lock {
+class scoped_drop;
+struct detail;
+} // namespace client_lock
+} // namespace ceph
 
 class Client : public Dispatcher, public md_config_obs_t {
+  friend class std::unique_lock<Client>;
+  friend class std::scoped_lock<Client>;
+  friend class ceph::unique_unlock<Client>;
+  friend class ceph::client_lock::scoped_drop;
+  friend struct ceph::client_lock::detail;
 public:
   friend class C_Block_Sync; // Calls block map and protected helpers
   friend class C_Client_CacheInvalidate;  // calls ino_invalidate_cb
@@ -651,10 +670,7 @@ public:
   int get_caps_issued(const char *path, const UserPerm& perms);
 
   snapid_t ll_get_snapid(Inode *in);
-  vinodeno_t ll_get_vino(Inode *in) {
-    std::lock_guard lock(client_lock);
-    return _get_vino(in);
-  }
+  vinodeno_t ll_get_vino(Inode *in);
   // get inode from faked ino
   Inode *ll_get_inode(ino_t ino);
   Inode *ll_get_inode(vinodeno_t vino);
@@ -1053,18 +1069,8 @@ public:
 #endif
   bool _collect_and_send_global_metrics;
 
-  void lock() const;
-  bool try_lock() const;
-  void unlock() const;
   bool is_locked() const;
   bool is_locked_by_me() const;
-  // Called by reentrant_condition_variable before blocking: saves recursion
-  // depth and marks the lock as released so other threads can acquire it.
-  int release_for_wait() noexcept;
-
-  // Called by reentrant_condition_variable after waking: restores the saved
-  // recursion depth and re-establishes ownership for the current thread.
-  void restore_after_wait(int saved) noexcept;
 
 protected:
   struct FSCrypt_Options {
@@ -1194,25 +1200,19 @@ protected:
     return fd;
   }
 
-  int get_fd() {
-    std::scoped_lock lock(client_lock);
-    return _get_fd();
-  }
+  int get_fd();
 
   void _put_fd(int fd) {
     free_fd_set.insert(fd, 1);
   }
 
-  void put_fd(int fd) {
-    std::scoped_lock lock(client_lock);
-    _put_fd(fd);
-  }
+  void put_fd(int fd);
 
   /*
    * Resolve file descriptor, or return NULL.
    */
   Fh *_get_filehandle(int fd) {
-    ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+    ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
     auto it = fd_map.find(fd);
     if (it == fd_map.end())
@@ -1220,29 +1220,16 @@ protected:
     return it->second;
   }
 
-  Fh *get_filehandle(int fd) {
-    ceph_assert(ceph_mutex_is_not_locked_by_me(client_lock));
-
-    std::scoped_lock lock(client_lock);
-    return _get_filehandle(fd);
-  }
+  Fh *get_filehandle(int fd);
   int _get_fd_inode(int fd, InodeRef *in);
-  int get_fd_inode(int fd, InodeRef *in)
-  {
-    ceph_assert(ceph_mutex_is_not_locked_by_me(client_lock));
-    std::scoped_lock lock(client_lock);
-    return _get_fd_inode(fd, in);
-  }
+  int get_fd_inode(int fd, InodeRef *in);
 
   bool _ll_fh_exists(Fh *f) {
-    ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+    ceph_assert(ceph_mutex_is_locked_by_me(*this));
     return ll_unclosed_fh_set.count(f);
   }
   
-  bool ll_fh_exists(Fh *f) {
-    std::scoped_lock lock(client_lock);
-    return _ll_fh_exists(f);
-  }
+  bool ll_fh_exists(Fh *f);
 
   // helpers
   void wake_up_session_caps(MetaSession *s, bool reconnect);
@@ -1348,12 +1335,6 @@ protected:
    * being set up.
    */
   void _finish_init();
-
-  // global client lock
-  //  - protects Client and buffer cache both!
-  // ceph::mutex client_lock = ceph::make_mutex("Client::client_lock");
-
-  mutable ceph::ReentrantLock client_lock = ceph::make_reentrant("Client::client_lock", false); // disable deadlock detection
 
   std::map<snapid_t, int> ll_snap_ref;
 
@@ -2038,7 +2019,7 @@ private:
     }
 
     void finish(int r) override {
-      ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+      ceph_assert(ceph_mutex_is_locked_by_me(*clnt));
       state->complete_flush(r);
     }
   };
@@ -2464,6 +2445,16 @@ private:
   bool respect_subvolume_snapshot_visibility;
 
   std::locale m_locale;
+
+private:
+  // Protects Client state and the buffer cache.  Acquire only through
+  // std::unique_lock<Client> / std::scoped_lock<Client> (client_lock.h).
+  mutable ceph::ReentrantLock m_client_lock =
+    ceph::make_reentrant("Client::m_client_lock", false);
+
+  ceph::ReentrantLock& get_client_lock() { return m_client_lock; }
+  ceph::reentrant_condition_variable& get_mount_cond() { return mount_cond; }
+  ceph::reentrant_condition_variable& get_sync_cond() { return sync_cond; }
 };
 
 /**
@@ -2480,5 +2471,45 @@ public:
   int init() override;
   void shutdown() override;
 };
+
+#include "client_lock.h"
+
+inline int Client::get_fd()
+{
+  std::scoped_lock<Client> lock(*this);
+  return _get_fd();
+}
+
+inline void Client::put_fd(int fd)
+{
+  std::scoped_lock<Client> lock(*this);
+  _put_fd(fd);
+}
+
+inline Fh *Client::get_filehandle(int fd)
+{
+  ceph_assert(ceph_mutex_is_not_locked_by_me(*this));
+  std::scoped_lock<Client> lock(*this);
+  return _get_filehandle(fd);
+}
+
+inline int Client::get_fd_inode(int fd, InodeRef *in)
+{
+  ceph_assert(ceph_mutex_is_not_locked_by_me(*this));
+  std::scoped_lock<Client> lock(*this);
+  return _get_fd_inode(fd, in);
+}
+
+inline bool Client::ll_fh_exists(Fh *f)
+{
+  std::scoped_lock<Client> lock(*this);
+  return _ll_fh_exists(f);
+}
+
+inline vinodeno_t Client::ll_get_vino(Inode *in)
+{
+  std::scoped_lock<Client> lock(*this);
+  return _get_vino(in);
+}
 
 #endif

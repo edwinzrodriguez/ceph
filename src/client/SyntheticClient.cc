@@ -2270,7 +2270,7 @@ int SyntheticClient::create_objects(int nobj, int osize, int inflight)
 
     starts.push_back(ceph_clock_now());
     {
-      std::lock_guard locker{client->client_lock};
+      std::scoped_lock<Client> locker(*client);
       client->objecter->write(oid, oloc, 0, osize, snapc, bl,
 			      ceph::real_clock::now(), 0,
 			      new C_Ref(lock, cond, &unsafe));
@@ -2360,28 +2360,29 @@ int SyntheticClient::object_rw(int nobj, int osize, int wrpc,
     object_locator_t oloc(SYNCLIENT_FIRST_POOL);
     SnapContext snapc;
     
-    client->client_lock.lock();
-    utime_t start = ceph_clock_now();
-    if (write) {
-      dout(10) << "write to " << oid << dendl;
+    {
+      std::scoped_lock<Client> client_guard(*client);
+      utime_t start = ceph_clock_now();
+      if (write) {
+        dout(10) << "write to " << oid << dendl;
 
-      ObjectOperation m;
-      OSDOp op;
-      op.op.op = CEPH_OSD_OP_WRITE;
-      op.op.extent.offset = 0;
-      op.op.extent.length = osize;
-      op.indata = bl;
-      m.ops.push_back(op);
-      client->objecter->mutate(oid, oloc, m, snapc,
-			       ceph::real_clock::now(), 0,
+        ObjectOperation m;
+        OSDOp op;
+        op.op.op = CEPH_OSD_OP_WRITE;
+        op.op.extent.offset = 0;
+        op.op.extent.length = osize;
+        op.indata = bl;
+        m.ops.push_back(op);
+        client->objecter->mutate(oid, oloc, m, snapc,
+				 ceph::real_clock::now(), 0,
+				 new C_Ref(lock, cond, &unack));
+      } else {
+        dout(10) << "read from " << oid << dendl;
+        bufferlist inbl;
+        client->objecter->read(oid, oloc, 0, osize, CEPH_NOSNAP, &inbl, 0,
 			       new C_Ref(lock, cond, &unack));
-    } else {
-      dout(10) << "read from " << oid << dendl;
-      bufferlist inbl;
-      client->objecter->read(oid, oloc, 0, osize, CEPH_NOSNAP, &inbl, 0,
-			     new C_Ref(lock, cond, &unack));
+      }
     }
-    client->client_lock.unlock();
 
     {
       std::unique_lock locker{lock};

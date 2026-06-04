@@ -269,8 +269,8 @@ public:
     return m_released;
   }
 
-  // Call when client_lock is re-acquired before scope end and the destructor
-  // must not restore the saved recursion depth (e.g. flush_set_callback).
+  // Call when the lock is re-acquired before scope end and the destructor must
+  // not restore the saved recursion depth (e.g. inode_lock pairing).
   void abandon() noexcept
   {
     m_released = false;

@@ -423,7 +423,7 @@ void ClientCaps::trim_caps(MetaSession *s, uint64_t max)
   }
   ldout(cct, 20) << " trimming dentries for " << to_trim.size() 
                  << " inodes" << dendl;
-  std::scoped_lock cl(client->client_lock);
+  std::scoped_lock<Client> cl(*client);
   for (auto dn : to_trim)
     client->trim_dentry(dn);
 }
@@ -509,7 +509,7 @@ void ClientCaps::prepare_inode_unmount(Inode *in)
 {
   // inode_lock before client_lock (same order as _put_inode) — callers must
   // not hold client_lock across this function.
-  ceph_assert(ceph_mutex_is_not_locked_by_me(client->client_lock));
+  ceph_assert(ceph_mutex_is_not_locked_by_me(client->m_client_lock));
 
   std::unique_lock in_lock(*in);
 
@@ -531,7 +531,7 @@ void ClientCaps::prepare_inode_unmount(Inode *in)
 
 void ClientCaps::flush_cap_releases()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->m_client_lock));
   
   uint64_t nr_caps = 0;
 
@@ -565,7 +565,7 @@ void ClientCaps::flush_cap_releases()
 
 void ClientCaps::renew_and_flush_cap_releases()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->m_client_lock));
 
   if (!client->mount_aborted && client->mdsmap->get_epoch()) {
     // renew caps?
@@ -579,7 +579,7 @@ void ClientCaps::renew_and_flush_cap_releases()
 
 void ClientCaps::renew_caps()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->m_client_lock));
   
   ldout(cct, 10) << "renew_caps()" << dendl;
   last_cap_renew = ceph::coarse_mono_clock::now();
@@ -926,7 +926,7 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 
   int r = 0;
   {
-    std::unique_lock lock(client->client_lock);
+    std::unique_lock<Client> lock(*client);
     r = client->check_pool_perm(in, need);
     if (r < 0)
       return r;
@@ -1144,7 +1144,7 @@ void ClientCaps::early_kick_flushing_caps(MetaSession *session)
 
 void ClientCaps::flush_caps_sync()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->m_client_lock));
   
   ldout(cct, 10) << __func__ << dendl;
   for (auto &q : client->mds_sessions) {
@@ -1303,7 +1303,7 @@ void ClientCaps::flush_snaps(Inode *in)
 
 void ClientCaps::submit_sync_caps(Inode *in, ceph_tid_t want, Context *onfinish)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(client->m_client_lock));
   // TODO: Implement sync caps submission
   // For now, just complete the context immediately
   if (onfinish)

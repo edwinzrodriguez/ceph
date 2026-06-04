@@ -238,7 +238,7 @@ int Client::CommandHook::call(
 {
   f->open_object_section("result");
   {
-    std::scoped_lock l{m_client->client_lock};
+    std::scoped_lock<Client> l{*m_client};
     if (command == "mds_requests")
       m_client->dump_mds_requests(f);
     else if (command == "mds_sessions") {
@@ -264,7 +264,7 @@ int Client::CommandHook::call(
 // -------------
 
 int Client::_get_fd_inode(int fd, InodeRef *in) {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
   int r = 0;
   if (fd == CEPHFS_AT_FDCWD) {
     *in = cwd;
@@ -384,7 +384,7 @@ vinodeno_t Client::_map_faked_ino(ino_t ino)
 
 vinodeno_t Client::map_faked_ino(ino_t ino)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   return _map_faked_ino(ino);
 }
 
@@ -459,7 +459,7 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
 
   // osd interfaces
   writeback_handler.reset(new ObjecterWriteback(objecter, &objecter_finisher,
-  			    &client_lock));
+  			    &m_client_lock));
   objectcacher.reset(new ObjectCacher(cct, "libcephfs", *writeback_handler,
   		  client_flush_set_callback,    // all commit callback
   		  (void*)this,
@@ -477,7 +477,7 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
 
 Client::~Client()
 {
-  ceph_assert(ceph_mutex_is_not_locked(client_lock));
+  ceph_assert(ceph_mutex_is_not_locked(*this));
 
   // If the task is crashed or aborted and doesn't
   // get any chance to run the umount and shutdow.
@@ -534,26 +534,26 @@ inodeno_t Client::_get_root_ino(bool fake)
 
 inodeno_t Client::get_root_ino()
 {
-  std::scoped_lock l(client_lock);
+  std::scoped_lock<Client> l(*this);
   return _get_root_ino(true);
 }
 
 Inode *Client::get_root()
 {
-  std::scoped_lock l(client_lock);
+  std::scoped_lock<Client> l(*this);
   root->ll_get();
   return root.get();
 }
 
 InodeRef Client::get_root_ref()
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   return root;
 }
 
 InodeRef Client::get_cwd_ref()
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   return cwd;
 }
 
@@ -623,7 +623,7 @@ void Client::dump_cache(Formatter *f)
 
 void Client::dump_status(Formatter *f)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
   ldout(cct, 1) << __func__ << dendl;
 
@@ -676,7 +676,7 @@ int Client::init()
 
   _pre_init();
   {
-    std::scoped_lock l{client_lock};
+    std::scoped_lock<Client> l{*this};
     messenger->add_dispatcher_tail(this);
   }
   _finish_init();
@@ -687,7 +687,7 @@ int Client::init()
 void Client::_finish_init()
 {
   {
-    std::scoped_lock l{client_lock};
+    std::scoped_lock<Client> l{*this};
     // logger
     PerfCountersBuilder plb(cct, "client", l_c_first, l_c_last);
     plb.add_time_avg(l_c_reply, "reply", "Latency of receiving a reply on metadata request");
@@ -764,7 +764,7 @@ void Client::shutdown()
   // If we were not mounted, but were being used for sending
   // MDS commands, we may have sessions that need closing.
   {
-    std::scoped_lock l{client_lock};
+    std::scoped_lock<Client> l{*this};
 
     // To make sure the tick thread will be stoppped before
     // destructing the Client, just in case like the _mount()
@@ -812,7 +812,7 @@ void Client::shutdown()
     async_ino_releasor.stop();
   }
 
-  objectcacher->stop();  // outside of client_lock! this does a join.
+  objectcacher->stop();  // outside of m_client_lock! this does a join.
 
   /*
    * We are shuting down the client.
@@ -902,8 +902,8 @@ void Client::update_io_stat_write(utime_t latency) {
 
 void Client::trim_cache(bool trim_kernel_dcache)
 {
-  const bool held = ceph_mutex_is_locked_by_me(client_lock);
-  std::unique_lock lock(client_lock, std::defer_lock);
+  const bool held = ceph_mutex_is_locked_by_me(*this);
+  std::unique_lock<Client> lock(*this, std::defer_lock);
   if (!held) {
     lock.lock();
   }
@@ -953,7 +953,7 @@ void Client::trim_cache(bool trim_kernel_dcache)
 
 void Client::trim_cache_for_reconnect(MetaSession *s)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   mds_rank_t mds = s->mds_num;
   ldout(cct, 20) << __func__ << " mds." << mds << dendl;
 
@@ -984,7 +984,7 @@ void Client::trim_cache_for_reconnect(MetaSession *s)
 
 void Client::trim_dentry(Dentry *dn)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
   if (!dn->dir) {
     ldout(cct, 15) << "trim_dentry skipping already-detached dn " << dn->name
 		   << dendl;
@@ -1141,9 +1141,9 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
 {
   Inode *in;
   bool was_new = false;
-  // inode_map and mount root state are protected by client_lock, not inode_lock.
+  // inode_map and mount root state are protected by m_client_lock, not inode_lock.
   {
-    std::scoped_lock cl(client_lock);
+    std::scoped_lock<Client> cl(*this);
     auto [it, b] = inode_map.try_emplace(st->vino);
     ldout(cct, 25) << __func__ << ": " << *st << dendl;
     if (!b) {
@@ -1318,7 +1318,7 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
     Inode *snapdir = nullptr;
     in_lock.unlock();
     {
-      std::scoped_lock cl(client_lock);
+      std::scoped_lock<Client> cl(*this);
       auto it = inode_map.find(vino);
       if (it != inode_map.end())
         snapdir = it->second;
@@ -1957,7 +1957,7 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
     vinodeno_t vino = ist.vino;
     vino.snapid = CEPH_SNAPDIR;
     {
-      std::scoped_lock cl(client_lock);
+      std::scoped_lock<Client> cl(*this);
       auto it = inode_map.find(vino);
       ceph_assert(it != inode_map.end());
       diri = it->second;
@@ -2304,7 +2304,7 @@ int Client::make_request(MetaRequest *request,
 {
   int r = 0;
 
-  std::unique_lock l(client_lock);
+  std::unique_lock<Client> l(*this);
   // assign a unique tid
   ceph_tid_t tid = ++last_tid;
   request->set_tid(tid);
@@ -2362,7 +2362,7 @@ int Client::make_request(MetaRequest *request,
 	ldout(cct, 10) << " target mds." << mds << " not active, waiting for new mdsmap" << dendl;
 	ceph::reentrant_condition_variable mdsmap_cond;
 	waiting_for_mdsmap.push_back(&mdsmap_cond);
-	mdsmap_cond.wait(l);
+	ceph::client_lock::wait_on(*this, mdsmap_cond, l);
 	waiting_for_mdsmap.remove(&mdsmap_cond);
       }
       continue;
@@ -2383,7 +2383,8 @@ int Client::make_request(MetaRequest *request,
 	int open_r = 0;
 	session->waiting_for_open.push_back(
 	  new C_ReentrantCond(open_cond, &open_done, &open_r));
-	open_cond.wait(l, [&open_done] { return open_done; });
+	ceph::client_lock::wait_on(*this, open_cond, l,
+				  [&open_done] { return open_done; });
 	continue;
       }
 
@@ -2399,11 +2400,11 @@ int Client::make_request(MetaRequest *request,
     }
 
     // send request.
-    // Release client_lock before calling send_request() to maintain proper lock ordering.
+    // Release m_client_lock before calling send_request() to maintain proper lock ordering.
     // send_request() -> encode_cap_releases() -> encode_inode_release() needs inode_lock,
-    // and the correct lock ordering is: inode_lock first, then client_lock.
+    // and the correct lock ordering is: inode_lock first, then m_client_lock.
     {
-      unique_unlock c_unlock(client_lock);
+      ceph::unique_unlock<Client> c_unlock(*this);
       send_request(request, session.get());
     }
 
@@ -2411,7 +2412,7 @@ int Client::make_request(MetaRequest *request,
     ldout(cct, 20) << "awaiting reply|forward|kick on " << &caller_cond << dendl;
     request->resend_mds = -1; /* reset for retries */
     request->kick = false;
-    caller_cond.wait(l, [request] {
+    ceph::client_lock::wait_on(*this, caller_cond, l, [request] {
       return (request->reply ||	          // reply
 	      request->resend_mds >= 0 || // forward
 	      request->kick);
@@ -2524,7 +2525,7 @@ int Client::encode_inode_release(Inode *in, MetaRequest *req,
   if (it != in->caps.end()) {
     Cap &cap = it->second;
     // Acquire inode_lock to access inode data (dirty_caps, cap_refs)
-    // Caller must not hold client_lock to maintain lock ordering
+    // Caller must not hold m_client_lock to maintain lock ordering
     std::unique_lock in_lock(*in);
     drop &= ~(in->dirty_caps | get_caps_used(in));
     
@@ -2571,7 +2572,7 @@ void Client::encode_dentry_release(Dentry *dn, MetaRequest *req,
   int released = 0;
   if (dn->dir) {
     // Don't acquire inode_lock here - it violates lock ordering
-    // when called from send_request which may hold client_lock.
+    // when called from send_request which may hold m_client_lock.
     // The inode_lock should be held by the caller if needed.
     released = encode_inode_release(dn->dir->parent_inode, req,
                                    mds, drop, unless, 1);
@@ -2628,7 +2629,7 @@ void Client::encode_cap_releases(MetaRequest *req, mds_rank_t mds)
 
 bool Client::have_open_session(mds_rank_t mds)
 {
-  std::unique_lock c_lock(client_lock);
+  std::unique_lock<Client> c_lock(*this);
   const auto &it = mds_sessions.find(mds);
   return it != mds_sessions.end() &&
     (it->second->state == MetaSession::STATE_OPEN ||
@@ -2637,7 +2638,7 @@ bool Client::have_open_session(mds_rank_t mds)
 
 MetaSessionRef Client::_get_mds_session(mds_rank_t mds, Connection *con)
 {
-  std::unique_lock c_lock(client_lock);
+  std::unique_lock<Client> c_lock(*this);
   const auto &it = mds_sessions.find(mds);
   if (it == mds_sessions.end() || it->second->con != con) {
     return NULL;
@@ -2648,7 +2649,7 @@ MetaSessionRef Client::_get_mds_session(mds_rank_t mds, Connection *con)
 
 MetaSessionRef Client::_get_or_open_mds_session(mds_rank_t mds)
 {
-  std::unique_lock c_lock(client_lock);
+  std::unique_lock<Client> c_lock(*this);
   auto it = mds_sessions.find(mds);
   return it == mds_sessions.end() ? _open_mds_session(mds) : it->second;
 }
@@ -2713,7 +2714,7 @@ void Client::update_metadata(std::string const &k, std::string const &v)
   RWRef_t iref_reader(initialize_state, CLIENT_INITIALIZED);
   ceph_assert(iref_reader.is_state_satisfied());
 
-  std::scoped_lock l(client_lock);
+  std::scoped_lock<Client> l(*this);
 
   auto it = metadata.find(k);
   if (it != metadata.end()) {
@@ -2726,7 +2727,7 @@ void Client::update_metadata(std::string const &k, std::string const &v)
 
 MetaSessionRef Client::_open_mds_session(mds_rank_t mds)
 {
-  std::unique_lock c_lock(client_lock);
+  std::unique_lock<Client> c_lock(*this);
   ldout(cct, 10) << __func__ << " mds." << mds << dendl;
   auto addrs = mdsmap->get_addrs(mds);
   auto em = mds_sessions.emplace(std::piecewise_construct,
@@ -2745,7 +2746,7 @@ MetaSessionRef Client::_open_mds_session(mds_rank_t mds)
 
 void Client::_close_mds_session(MetaSession *s)
 {
-  std::unique_lock c_lock(client_lock);
+  std::unique_lock<Client> c_lock(*this);
   ldout(cct, 2) << __func__ << " mds." << s->mds_num << " seq " << s->seq << dendl;
   s->state = MetaSession::STATE_CLOSING;
   s->con->send_message2(make_message<MClientSession>(CEPH_SESSION_REQUEST_CLOSE, s->seq));
@@ -2753,7 +2754,7 @@ void Client::_close_mds_session(MetaSession *s)
 
 void Client::_closed_mds_session(MetaSession *s, int err, bool rejected)
 {
-  std::unique_lock c_lock(client_lock);
+  std::unique_lock<Client> c_lock(*this);
   ldout(cct, 5) << __func__ << " mds." << s->mds_num << " seq " << s->seq << dendl;
   if (rejected && s->state != MetaSession::STATE_CLOSING)
     s->state = MetaSession::STATE_REJECTED;
@@ -2780,7 +2781,7 @@ void Client::handle_client_session(const MConstRef<MClientSession>& m)
   mds_rank_t from = mds_rank_t(m->get_source().num());
   ldout(cct, 10) << __func__ << " " << *m << " from mds." << from << dendl;
 
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
   auto session = _get_mds_session(from, m->get_connection().get());
   if (!session) {
     ldout(cct, 10) << " discarding session message from sessionless mds " << m->get_source_inst() << dendl;
@@ -2899,7 +2900,7 @@ void Client::handle_client_session(const MConstRef<MClientSession>& m)
 
 bool Client::_any_stale_sessions() const
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
   for (const auto &p : mds_sessions) {
     if (p.second->state == MetaSession::STATE_STALE) {
@@ -3050,7 +3051,7 @@ void Client::handle_client_request_forward(const MConstRef<MClientRequestForward
 {
   mds_rank_t mds = mds_rank_t(fwd->get_source().num());
 
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
   auto session = _get_mds_session(mds, fwd->get_connection().get());
   if (!session) {
     return;
@@ -3121,7 +3122,7 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
 {
   mds_rank_t mds_num = mds_rank_t(reply->get_source().num());
 
-  std::unique_lock cl(client_lock);
+  std::unique_lock<Client> cl(*this);
   auto session = _get_mds_session(mds_num, reply->get_connection().get());
   if (!session) {
     return;
@@ -3159,7 +3160,7 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
 
   // Only signal the caller once (on the first reply): either an unsafe reply,
   // or a safe reply with no prior unsafe reply.  Set dispatch_cond before
-  // insert_trace: that path drops client_lock and make_request may wake on
+  // insert_trace: that path drops m_client_lock and make_request may wake on
   // request->reply, clear caller_cond, and kick dispatch_cond.
   const bool signal_caller = !is_safe || !request->got_unsafe;
   ceph::reentrant_condition_variable cond;
@@ -3168,10 +3169,10 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
 
   request->reply = reply;
 
-  // Release client_lock before calling insert_trace to avoid lock ordering issues
+  // Release m_client_lock before calling insert_trace to avoid lock ordering issues
   // insert_trace -> add_update_inode acquires inode_lock
   {
-    unique_unlock cl_unlock(client_lock);
+    ceph::unique_unlock<Client> cl_unlock(*this);
     insert_trace(request, session.get());
   }
 
@@ -3201,7 +3202,7 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
       request->caller_cond->notify_all();
 
       // wake for kick back (use cl; a second unique_lock would desync reentrancy)
-      cond.wait(cl, [tid, request, &cond, this] {
+      ceph::client_lock::wait_on(*this, cond, cl, [tid, request, &cond, this] {
 	if (request->dispatch_cond) {
 	  ldout(cct, 20) << "handle_client_reply awaiting kickback on tid "
 			 << tid << " " << &cond << dendl;
@@ -3210,7 +3211,7 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
       });
     } else {
       // make_request already returned (cleared caller_cond) but we still got a
-      // reply; do not wait on dispatch_cond or we pin client_lock until the
+      // reply; do not wait on dispatch_cond or we pin m_client_lock until the
       // (nonexistent) caller clears it.
       ldout(cct, 20) << __func__ << " caller already done on tid " << tid
 		       << dendl;
@@ -3285,7 +3286,7 @@ void Client::_handle_full_flag(int64_t pool)
 
 void Client::handle_osd_map(const MConstRef<MOSDMap>& m)
 {
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
 
   const auto myaddrs = messenger->get_myaddrs();
   bool new_blocklist = objecter->with_osdmap(
@@ -3427,7 +3428,7 @@ Dispatcher::dispatch_result_t Client::ms_dispatch2(const MessageRef &m)
   // write reply).  Do not call trim_cache() here: it can block on cache_lock
   // while holding work in the dispatch thread and stall replies.
   if (is_unmounting()) {
-    std::scoped_lock cl(client_lock);
+    std::scoped_lock<Client> cl(*this);
     delay_put_inodes(true);
     mount_cond.notify_all();
   }
@@ -3437,7 +3438,7 @@ Dispatcher::dispatch_result_t Client::ms_dispatch2(const MessageRef &m)
 
 void Client::handle_fs_map(const MConstRef<MFSMap>& m)
 {
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
   fsmap.reset(new FSMap(m->get_fsmap()));
 
   signal_cond_list(waiting_for_fsmap);
@@ -3447,7 +3448,7 @@ void Client::handle_fs_map(const MConstRef<MFSMap>& m)
 
 void Client::handle_fs_map_user(const MConstRef<MFSMapUser>& m)
 {
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
   fsmap_user.reset(new FSMapUser);
   *fsmap_user = m->get_fsmap();
 
@@ -3469,7 +3470,7 @@ void Client::cancel_commands(const MDSMap& newmap)
       }
       /*
        * No need to make the con->mark_down under
-       * client_lock here, because the con will
+       * m_client_lock here, because the con will
        * has its own lock.
        */
       op.con->mark_down();
@@ -3481,7 +3482,7 @@ void Client::cancel_commands(const MDSMap& newmap)
 
 void Client::handle_mds_map(const MConstRef<MMDSMap>& m)
 {
-  std::unique_lock cl(client_lock);
+  std::unique_lock<Client> cl(*this);
   if (m->get_epoch() <= mdsmap->get_epoch()) {
     ldout(cct, 1) << __func__ << " epoch " << m->get_epoch()
                   << " is identical to or older than our "
@@ -3795,7 +3796,7 @@ void Client::handle_lease(const MConstRef<MClientLease>& m)
   ceph_assert(m->get_action() == CEPH_MDS_LEASE_REVOKE);
   mds_rank_t mds = mds_rank_t(m->get_source().num());
 
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
   auto session = _get_mds_session(mds, m->get_connection().get());
   if (!session) {
     return;
@@ -3840,7 +3841,7 @@ void Client::handle_lease(const MConstRef<MClientLease>& m)
 
 void Client::_put_inode(Inode *in, int n)
 {
-  ceph_assert(ceph_mutex_is_not_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_not_locked_by_me(*this));
 
   ldout(cct, 10) << __func__ << " on " << *in << " n = " << n << dendl;
   // ceph_assert(ceph_mutex_is_locked_by_me(*in));
@@ -3860,7 +3861,7 @@ void Client::_put_inode(Inode *in, int n)
     left -= n;
   }
   if (left == 1) { // last ref is the inode_map pin
-    std::unique_lock c_lock(client_lock);
+    std::unique_lock<Client> c_lock(*this);
     if (unmount_anchor_pins.count(in)) {
       ldout(cct, 15) << __func__ << " defer delete (unmount anchor) " << *in
 		     << dendl;
@@ -3891,7 +3892,7 @@ void Client::_put_inode(Inode *in, int n)
 
 void Client::delay_put_inodes(bool wakeup)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
   std::map<Inode*,int> release;
   {
@@ -3902,11 +3903,11 @@ void Client::delay_put_inodes(bool wakeup)
   if (release.empty())
     return;
 
-  // Drop client_lock for _put_inode (inode_lock only).  Use unique_unlock so we
+  // Drop m_client_lock for _put_inode (inode_lock only).  Use unique_unlock so we
   // save/restore the full reentrant depth in one step; the old per-level
   // unlock()/lock() loop desynced outer std::unique_lock guards on _unmount.
   {
-    unique_unlock ulock(client_lock);
+    ceph::unique_unlock<Client> ulock(*this);
     for (auto &[in, cnt] : release) {
       _put_inode(in, cnt);
     }
@@ -3927,11 +3928,11 @@ void Client::put_inode(Inode *in, int n)
   }
   // During unmount, wake the unmount thread whenever a put is queued.  Most
   // cap/cache teardown (flush_set_callback, put_cap_ref, etc.) runs under
-  // inode_lock only; mount_cond requires client_lock for a strict notify.
+  // inode_lock only; mount_cond requires m_client_lock for a strict notify.
   // The unmount path batches delay_put_inodes() itself — do not drain here
-  // while a std::unique_lock<client_lock> is still active on the stack.
+  // while a std::unique_lock<Client> is still active on the stack.
   if (unmounting) {
-    if (ceph_mutex_is_locked_by_me(client_lock)) {
+    if (ceph_mutex_is_locked_by_me(*this)) {
       mount_cond.notify_all();
     } else {
       mount_cond.notify_all_sloppy();
@@ -3963,7 +3964,7 @@ void Client::ensure_dentry_lru(Dentry *dn)
 {
   if (dn->lru_is_cached())
     return;
-  std::unique_lock lock(client_lock);
+  std::unique_lock<Client> lock(*this);
   if (!dn->lru_is_cached())
     lru.lru_insert_mid(dn);
 }
@@ -4025,10 +4026,10 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
 
 void Client::unlink_locked(Dentry *dn, bool keepdir, bool keepdentry)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
   // Capture the parent dir now; another trim may detach this dentry before
-  // we finish, but only while client_lock is held.
+  // we finish, but only while m_client_lock is held.
   Dir *dir = dn->dir;
 
   if (!keepdentry && !dir) {
@@ -4077,7 +4078,7 @@ void Client::unlink_locked(Dentry *dn, bool keepdir, bool keepdentry)
 
 void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 {
-  std::unique_lock cl(client_lock);
+  std::unique_lock<Client> cl(*this);
   unlink_locked(dn, keepdir, keepdentry);
 }
 
@@ -4104,7 +4105,7 @@ public:
     }
     if (client->is_unmounting()) {
       {
-        std::scoped_lock cl(client->client_lock);
+        std::scoped_lock<Client> cl(*client);
         client->delay_put_inodes(true);
         client->mount_cond.notify_all();
       }
@@ -4345,10 +4346,10 @@ void Client::flush_snaps(Inode *in)
 
 void Client::wait_on_list(list<ceph::reentrant_condition_variable*>& ls)
 {
-  std::unique_lock l{client_lock};
+  std::unique_lock<Client> l{*this};
   ceph::reentrant_condition_variable cond;
   ls.push_back(&cond);
-  cond.wait(l);
+  ceph::client_lock::wait_on(*this, cond, l);
   ls.remove(&cond);
 }
 
@@ -4361,12 +4362,12 @@ void Client::signal_cond_list(list<ceph::reentrant_condition_variable*>& ls)
 
 void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
-  std::unique_lock l{client_lock};
+  std::unique_lock<Client> l{*this};
   ceph::reentrant_condition_variable cond;
   bool done = false;
   int r;
   ls.push_back(new C_ReentrantCond(cond, &done, &r));
-  cond.wait(l, [&done] { return done;});
+  ceph::client_lock::wait_on(*this, cond, l, [&done] { return done;});
 }
 
 void Client::signal_caps_inode(Inode *in)
@@ -4420,7 +4421,7 @@ public:
   }
   void finish(int r) override {
     // _async_invalidate takes the lock when it needs to, call this back from outside of lock.
-    ceph_assert(ceph_mutex_is_not_locked_by_me(client->client_lock));
+    ceph_assert(ceph_mutex_is_not_locked_by_me(client->m_client_lock));
     client->_async_invalidate(ino, offset, length);
   }
 };
@@ -4528,7 +4529,7 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
                                    offset, size, &onflush);
   if (!ret) {
     // wait for flush
-    ceph::unique_unlock<Inode> in_unlock(*in);
+    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
     onflush.wait();
   }
 }
@@ -4536,27 +4537,18 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
 void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
 {
   // Called from ObjectCacher's finisher (see _schedule_flush_set_callback).
-  // Lock order is inode_lock then client_lock (_put_inode); _flushed needs
-  // only inode_lock.  Drop client_lock if writeback held it via C_ReentrantLock.
-  int client_lock_depth = 0;
-  while (client_lock.is_locked_by_me()) {
-    client_lock.unlock();
-    ++client_lock_depth;
-  }
+  // Lock order is inode_lock then m_client_lock (_put_inode); _flushed needs
+  // only inode_lock.  Reads may still hold m_client_lock via C_ReentrantLock on
+  // the writeback finisher path — drop the full reentrant depth with scoped_drop.
+  ceph::client_lock::scoped_drop drop_client_lock(*this);
 
   if (is_unmounting()) {
-    while (client_lock_depth-- > 0) {
-      client_lock.lock();
-    }
     return;
   }
 
   {
     auto oc_lock = objectcacher->acquire_cache_lock();
     if (oset->invalidated) {
-      while (client_lock_depth-- > 0) {
-        client_lock.lock();
-      }
       return;
     }
   }
@@ -4571,14 +4563,10 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
       _flushed(in);
     }
   } else {
-    std::scoped_lock in_lock(*in);
+    std::scoped_lock<Inode> in_lock(*in);
     if (!in->oset.dirty_or_tx) {
       _flushed(in);
     }
-  }
-
-  while (client_lock_depth-- > 0) {
-    client_lock.lock();
   }
 }
 
@@ -4673,7 +4661,7 @@ void Client::_invalidate_kernel_dcache()
   RWRef_t mref_reader(mount_state, CLIENT_MOUNTING);
   if (!mref_reader.is_state_satisfied())
     return;
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
   if (can_invalidate_dentries) {
     if (dentry_invalidate_cb && root->dir) {
       for (auto p = root->dir->dentries.begin();
@@ -4728,7 +4716,7 @@ public:
       ino = in->vino();
   }
   void finish(int r) override {
-    ceph_assert(ceph_mutex_is_not_locked_by_me(client->client_lock));
+    ceph_assert(ceph_mutex_is_not_locked_by_me(client->m_client_lock));
     client->_async_inode_release(ino);
   }
 };
@@ -4859,8 +4847,8 @@ void Client::flush_caps_sync()
 
 void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
 {
-  const bool held = ceph_mutex_is_locked_by_me(client_lock);
-  std::unique_lock l(client_lock, std::defer_lock);
+  const bool held = ceph_mutex_is_locked_by_me(*this);
+  std::unique_lock<Client> l(*this, std::defer_lock);
   if (!held) {
     l.lock();
   }
@@ -4878,8 +4866,8 @@ void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
 
 void Client::wait_sync_caps(ceph_tid_t want)
 {
-  const bool held = ceph_mutex_is_locked_by_me(client_lock);
-  std::unique_lock l(client_lock, std::defer_lock);
+  const bool held = ceph_mutex_is_locked_by_me(*this);
+  std::unique_lock<Client> l(*this, std::defer_lock);
   if (!held) {
     l.lock();
   }
@@ -4894,7 +4882,7 @@ void Client::wait_sync_caps(ceph_tid_t want)
     if (oldest_tid <= want) {
       ldout(cct, 10) << " waiting on mds." << p.first << " tid " << oldest_tid
 		     << " (want " << want << ")" << dendl;
-      sync_cond.wait(l);
+      ceph::client_lock::wait_on(*this, sync_cond, l);
       goto retry;
     }
   }
@@ -4936,7 +4924,7 @@ void Client::invalidate_snaprealm_and_children(SnapRealm *realm)
 
 SnapRealm *Client::get_snap_realm(inodeno_t r)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   SnapRealm *realm = snap_realms[r];
 
   ldout(cct, 20) << __func__ << " " << r << " " << realm << ", nref was "
@@ -4957,7 +4945,7 @@ SnapRealm *Client::get_snap_realm(inodeno_t r)
 
 SnapRealm *Client::get_snap_realm_maybe(inodeno_t r)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   auto it = snap_realms.find(r);
   if ( it == snap_realms.end()) {
     ldout(cct, 20) << __func__ << " " << r << " fail" << dendl;
@@ -4971,7 +4959,7 @@ SnapRealm *Client::get_snap_realm_maybe(inodeno_t r)
 
 void Client::put_snap_realm(SnapRealm *realm)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   ldout(cct, 20) << __func__ << " " << realm->ino << " " << realm
 		 << " " << realm->nref << " -> " << (realm->nref - 1) << dendl;
   if (--realm->nref == 0) {
@@ -5037,7 +5025,7 @@ static std::pair<SnapRealmInfo, std::optional<SnapRealmInfoMeta>> get_snap_realm
 
 void Client::update_snap_trace(MetaSession *session, const bufferlist& bl, SnapRealm **realm_ret, bool flush)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   SnapRealm *first_realm = NULL;
   ldout(cct, 10) << __func__ << " len " << bl.length() << dendl;
 
@@ -5134,7 +5122,7 @@ void Client::handle_snap(const MConstRef<MClientSnap>& m)
   ldout(cct, 10) << __func__ << " " << *m << dendl;
   mds_rank_t mds = mds_rank_t(m->get_source().num());
 
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
   auto session = _get_mds_session(mds, m->get_connection().get());
   if (!session) {
     return;
@@ -5207,7 +5195,7 @@ void Client::handle_quota(const MConstRef<MClientQuota>& m)
 {
   mds_rank_t mds = mds_rank_t(m->get_source().num());
 
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
   auto session = _get_mds_session(mds, m->get_connection().get());
   if (!session) {
     return;
@@ -5232,7 +5220,7 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
 {
   mds_rank_t mds = mds_rank_t(m->get_source().num());
 
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
   auto session = _get_mds_session(mds, m->get_connection().get());
   if (!session) {
     return;
@@ -5568,7 +5556,7 @@ public:
   }
   void finish(int r) override {
     // _async_dentry_invalidate is responsible for its own locking
-    ceph_assert(ceph_mutex_is_not_locked_by_me(client->client_lock));
+    ceph_assert(ceph_mutex_is_not_locked_by_me(*client));
     client->_async_dentry_invalidate(dirino, ino, name);
   }
 };
@@ -5826,7 +5814,7 @@ int Client::mds_check_access(std::string& path, const UserPerm& perms, int mask)
   ldout(cct, 25) << __func__ << " path " << path << ", uid " << perms.uid()
                  << ", gid " << perms.gid() << ", mask " << mask << dendl;
 
-  std::unique_lock c_lock(client_lock);
+  std::unique_lock<Client> c_lock(*this);
   if (count) {
     gid_list.reserve(count);
     for (int i = 0; i < count; ++i) {
@@ -6309,7 +6297,7 @@ int Client::resolve_mds(
  */
 int Client::authenticate()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
   if (monclient->is_authenticated()) {
     return 0;
@@ -6317,7 +6305,7 @@ int Client::authenticate()
 
   int r =0;
   {
-    unique_unlock c_unlock(client_lock);
+    ceph::unique_unlock<Client> c_unlock(*this);
     r = monclient->authenticate(std::chrono::duration<double>(mount_timeout).count());
   }
   if (r < 0) {
@@ -6332,7 +6320,7 @@ int Client::authenticate()
 
 int Client::fetch_fsmap(bool user)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
   // Retrieve FSMap to enable looking up daemon addresses.  We need FSMap
   // rather than MDSMap because no one MDSMap contains all the daemons, and
@@ -6340,7 +6328,7 @@ int Client::fetch_fsmap(bool user)
   version_t fsmap_latest;
   bs::error_code ec;
   do {
-    unique_unlock c_unlock(client_lock);
+    ceph::unique_unlock<Client> c_unlock(*this);
     std::tie(fsmap_latest, std::ignore) =
       monclient->get_version("fsmap", ca::use_blocked[ec]);
   } while (ec == bs::errc::resource_unavailable_try_again);
@@ -6392,7 +6380,7 @@ int Client::mds_command(
   if (!iref_reader.is_state_satisfied())
     return -ENOTCONN;
 
-  std::unique_lock cl(client_lock);
+  std::unique_lock<Client> cl(*this);
 
   int r;
   r = authenticate();
@@ -6590,7 +6578,7 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
   ldout(cct, 1) << __func__ << ": " << mount_root << " " << perms
                 << " required_mds=" << require_mds << " fs_name=" << fs_name << dendl;
 
-  std::unique_lock cl(client_lock);
+  std::unique_lock<Client> cl(*this);
 
   int r = subscribe_mdsmap(fs_name);
   if (r < 0) {
@@ -6673,7 +6661,7 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
 #if defined(__linux__)
   // dummy encryption?
   if (cct->_conf.get_val<bool>("client_fscrypt_dummy_encryption")) {
-    unique_unlock c_unlock(client_lock);
+    ceph::unique_unlock<Client> c_unlock(*this);
     r = fscrypt_dummy_encryption();
     if (r < 0) {
       return r;
@@ -6719,10 +6707,12 @@ void Client::_close_sessions()
     double timo = cct->_conf.get_val<std::chrono::seconds>("client_shutdown_timeout").count();
     ldout(cct, 2) << "waiting for " << mds_ranks_closing.size() << " mds session(s) to close (timeout: "
                   << timo << "s)" << dendl;
-    std::unique_lock l{client_lock, std::adopt_lock};
+    std::unique_lock<Client> l{*this, std::adopt_lock};
     if (!timo) {
-      mount_cond.wait(l);
-    } else if (!mount_cond.wait_for(l, ceph::make_timespan(timo), [this] { return mds_ranks_closing.empty(); })) {
+      ceph::client_lock::wait_mount(*this, l);
+    } else if (!ceph::client_lock::wait_mount_for(
+                 *this, l, ceph::make_timespan(timo),
+                 [this] { return mds_ranks_closing.empty(); })) {
       ldout(cct, 1) << mds_ranks_closing.size() << " mds(s) did not respond to session close -- timing out." << dendl;
       while (!mds_ranks_closing.empty()) {
         auto session = mds_sessions.at(*mds_ranks_closing.begin());
@@ -6754,7 +6744,7 @@ void Client::_force_evict_unmount_cache()
       in->mark_caps_clean();
     }
     {
-      unique_unlock unlock(client_lock);
+      ceph::unique_unlock<Client> unlock(*this);
       client_caps->prepare_inode_unmount(in);
     }
     {
@@ -6764,7 +6754,7 @@ void Client::_force_evict_unmount_cache()
       in->cap_snaps.clear();
     }
     {
-      unique_unlock unlock(client_lock);
+      ceph::unique_unlock<Client> unlock(*this);
       check_caps(InodeRef(in), CHECK_CAPS_NODELAY);
     }
     _try_to_trim_inode(in, false);
@@ -6866,7 +6856,7 @@ void Client::_unmount(bool abort)
     return;
   mref_writer.wait_readers_done();
 
-  std::unique_lock lock{client_lock};
+  std::unique_lock<Client> lock{*this};
   unmount_anchor_pins.clear();
 
   if (abort || blocklisted) {
@@ -6888,7 +6878,7 @@ void Client::_unmount(bool abort)
     flush_mdlog_sync();
   }
 
-  mount_cond.wait(lock, [this] {
+  ceph::client_lock::wait_mount(*this, lock, [this] {
     // Only wait for outstanding write OPs (skip aborted).
     for (auto& [tid, req] : mds_requests) {
       if (req->aborted())
@@ -6952,7 +6942,7 @@ void Client::_unmount(bool abort)
 	if (abort || blocklisted) {
 	  objectcacher->purge_set(&in->oset);
 	} else {
-	  unique_unlock unlock(client_lock);
+	  ceph::unique_unlock<Client> unlock(*this);
 	  client_caps->prepare_inode_unmount(in);
 	  check_caps(in, CHECK_CAPS_NODELAY | CHECK_CAPS_SYNCHRONOUS);
 	}
@@ -7004,8 +6994,8 @@ void Client::_unmount(bool abort)
     delay_put_inodes(true);
 
     // prepare_inode_unmount uses inode_lock only (see _put_inode); drop
-    // client_lock briefly to avoid ABBA with ms_dispatch.  Pin inodes first:
-    // delay_put_inodes/trim_cache may delete map entries while client_lock
+    // m_client_lock briefly to avoid ABBA with ms_dispatch.  Pin inodes first:
+    // delay_put_inodes/trim_cache may delete map entries while m_client_lock
     // is dropped.
     {
       std::vector<Inode*> pinned;
@@ -7018,7 +7008,7 @@ void Client::_unmount(bool abort)
       std::vector<Inode*> caps_inodes;
       for (Inode *in : pinned) {
 	{
-	  unique_unlock unlock(client_lock);
+	  ceph::unique_unlock<Client> unlock(*this);
 	  client_caps->prepare_inode_unmount(in);
 	}
         if (!in->caps.empty())
@@ -7028,7 +7018,7 @@ void Client::_unmount(bool abort)
         unsigned flags = CHECK_CAPS_NODELAY;
         if (i + 1 == caps_inodes.size())
           flags |= CHECK_CAPS_SYNCHRONOUS;
-        unique_unlock unlock(client_lock);
+        ceph::unique_unlock<Client> unlock(*this);
         check_caps(InodeRef(caps_inodes[i]), flags);
       }
       for (Inode *in : pinned) {
@@ -7052,7 +7042,7 @@ void Client::_unmount(bool abort)
       continue;
     }
 
-    auto r = mount_cond.wait_for(lock, ceph::make_timespan(5));
+    auto r = ceph::client_lock::wait_mount_for(*this, lock, ceph::make_timespan(5));
     // Process puts queued while we slept (e.g. from cap release paths).
     delay_put_inodes(true);
     if (r == std::cv_status::timeout &&
@@ -7193,7 +7183,7 @@ void Client::flush_cap_releases()
 
 void Client::renew_and_flush_cap_releases()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
   if (!mount_aborted && mdsmap->get_epoch()) {
     // renew caps?
@@ -7212,7 +7202,7 @@ void Client::tick()
   auto now = ceph::coarse_mono_clock::now();
 
   {
-    std::scoped_lock cl(client_lock);
+    std::scoped_lock<Client> cl(*this);
 
     /*
      * If the mount() is not finished
@@ -7266,7 +7256,7 @@ void Client::tick()
   }
 
   {
-    unique_unlock unlock(client_lock);
+    ceph::unique_unlock<Client> unlock(*this);
     // delayed caps
     client_caps->process_delayed_caps(now, mount_aborted, [this](Inode *in) {
       std::unique_lock in_lock(*in);
@@ -7321,7 +7311,7 @@ void Client::start_tick_thread()
 void Client::collect_and_send_metrics() {
   ldout(cct, 20) << __func__ << dendl;
 
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
   // right now, we only track and send global metrics. its sufficient
   // to send these metrics to MDS rank0.
@@ -7330,7 +7320,7 @@ void Client::collect_and_send_metrics() {
 
 void Client::collect_and_send_global_metrics() {
   ldout(cct, 20) << __func__ << dendl;
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
   /* Do not send the metrics until the MDS rank is ready */
   if (!mdsmap->is_active((mds_rank_t)0)) {
@@ -7509,7 +7499,7 @@ bool Client::_dentry_valid(const Dentry *dn)
   // is dn lease valid?
   utime_t now = ceph_clock_now();
   if (dn->lease_mds >= 0 && dn->lease_ttl > now) {
-    std::unique_lock lock(client_lock);
+    std::unique_lock<Client> lock(*this);
     if (auto it = mds_sessions.find(dn->lease_mds); it != mds_sessions.end()) {
       auto s = it->second;
       if (s->cap_lease_valid(dn->lease_gen)) {
@@ -7809,7 +7799,7 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
       }
 
       // get_or_create takes diri's inode_lock internally; do not hold it here.
-      // _lookup/_do_lookup may take client_lock (make_request) then inode_lock.
+      // _lookup/_do_lookup may take m_client_lock (make_request) then inode_lock.
       if (i == (path.depth() - 1)) {
         dn = get_or_create(diri.get(), dname.c_str());
       } else {
@@ -7992,7 +7982,7 @@ int Client::do_mkdirat(int dirfd, const char *relpath, mode_t mode, const UserPe
   InodeRef dirinode;
 
   {
-    std::scoped_lock lock(client_lock);
+    std::scoped_lock<Client> lock(*this);
     int r = _get_fd_inode(dirfd, &dirinode);
     if (r < 0) {
       return r;
@@ -8233,7 +8223,7 @@ int Client::_getvxattr(
 bool Client::make_absolute_path_string(const InodeRef& in, std::string& path)
 {
   {
-    std::unique_lock c_lock(client_lock);
+    std::unique_lock<Client> c_lock(*this);
     auto it = metadata.find("root");
     if (it == metadata.end() || !in)
       return false;
@@ -9086,7 +9076,7 @@ void Client::fill_statx(Inode *in, unsigned int mask, struct ceph_statx *stx)
 
 void Client::touch_dn(Dentry *dn)
 {
-  std::unique_lock lock(client_lock);
+  std::unique_lock<Client> lock(*this);
   lru.lru_touch(dn);
 }
 
@@ -9522,7 +9512,7 @@ int Client::_opendir(Inode *in, dir_result_t **dirpp, const UserPerm& perms, int
     *dirpp = new dir_result_t(in, perms, fd);
   }
   {
-    std::unique_lock c_lock(client_lock);
+    std::unique_lock<Client> c_lock(*this);
     opened_dirs.insert(*dirpp);
   }
   ldout(cct, 8) << __func__ << "(" << in->ino << ") = " << 0 << " (" << *dirpp << ")" << dendl;
@@ -9550,7 +9540,7 @@ void Client::_closedir(dir_result_t *dirp)
   }
   _readdir_drop_dirp_buffer(dirp);
   {
-    std::unique_lock c_lock(client_lock);
+    std::unique_lock<Client> c_lock(*this);
     opened_dirs.erase(dirp);
   }
 
@@ -9743,7 +9733,7 @@ struct dentry_off_lt {
 int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
 			      int caps, bool getref)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
   ldout(cct, 10) << __func__ << " " << dirp << " on " << dirp->inode->ino
 	   << " last_name " << dirp->last_name
 	   << " offset " << hex << dirp->offset << dec
@@ -10486,7 +10476,7 @@ int Client::getdir(const char *relpath, list<string>& contents,
 
 /****** file i/o **********/
 
-// common parts for open and openat. call with client_lock locked.
+// common parts for open and openat. call with m_client_lock locked.
 int Client::create_and_open(int dirfd, const char *relpath, int flags,
                             const UserPerm& perms, mode_t mode, int stripe_unit,
                             int stripe_count, int object_size, const char *data_pool,
@@ -10575,7 +10565,7 @@ int Client::create_and_open(int dirfd, const char *relpath, int flags,
     // allocate a integer file descriptor
     ceph_assert(fh);
     r = get_fd();
-    std::unique_lock lock(client_lock);
+    std::unique_lock<Client> lock(*this);
     auto [it, b] = fd_map.try_emplace(r, fh);
     ceph_assert(b);
   }
@@ -10665,7 +10655,7 @@ int Client::_lookup_vino(vinodeno_t vino, const UserPerm& perms, Inode **inode)
 
   int r = make_request(req, perms, NULL, NULL, rand() % mdsmap->get_num_in_mds());
   if (r == 0 && inode != NULL) {
-    std::scoped_lock lock(client_lock);
+    std::scoped_lock<Client> lock(*this);
     auto p = inode_map.find(vino);
     ceph_assert(p != inode_map.end());
     *inode = p->second;
@@ -11007,7 +10997,7 @@ int Client::_close(int fd)
     }
     err = _release_fh(fh);
   }
-  std::unique_lock lock(client_lock);
+  std::unique_lock<Client> lock(*this);
   fd_map.erase(fd);
   _put_fd(fd);
   ldout(cct, 3) << "close exit(" << fd << ")" << dendl;
@@ -12181,7 +12171,7 @@ void Client::C_Write_Finisher::finish_fsync(int r)
   bool fini;
   client_t const whoami = clnt->whoami;  // For the benefit of ldout prefix
 
-  ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*clnt));
 
   ldout(clnt->cct, 3) << "finish_fsync r = " << r << dendl;
 
@@ -12360,7 +12350,7 @@ int Client::WriteEncMgr::read_modify_write(Context *_iofinish)
 
   if (need_read && !async) {
 
-    ceph::unique_unlock<Inode> in_unlock(*in);
+    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
     if (finish_read_start_ctx) {
       finish_read_start_ctx->wait();
     }
@@ -12753,10 +12743,10 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
       cond_iofinish = new C_SaferCond();
       filer_iofinish.reset(cond_iofinish);
     } else {
-      //Register a wrapper callback C_Lock_Client_Finisher for the C_Write_Finisher which takes 'client_lock'.
-      //Use C_OnFinisher for callbacks. The op_cancel_writes has to be called without 'client_lock' held because
+      //Register a wrapper callback C_Lock_Client_Finisher for the C_Write_Finisher which takes 'm_client_lock'.
+      //Use C_OnFinisher for callbacks. The op_cancel_writes has to be called without 'm_client_lock' held because
       //the callback registered here needs to take it. This would cause incorrect lock order i.e., objecter->rwlock
-      //taken by objecter's op_cancel and then 'client_lock' taken by callback. To fix the lock order, queue
+      //taken by objecter's op_cancel and then 'm_client_lock' taken by callback. To fix the lock order, queue
       //the callback using the finisher
       filer_iofinish.reset(new C_OnFinisher(new C_Lock_Client_Finisher(this, iofinish.get()), &objecter_finisher));
     }
@@ -12764,7 +12754,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
     auto delay = get_injected_write_delay_secs();
     if (unlikely(delay > 0)) {
       ldout(cct, 20) << __func__ << ": delaying write for " << delay << " seconds" << dendl;
-      ceph::unique_unlock<Inode> in_unlock(*in);
+      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
       sleep(delay);
     }
 
@@ -12785,7 +12775,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
     }
 
     {
-      unique_unlock<Inode> in_unlock(*in);
+      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
 
       r = cond_iofinish->wait();
     }
@@ -12815,7 +12805,7 @@ done:
   if (nullptr != onuninline) {
     int uninline_ret = 0;
     {
-      ceph::unique_unlock<Inode> in_unlock(*in);
+      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
 
       uninline_ret = onuninline->wait();
     }
@@ -13159,7 +13149,7 @@ int Client::_fsync(Inode *in, bool syncdataonly)
   }
 
   if (nullptr != object_cacher_completion) { // wait on a real reply instead of guessing
-    ceph::unique_unlock<Inode> in_unlock(*in);
+    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
     ldout(cct, 15) << "waiting on data to flush" << dendl;
     r = object_cacher_completion->wait();
     ldout(cct, 15) << "got " << r << " from flush writeback" << dendl;
@@ -13302,7 +13292,7 @@ int Client::chdir(const char *relpath, const UserPerm& perms)
   if (!in->is_dir())
     return -ENOTDIR;
 
-  std::unique_lock cock(client_lock);
+  std::unique_lock<Client> cock(*this);
   cwd = std::move(in);
 
   ldout(cct, 3) << "chdir(" << relpath << ")  cwd now " << cwd->ino << dendl;
@@ -13383,7 +13373,7 @@ int Client::_statfs(Inode *in, struct statvfs *stbuf,
 
   int rval = 0;
   {
-    ceph::unique_unlock<Inode> in_unlock(*in);
+    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
     rval = cond.wait();
   }
 
@@ -13957,7 +13947,7 @@ int Client::sync_fs()
   if (!mref_reader.is_state_satisfied())
     return -ENOTCONN;
 
-  std::scoped_lock l(client_lock);
+  std::scoped_lock<Client> l(*this);
 
   return _sync_fs();
 }
@@ -14221,7 +14211,7 @@ int Client::ll_lookup_vino(
   if (is_reserved_vino(vino))
     return -ESTALE;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   ldout(cct, 3) << __func__ << " " << vino << dendl;
 
   // Check the cache first
@@ -14439,7 +14429,7 @@ bool Client::ll_put(Inode *in)
 
 int Client::ll_get_snap_ref(snapid_t snap)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   auto p = ll_snap_ref.find(snap);
   if (p != ll_snap_ref.end())
     return p->second;
@@ -14460,7 +14450,7 @@ Inode *Client::ll_get_inode(ino_t ino)
 
   Inode *in = nullptr;
   {
-    std::scoped_lock lock(client_lock);
+    std::scoped_lock<Client> lock(*this);
 
     vinodeno_t vino = _map_faked_ino(ino);
     auto p = inode_map.find(vino);
@@ -14484,7 +14474,7 @@ Inode *Client::ll_get_inode(vinodeno_t vino)
 
   Inode *in = nullptr;
   {
-    std::scoped_lock lock(client_lock);
+    std::scoped_lock<Client> lock(*this);
 
     auto p = inode_map.find(vino);
     if (p == inode_map.end())
@@ -16653,13 +16643,13 @@ int Client::ll_link(Inode *in, Inode *newparent, const char *newname,
 
 int Client::ll_num_osds(void)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   return objecter->with_osdmap(std::mem_fn(&OSDMap::get_num_osds));
 }
 
 int Client::ll_osdaddr(int osd, uint32_t *addr)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   entity_addr_t g;
   bool exists = objecter->with_osdmap([&](const OSDMap& o) {
@@ -16839,7 +16829,7 @@ int Client::ll_open(Inode *in, int flags, Fh **fhp, const UserPerm& perms)
  out:
   Fh *fhptr = fhp ? *fhp : NULL;
   if (fhptr) {
-    std::scoped_lock lock(client_lock);
+    std::scoped_lock<Client> lock(*this);
     ll_unclosed_fh_set.insert(fhptr);
   }
   tout(cct) << (uintptr_t)fhptr << std::endl;
@@ -16913,7 +16903,7 @@ int Client::_ll_create(Inode *parent, const char *name, mode_t mode,
 
 out:
   if (*fhp) {
-    std::scoped_lock lock(client_lock);
+    std::scoped_lock<Client> lock(*this);
     ll_unclosed_fh_set.insert(*fhp);
   }
 
@@ -17162,7 +17152,7 @@ int Client::ll_commit_blocks(Inode *in,
       return -EINVAL;
     }
 
-    std::scoped_lock lock(client_lock);
+    std::scoped_lock<Client> lock(*this);
     map<uint64_t, BarrierContext*>::iterator p = barriers.find(ino);
     if (p != barriers.end()) {
       barrier_interval civ(offset, offset + length);
@@ -17299,7 +17289,7 @@ int64_t Client::ll_preadv_pwritev(struct Fh *fh, const struct iovec *iov,
     if (retval < 0) {
       if (onfinish != nullptr) {
         //async io failed
-        ceph::unique_unlock<Inode> in_unlock(*(fh->inode));
+        ceph::unique_unlock<ceph::ReentrantLock> in_unlock(fh->inode->m_inode_lock);
         onfinish->complete(retval);
         /* async call should always return zero to caller and allow the
         caller to wait on callback for the actual errno/retval. */
@@ -17486,7 +17476,7 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
       in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
       {
-        ceph::unique_unlock<Inode> in_unlock(*in);
+        ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
         onfinish.wait();
       }
       put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
@@ -17516,7 +17506,7 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
   if (nullptr != onuninline) {
     int ret = 0;
     {
-      ceph::unique_unlock<Inode> in_unlock(*in);
+      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
       ret = onuninline->wait();
     }
 
@@ -17578,7 +17568,7 @@ int Client::ll_release(Fh *fh)
   tout(cct) << (uintptr_t)fh << std::endl;
 
   {
-    std::scoped_lock lock(client_lock);
+    std::scoped_lock<Client> lock(*this);
     ll_unclosed_fh_set.erase(fh);
   }
   return _release_fh(fh);
@@ -17625,7 +17615,7 @@ int Client::ll_flock(Fh *fh, int cmd, uint64_t owner)
 
 int Client::set_deleg_timeout(uint32_t timeout)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   /*
    * The whole point is to prevent blocklisting so we must time out the
@@ -17674,7 +17664,7 @@ public:
     req->get();
   }
   void finish(int r) override {
-    std::scoped_lock l(client->client_lock);
+    std::scoped_lock<Client> l(*client);
     ceph_assert(req->head.op == CEPH_MDS_OP_SETFILELOCK);
     client->_interrupt_filelock(req);
     client->put_request(req);
@@ -17739,7 +17729,7 @@ int64_t Client::get_default_pool_id()
   if (!mref_reader.is_state_satisfied())
     return -ENOTCONN;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   /* first data pool is the default */ 
   return mdsmap->get_first_data_pool(); 
@@ -17753,7 +17743,7 @@ int64_t Client::get_pool_id(const char *pool_name)
   if (!mref_reader.is_state_satisfied())
     return -ENOTCONN;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   return objecter->with_osdmap(std::mem_fn(&OSDMap::lookup_pg_pool_name),
 			       pool_name);
@@ -17765,7 +17755,7 @@ string Client::get_pool_name(int64_t pool)
   if (!mref_reader.is_state_satisfied())
     return string();
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   return objecter->with_osdmap([pool](const OSDMap& o) {
       return o.have_pg_pool(pool) ? o.get_pool_name(pool) : string();
@@ -17778,7 +17768,7 @@ int Client::get_pool_replication(int64_t pool)
   if (!mref_reader.is_state_satisfied())
     return -ENOTCONN;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   return objecter->with_osdmap([pool](const OSDMap& o) {
       return o.have_pg_pool(pool) ? o.get_pg_pool(pool)->get_size() : -ENOENT;
@@ -17803,7 +17793,7 @@ int Client::get_file_extent_osds(int fd, loff_t off, loff_t *len, vector<int>& o
     ceph_assert(extents.size() == 1);
   }
 
-  std::unique_lock lock(client_lock);
+  std::unique_lock<Client> lock(*this);
   objecter->with_osdmap([&](const OSDMap& o) {
       pg_t pg = o.object_locator_to_pg(extents[0].oid, extents[0].oloc);
       o.pg_to_acting_osds(pg, osds);
@@ -17840,7 +17830,7 @@ int Client::get_osd_crush_location(int id, vector<pair<string, string> >& path)
   if (!mref_reader.is_state_satisfied())
     return -ENOTCONN;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   if (id < 0)
     return -EINVAL;
@@ -17870,7 +17860,7 @@ int Client::get_file_stripe_address(int fd, loff_t offset,
                              in->truncate_size, extents);
     ceph_assert(extents.size() == 1);
   }
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   // now we have the object and its 'layout'
   return objecter->with_osdmap([&](const OSDMap& o) {
@@ -17893,7 +17883,7 @@ int Client::get_osd_addr(int osd, entity_addr_t& addr)
   if (!mref_reader.is_state_satisfied())
     return -ENOTCONN;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   return objecter->with_osdmap([&](const OSDMap& o) {
       if (!o.exists(osd))
@@ -17933,7 +17923,7 @@ int Client::get_local_osd()
   if (!mref_reader.is_state_satisfied())
     return -ENOTCONN;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   objecter->with_osdmap([this](const OSDMap& o) {
       if (o.get_epoch() != local_osd_epoch) {
@@ -17993,7 +17983,7 @@ void Client::ms_handle_remote_reset(Connection *con)
     return 0;
   });
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
   switch (con->get_peer_type()) {
   case CEPH_ENTITY_TYPE_MDS:
     {
@@ -18071,7 +18061,7 @@ bool Client::ms_handle_refused(Connection *con)
 
 Inode *Client::get_quota_root(Inode *in, const UserPerm& perms, quota_max_t type)
 {
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
   Inode *quota_in = root_ancestor;
   SnapRealm *realm = in->snaprealm;
 
@@ -18170,7 +18160,7 @@ enum {
 
 int Client::check_pool_perm(Inode *in, int need)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
   ceph_assert(ceph_mutex_is_locked_by_me(*in));
 
   if (!cct->_conf->client_check_pool_perm)
@@ -18231,8 +18221,8 @@ int Client::check_pool_perm(Inode *in, int need)
     int rd_ret = 0;
     int wr_ret = 0;
     {
-      unique_unlock client_unlock(client_lock);
-      unique_unlock<Inode> in_unlock(*in);
+      ceph::unique_unlock<Client> client_unlock(*this);
+      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
 
       rd_ret = rd_cond.wait();
       wr_ret = wr_cond.wait();
@@ -18377,7 +18367,7 @@ out:
 
 void Client::set_filer_flags(int flags)
 {
-  std::scoped_lock l(client_lock);
+  std::scoped_lock<Client> l(*this);
   ceph_assert(flags == 0 ||
 	 flags == CEPH_OSD_FLAG_LOCALIZE_READS);
   objecter->add_global_op_flags(flags);
@@ -18385,7 +18375,7 @@ void Client::set_filer_flags(int flags)
 
 void Client::clear_filer_flags(int flags)
 {
-  std::scoped_lock l(client_lock);
+  std::scoped_lock<Client> l(*this);
   ceph_assert(flags == CEPH_OSD_FLAG_LOCALIZE_READS);
   objecter->clear_global_op_flag(flags);
 }
@@ -18396,7 +18386,7 @@ void Client::set_uuid(const std::string& uuid)
   RWRef_t iref_reader(initialize_state, CLIENT_INITIALIZED);
   ceph_assert(iref_reader.is_state_satisfied());
 
-  std::scoped_lock l(client_lock);
+  std::scoped_lock<Client> l(*this);
   ceph_assert(!uuid.empty());
 
   metadata["uuid"] = uuid;
@@ -18615,7 +18605,7 @@ void Client::set_session_timeout(unsigned timeout)
   RWRef_t iref_reader(initialize_state, CLIENT_INITIALIZED);
   ceph_assert(iref_reader.is_state_satisfied());
 
-  std::scoped_lock l(client_lock);
+  std::scoped_lock<Client> l(*this);
 
   metadata["timeout"] = stringify(timeout);
 }
@@ -18631,7 +18621,7 @@ int Client::start_reclaim(const std::string& uuid, unsigned flags,
   if (uuid.empty())
     return -EINVAL;
 
-  std::unique_lock l(client_lock);
+  std::unique_lock<Client> l(*this);
   {
     auto it = metadata.find("uuid");
     if (it != metadata.end() && it->second == uuid)
@@ -18745,7 +18735,7 @@ void Client::handle_client_reclaim_reply(const MConstRef<MClientReclaimReply>& r
   mds_rank_t from = mds_rank_t(reply->get_source().num());
   ldout(cct, 10) << __func__ << " " << *reply << " from mds." << from << dendl;
 
-  std::scoped_lock cl(client_lock);
+  std::scoped_lock<Client> cl(*this);
   auto session = _get_mds_session(from, reply->get_connection().get());
   if (!session) {
     ldout(cct, 10) << " discarding reclaim reply from sessionless mds." <<  from << dendl;
@@ -18814,7 +18804,7 @@ void Client::handle_conf_change(const ConfigProxy& conf,
 {
   ldout(cct, 20) << "got conf changes: " << changed << dendl;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock<Client> lock(*this);
 
   if (changed.count("client_permissions")) {
     client_permissions = cct->_conf.get_val<bool>("client_permissions");
@@ -18886,7 +18876,7 @@ void intrusive_ptr_release(Inode *in)
 
 mds_rank_t Client::_get_random_up_mds() const
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
   std::set<mds_rank_t> up;
   mdsmap->get_up_mds_set(up);
@@ -19011,7 +19001,7 @@ int Client::fcopyfile(const char *spath, const char *dpath, UserPerm& perms, mod
 
   walk_dentry_result wdrsrc;
   {
-    std::scoped_lock lock(client_lock);
+    std::scoped_lock<Client> lock(*this);
     if (int rc = path_walk(cwd, spath, &wdrsrc, perms, {.followsym = false}); rc < 0) {
       return rc;
     }
@@ -19107,31 +19097,12 @@ int Client::fcopyfile(const char *spath, const char *dpath, UserPerm& perms, mod
   return 0;
 }
 
-void Client::lock() const {
-  client_lock.lock();
-}
-
-bool Client::try_lock() const {
-  return client_lock.try_lock();
-}
-
-void Client::unlock() const {
-  client_lock.unlock();
-}
-
 bool Client::is_locked() const {
-  return client_lock.is_locked();
+  return m_client_lock.is_locked();
 }
+
 bool Client::is_locked_by_me() const {
-  return client_lock.is_locked_by_me();
-}
-
-int Client::release_for_wait() noexcept {
-  return client_lock.release_for_wait();
-}
-
-void Client::restore_after_wait(int saved) noexcept {
-  client_lock.restore_after_wait(saved);
+  return m_client_lock.is_locked_by_me();
 }
 
 StandaloneClient::StandaloneClient(Messenger *m, MonClient *mc,
@@ -19156,7 +19127,7 @@ int StandaloneClient::init()
   _pre_init();
   objecter->init();
 
-  client_lock.lock();
+  std::scoped_lock<Client> client_guard(*this);
 
   messenger->add_dispatcher_tail(objecter);
   messenger->add_dispatcher_tail(this);
@@ -19170,7 +19141,6 @@ int StandaloneClient::init()
       timer.shutdown();
     }
 
-    client_lock.unlock();
     objecter->shutdown();
     objectcacher->stop();
     monclient->shutdown();
@@ -19185,7 +19155,6 @@ int StandaloneClient::init()
       timer.shutdown();
     }
 
-    client_lock.unlock();
     objecter->shutdown();
     objectcacher->stop();
     monclient->shutdown();
@@ -19194,7 +19163,6 @@ int StandaloneClient::init()
 
   objecter->start();
 
-  client_lock.unlock();
   _finish_init();
   iref_writer.update_state(CLIENT_INITIALIZED);
 

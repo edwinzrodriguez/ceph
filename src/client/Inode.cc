@@ -1010,7 +1010,7 @@ bool Inode::is_locked_by_me() const {
 
 ceph::ReentrantLock& Inode::get_client_lock() const
 {
-  return client->client_lock;
+  return client->m_client_lock;
 }
 
 int Inode::release_for_wait() noexcept {

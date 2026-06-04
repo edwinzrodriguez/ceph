@@ -142,8 +142,6 @@ private:
       _inode_acquired = false;
     }
     if (_client_unlock) {
-      // lock() re-acquired client_lock; abandon so ~unique_unlock does not
-      // restore the depth we already released (would strand recursion_count).
       _client_unlock->abandon();
       _client_unlock.reset();
     }

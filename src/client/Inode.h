@@ -136,12 +136,14 @@ template <> class scoped_lock<Inode>;
 struct Inode : RefCountedObject {
   friend class std::unique_lock<Inode>;
   friend class std::scoped_lock<Inode>;
-  friend class unique_unlock<Inode>;
 
   ceph::coarse_mono_time hold_caps_until;
   Client *client;
 
   ceph::ReentrantLock& get_client_lock() const;
+
+  // mutable ceph::mutex inode_lock = ceph::make_mutex("Inode::inode_lock");
+  mutable ceph::ReentrantLock m_inode_lock = ceph::make_reentrant("Inode::inode_lock", false); // disable deadlock detection
 
   bool is_locked() const;
   bool is_locked_by_me() const;
@@ -434,10 +436,6 @@ private:
 
   void break_deleg(bool skip_read);
   bool delegations_broken(bool skip_read);
-
-  // mutable ceph::mutex inode_lock = ceph::make_mutex("Inode::inode_lock");
-  mutable ceph::ReentrantLock m_inode_lock = ceph::make_reentrant("Inode::inode_lock", false); // disable deadlock detection
-
 };
 
 inline Cap::~Cap() {
