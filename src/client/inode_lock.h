@@ -4,8 +4,8 @@
 #ifndef CEPH_CLIENT_INODE_LOCK_H
 #define CEPH_CLIENT_INODE_LOCK_H
 
+#include <memory>
 #include <mutex>
-#include <optional>
 
 #include "common/ceph_mutex.h"
 #include "common/reentrant_lock.h"
@@ -59,7 +59,8 @@ public:
     }
     auto& client = _in->get_client_lock();
     if (ceph_mutex_is_locked_by_me(client)) {
-      _client_unlock.emplace(client, std::defer_lock);
+      _client_unlock = std::make_unique<ceph::unique_unlock<ceph::ReentrantLock>>(
+        client, std::defer_lock);
       _client_unlock->release();
     }
     if (!_in->is_locked_by_me()) {
@@ -80,7 +81,8 @@ public:
     auto& client = _in->get_client_lock();
     const bool had_client = ceph_mutex_is_locked_by_me(client);
     if (had_client) {
-      _client_unlock.emplace(client, std::defer_lock);
+      _client_unlock = std::make_unique<ceph::unique_unlock<ceph::ReentrantLock>>(
+        client, std::defer_lock);
       _client_unlock->release();
     }
     if (_in->is_locked_by_me()) {
@@ -109,6 +111,11 @@ public:
       _in->m_inode_lock.unlock();
       _inode_acquired = false;
     }
+    if (_client_unlock) {
+      // lock() re-acquired client_lock; abandon so we do not restore twice.
+      _client_unlock->abandon();
+      _client_unlock.reset();
+    }
     _owns = false;
   }
 
@@ -126,14 +133,18 @@ private:
   void finish()
   {
     if (_inode_acquired) {
-      _in->m_inode_lock.unlock();
+      // Another path may have dropped m_inode_lock via release_for_wait +
+      // abandon (e.g. _create's make_request) while this guard still has
+      // _inode_acquired set.
+      if (_in->is_locked_by_me()) {
+        _in->m_inode_lock.unlock();
+      }
       _inode_acquired = false;
     }
     if (_client_unlock) {
-      auto& client = _in->get_client_lock();
-      if (ceph_mutex_is_locked_by_me(client)) {
-        client.unlock();
-      }
+      // lock() re-acquired client_lock; abandon so ~unique_unlock does not
+      // restore the depth we already released (would strand recursion_count).
+      _client_unlock->abandon();
       _client_unlock.reset();
     }
     _owns = false;
@@ -142,7 +153,7 @@ private:
   const Inode *_in;
   bool _owns;
   bool _inode_acquired;
-  std::optional<ceph::unique_unlock<ceph::ReentrantLock>> _client_unlock;
+  std::unique_ptr<ceph::unique_unlock<ceph::ReentrantLock>> _client_unlock;
 };
 
 template <>
