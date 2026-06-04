@@ -89,6 +89,7 @@ public:
   // Called by reentrant_condition_variable before blocking: saves recursion
   // depth and marks the lock as released so other threads can acquire it.
   int release_for_wait() noexcept {
+    ceph_assert(is_locked_by_me());
     int saved = recursion_count.load(std::memory_order_relaxed);
     owner.store({}, std::memory_order_release);
     recursion_count.store(0, std::memory_order_relaxed);
@@ -282,13 +283,18 @@ public:
     if (!m_released || m_saved <= 0) {
       return;
     }
-    if (!m_lock.is_locked_by_me()) {
-      // The native mutex may already be held if this thread re-acquired
-      // client_lock while the lock was released (e.g. during monclient I/O).
-#ifdef CEPH_DEBUG_MUTEX
-      if (!ceph_mutex_is_locked_by_me(m_lock.native_mutex()))
-#endif
-        m_lock.native_mutex().lock();
+    if (m_lock.is_locked_by_me()) {
+      // Same thread already re-acquired via lock() (e.g. monclient I/O).
+      m_lock.restore_after_wait(m_saved);
+      return;
+    }
+    // Another thread may have taken the lock after release().  Do not block
+    // on native_mutex().lock() here: that would restore owner/recursion_count
+    // on this thread after the other thread already owns the lock, leaking the
+    // pthread mutex to a stale owner (classic bench deadlock: main in join,
+    // ms_dispatch in wait_on, workers blocked on open).
+    if (!m_lock.native_mutex().try_lock()) {
+      return;
     }
     m_lock.restore_after_wait(m_saved);
   }
