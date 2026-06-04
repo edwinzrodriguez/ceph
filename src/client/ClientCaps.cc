@@ -625,11 +625,17 @@ int ClientCaps::get_caps_issued(const char *path, const UserPerm& perms)
 
 void ClientCaps::wait_on_context_list(std::vector<Context*>& ls)
 {
-  std::unique_lock l{caps_lock};
   reentrant_condition_variable cond;
   bool done = false;
   int r;
   ls.push_back(new C_ReentrantCond(cond, &done, &r));
+  wait_on_context_cond(cond, done);
+}
+
+void ClientCaps::wait_on_context_cond(
+  reentrant_condition_variable& cond, bool& done)
+{
+  std::unique_lock l{caps_lock};
   cond.wait(l, [&done] { return done;});
 }
 
@@ -969,7 +975,7 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	 }
 	 if (in->wanted_max_size > in->max_size &&
 	     in->wanted_max_size > in->requested_max_size)
-	   check_caps(in, 0);
+	   check_caps(in, Client::CHECK_CAPS_NODELAY);
       }
 
       if (endoff >= 0 && endoff > (loff_t)in->max_size) {
@@ -1045,14 +1051,18 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	}
 	check_caps(in, Client::CHECK_CAPS_NODELAY);
       }
-      // Do not hold the inode lock while sleeping: cap grants (ms_dispatch)
-      // and inode cleanup (tick -> _put_inode) also need it.
+      // Register on wait_list before dropping inode_lock: ms_dispatch may
+      // call signal_caps_inode as soon as the grant is applied.
+      reentrant_condition_variable cond;
+      bool done = false;
+      int r = 0;
+      wait_list.push_back(new C_ReentrantCond(cond, &done, &r));
       const bool had_inode = in->is_locked_by_me();
       if (had_inode) {
 	ceph::unique_unlock<Inode> in_unlock(*in);
-	wait_on_context_list(wait_list);
+	wait_on_context_cond(cond, done);
       } else {
-	wait_on_context_list(wait_list);
+	wait_on_context_cond(cond, done);
       }
     }
   }
