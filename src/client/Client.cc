@@ -3175,6 +3175,7 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
     ceph::unique_unlock<Client> cl_unlock(*this);
     insert_trace(request, session.get());
   }
+  cl.lock();
 
   // Handle unsafe reply
   if (!is_safe) {
@@ -3912,6 +3913,7 @@ void Client::delay_put_inodes(bool wakeup)
       _put_inode(in, cnt);
     }
   }
+  ceph::client_lock::reacquire_after_drop(*this);
 
   if (wakeup)
     mount_cond.notify_all();
@@ -4372,12 +4374,7 @@ void Client::wait_on_context_list(std::vector<Context*>& ls)
 
 void Client::signal_caps_inode(Inode *in)
 {
-  // Process the waitfor_caps list
-  signal_context_list(in->waitfor_caps);
-
-  // New items may have been added to the pending list, move them onto the
-  // waitfor_caps list
-  std::swap(in->waitfor_caps, in->waitfor_caps_pending);
+  client_caps->signal_caps_inode(in);
 }
 
 void Client::wake_up_session_caps(MetaSession *s, bool reconnect)
@@ -5705,10 +5702,12 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
     in->change_attr = m->get_change_attr();
 
   // max_size
+  bool max_size_changed = false;
   if (cap == in->auth_cap &&
       (new_caps & CEPH_CAP_ANY_FILE_WR) &&
       (m->get_max_size() != in->max_size)) {
     ldout(cct, 10) << "max_size " << in->max_size << " -> " << m->get_max_size() << dendl;
+    max_size_changed = true;
     in->max_size = m->get_max_size();
     if (in->max_size > in->wanted_max_size) {
       in->wanted_max_size = 0;
@@ -5787,8 +5786,8 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
   if (check)
     check_caps(in, flags);
 
-  // wake up waiters
-  if (new_caps) {
+  // wake up waiters (including get_caps sleeping on max_size)
+  if (new_caps || max_size_changed) {
     ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
     signal_caps_inode(in);
   }
@@ -6308,6 +6307,7 @@ int Client::authenticate()
     ceph::unique_unlock<Client> c_unlock(*this);
     r = monclient->authenticate(std::chrono::duration<double>(mount_timeout).count());
   }
+  ceph::client_lock::reacquire_after_drop(*this);
   if (r < 0) {
     return r;
   }
@@ -6331,6 +6331,7 @@ int Client::fetch_fsmap(bool user)
     ceph::unique_unlock<Client> c_unlock(*this);
     std::tie(fsmap_latest, std::ignore) =
       monclient->get_version("fsmap", ca::use_blocked[ec]);
+    ceph::client_lock::reacquire_after_drop(*this);
   } while (ec == bs::errc::resource_unavailable_try_again);
 
   if (ec) {
@@ -6663,6 +6664,7 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
   if (cct->_conf.get_val<bool>("client_fscrypt_dummy_encryption")) {
     ceph::unique_unlock<Client> c_unlock(*this);
     r = fscrypt_dummy_encryption();
+    cl.lock();
     if (r < 0) {
       return r;
     }
@@ -6747,6 +6749,7 @@ void Client::_force_evict_unmount_cache()
       ceph::unique_unlock<Client> unlock(*this);
       client_caps->prepare_inode_unmount(in);
     }
+    ceph::client_lock::reacquire_after_drop(*this);
     {
       std::unique_lock in_lock(*in);
       if (!in->caps.empty())
@@ -6757,6 +6760,7 @@ void Client::_force_evict_unmount_cache()
       ceph::unique_unlock<Client> unlock(*this);
       check_caps(InodeRef(in), CHECK_CAPS_NODELAY);
     }
+    ceph::client_lock::reacquire_after_drop(*this);
     _try_to_trim_inode(in, false);
     int extra = 0;
     {
@@ -6768,6 +6772,7 @@ void Client::_force_evict_unmount_cache()
   }
 
   trim_cache();
+  ceph::client_lock::reacquire_after_drop(*this);
   delay_put_inodes(true);
   mount_cond.notify_all();
 }
@@ -6946,6 +6951,7 @@ void Client::_unmount(bool abort)
 	  client_caps->prepare_inode_unmount(in);
 	  check_caps(in, CHECK_CAPS_NODELAY | CHECK_CAPS_SYNCHRONOUS);
 	}
+	lock.lock();
       }
     }
     for (Inode *in : anchor) {
@@ -7031,6 +7037,7 @@ void Client::_unmount(bool abort)
       for (Inode *in : pinned)
 	put_inode(in, 1);
     }
+    lock.lock();
     flush_caps_sync();
     wait_sync_caps(last_flush_tid);
     delay_put_inodes(true);
@@ -18227,6 +18234,7 @@ int Client::check_pool_perm(Inode *in, int need)
       rd_ret = rd_cond.wait();
       wr_ret = wr_cond.wait();
     }
+    ceph::client_lock::reacquire_after_drop(*this);
 
     bool errored = false;
 

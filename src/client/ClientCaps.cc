@@ -641,12 +641,10 @@ void ClientCaps::wait_on_context_cond(
 
 void ClientCaps::signal_caps_inode(Inode *in)
 {
-  // Process the waitfor_caps list
+  std::unique_lock l(caps_lock);
   signal_context_list(in->waitfor_caps);
-
-  // New items may have been added to the pending list, move them onto the
-  // waitfor_caps list
   std::swap(in->waitfor_caps, in->waitfor_caps_pending);
+  signal_context_list(in->waitfor_caps);
 }
 
 // Stub implementations for methods that need more complex refactoring
@@ -1041,6 +1039,13 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 
     if (waitfor_caps || waitfor_commit) {
       auto& wait_list = waitfor_caps ? in->waitfor_caps : in->waitfor_commit;
+      reentrant_condition_variable cond;
+      bool done = false;
+      int r = 0;
+      // Register before check_caps / ms_dispatch: a grant can arrive as soon as
+      // the MDS sees our cap update; signaling an empty waitfor_caps leaves the
+      // waiter stuck with done=false even after max_size is granted.
+      wait_list.push_back(new C_ReentrantCond(cond, &done, &r));
       if (waitfor_caps) {
 	// We may have already sent a max_size request (requested_max_size ==
 	// wanted_max_size) but the MDS grant was still too small.  Allow
@@ -1050,19 +1055,50 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	  in->requested_max_size = 0;
 	}
 	check_caps(in, Client::CHECK_CAPS_NODELAY);
+	// Grant may have been applied before we registered; don't sleep if so.
+	if (endoff >= 0 && endoff <= (loff_t)in->max_size) {
+	  bool snap_writing = false;
+	  if (!in->cap_snaps.empty()) {
+	    snap_writing = in->cap_snaps.rbegin()->second.writing;
+	  }
+	  if (!snap_writing) {
+	    waitfor_caps = false;
+	  }
+	}
       }
-      // Register on wait_list before dropping inode_lock: ms_dispatch may
-      // call signal_caps_inode as soon as the grant is applied.
-      reentrant_condition_variable cond;
-      bool done = false;
-      int r = 0;
-      wait_list.push_back(new C_ReentrantCond(cond, &done, &r));
+      if (!waitfor_caps && !waitfor_commit) {
+	// ms_dispatch may have already finish()ed our context after push_back.
+	if (!wait_list.empty()) {
+	  signal_context_list(wait_list);
+	}
+	continue;
+      }
+      // Drop client_lock when held so ms_dispatch can take scoped_lock<Client>
+      // in handle_caps.  ll_write/ll_read usually hold only inode_lock (see
+      // inode_lock.h: client_lock is not taken unless already held).
+      const bool had_client = client->is_locked_by_me();
+      ceph::unique_unlock<Client> cl_drop(*client, std::defer_lock);
+      if (had_client) {
+	cl_drop.release();
+      }
       const bool had_inode = in->is_locked_by_me();
       if (had_inode) {
-	ceph::unique_unlock<Inode> in_unlock(*in);
-	wait_on_context_cond(cond, done);
+	{
+	  ceph::unique_unlock<Inode> in_unlock(*in, std::defer_lock);
+	  in_unlock.release();
+	  wait_on_context_cond(cond, done);
+	  // Do not let ~unique_unlock try_lock-restore while handle_cap_grant may
+	  // still hold inode_lock on this thread.
+	  in_unlock.abandon();
+	}
+	if (!in->is_locked_by_me()) {
+	  in->m_inode_lock.lock();
+	}
       } else {
 	wait_on_context_cond(cond, done);
+      }
+      if (had_client) {
+	ceph::client_lock::reacquire_after_drop(*client);
       }
     }
   }
