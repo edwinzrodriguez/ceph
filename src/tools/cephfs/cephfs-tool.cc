@@ -197,12 +197,14 @@ static void async_io_callback(struct ceph_ll_io_info* cb_info) {
     *(ctx->stop_signal_ptr) = true;
   }
   
-  ctx->completed = true;
-  
-  // Release semaphore to signal slot availability
+  // Release semaphore to signal slot availability BEFORE marking as completed
+  // This ensures the callback finishes all work before the main thread can proceed
   if (ctx->semaphore_ptr) {
     ctx->semaphore_ptr->release();
   }
+  
+  // Mark as completed last - this signals to the main thread that it's safe to proceed
+  ctx->completed = true;
 }
 
 // --- Setup Helper (Updated to use stream for output) ---
