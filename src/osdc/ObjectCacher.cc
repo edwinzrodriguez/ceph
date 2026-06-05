@@ -837,6 +837,22 @@ void ObjectCacher::bh_read(BufferHead *bh, int op_flags,
   ++reads_outstanding;
 }
 
+// Run read finish waiters without cache_lock.  In-thread finish_contexts from
+// bh_read_finish caused cache_lock -> inode_lock inversions when
+// C_Read_Async_Finisher::do_readahead calls Inode::effective_size() while a
+// reader thread holds the inode lock and waits on cache_lock in _readx.
+class ObjectCacher::C_BHReadFinishWaiters : public Context {
+  CephContext *cct;
+  std::list<Context*> waiters;
+  int r;
+public:
+  C_BHReadFinishWaiters(CephContext *c, std::list<Context*>&& ls, int _r)
+    : cct(c), waiters(std::move(ls)), r(_r) {}
+  void finish(int) override {
+    finish_contexts(cct, waiters, r);
+  }
+};
+
 void ObjectCacher::bh_read_finish(int64_t poolid, sobject_t oid,
 				  ceph_tid_t tid, loff_t start,
 				  uint64_t length, bufferlist &bl, int r,
@@ -1009,7 +1025,14 @@ void ObjectCacher::bh_read_finish(int64_t poolid, sobject_t oid,
   // called with lock held.
   ldout(cct, 20) << "finishing waiters " << ls << dendl;
 
-  finish_contexts(cct, ls, err);
+  std::list<Context*> waiters;
+  waiters.swap(ls);
+  cl.unlock();
+  if (!waiters.empty()) {
+    finisher.queue(new C_BHReadFinishWaiters(cct, std::move(waiters), err));
+  }
+  cl.lock();
+
   retry_waiting_reads();
 
   --reads_outstanding;

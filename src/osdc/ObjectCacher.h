@@ -706,6 +706,7 @@ class ObjectCacher {
   class C_WaitForWrite;
   class C_FlushSetCallback;
   class C_BHWriteCommitWaiters;
+  class C_BHReadFinishWaiters;
 
   void perf_start();
   void perf_stop();
