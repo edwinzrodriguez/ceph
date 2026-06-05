@@ -12189,7 +12189,7 @@ void Client::C_Write_Finisher::finish_fsync(int r)
   bool fini;
   client_t const whoami = clnt->whoami;  // For the benefit of ldout prefix
 
-  ceph_assert(ceph_mutex_is_locked_by_me(*clnt));
+  std::unique_lock in_lock(*in);
 
   ldout(clnt->cct, 3) << "finish_fsync r = " << r << dendl;
 
@@ -12204,6 +12204,8 @@ void Client::C_Write_Finisher::finish_fsync(int r)
 bool Client::C_Write_Finisher::try_complete()
 {
   client_t const whoami = clnt->whoami;  // For the benefit of ldout prefix
+
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
 
   ldout(clnt->cct, 19) << "C_Write_Finisher::try_complete this " << this 
                        << " onuninlinefinished " << onuninlinefinished
@@ -12222,19 +12224,26 @@ bool Client::C_Write_Finisher::try_complete()
     state->advance();
   } else if (onuninlinefinished && iofinished) {
     // Now we are REALLY done...
+    if (onfinish_done) {
+      return false;
+    }
+    onfinish_done = true;
+
     clnt->put_cap_ref(in, CEPH_CAP_FILE_WR);
 
-    if (fsync_r < 0) {
-      ldout(clnt->cct, 19) << " complete with fsync_r " << fsync_r << dendl;
-      onfinish->complete(fsync_r);
-    } else if (onuninlinefinished_r < 0 && onuninlinefinished_r != -ECANCELED) {
-      ldout(clnt->cct, 19) << " complete with onuninlinefinished_r " << onuninlinefinished_r << dendl;
-      onfinish->complete(onuninlinefinished_r);
-    } else {
-      ldout(clnt->cct, 19) << " complete with iofinished_r " << iofinished_r << dendl;
-      onfinish->complete(iofinished_r);
+    if (onfinish) {
+      if (fsync_r < 0) {
+        ldout(clnt->cct, 19) << " complete with fsync_r " << fsync_r << dendl;
+        onfinish->complete(fsync_r);
+      } else if (onuninlinefinished_r < 0 && onuninlinefinished_r != -ECANCELED) {
+        ldout(clnt->cct, 19) << " complete with onuninlinefinished_r " << onuninlinefinished_r << dendl;
+        onfinish->complete(onuninlinefinished_r);
+      } else {
+        ldout(clnt->cct, 19) << " complete with iofinished_r " << iofinished_r << dendl;
+        onfinish->complete(iofinished_r);
+      }
+      onfinish = nullptr;
     }
-    onfinish = nullptr;
     return true;
   }
 

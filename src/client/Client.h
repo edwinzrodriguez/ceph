@@ -1946,6 +1946,7 @@ private:
     bool iofinished;
     bool onuninlinefinished;
     bool fsync_finished;
+    bool onfinish_done = false;
     bool try_complete();
   };
 
