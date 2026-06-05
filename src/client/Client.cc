@@ -8498,6 +8498,7 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
 
 
       if (r == 0) {
+        ceph::unique_unlock<Inode> in_unlock(*in);
         r = io_finish_cond->wait();
       }
       put_cap_ref(in, CEPH_CAP_FILE_CACHE);
@@ -11633,8 +11634,8 @@ Client::C_Readahead::~C_Readahead() {
 
 void Client::C_Readahead::finish(int r) {
   lgeneric_subdout(client->cct, client, 20) << "client." << client->get_nodeid() << " " << "C_Readahead on " << f->inode << dendl;
-  // Called from ObjectCacher with cache_lock held, need to acquire inode_lock
-  std::scoped_lock l(*(f->inode));
+  // put_cap_ref acquires inode_lock; do not block here on a second lock attempt
+  // while a reader may hold inode_lock across an objectcacher wait.
   client->put_cap_ref(f->inode.get(), CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
   if (r > 0) {
     client->update_read_io_size(r);
@@ -11787,8 +11788,11 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
     return 0;
   }
 
-  // Wait for the blocking read to complete and then do readahead
+  // Wait for the blocking read to complete and then do readahead.
+  // Release inode_lock while waiting so tick/_put_inode and read finishers
+  // (e.g. C_Readahead) can take the inode lock.
   if (r == 0) {
+    ceph::unique_unlock<Inode> in_unlock(*in);
     r = io_finish_cond->wait();
     put_cap_ref(in, CEPH_CAP_FILE_CACHE);
   } else {
@@ -11859,6 +11863,7 @@ uint64_t read_start;
 
   // 0 success, 1 continue and < 0 error happen.
   auto wait_and_copy = [&](C_SaferCond &onfinish, bufferlist &tbl, int wanted) {
+    ceph::unique_unlock<Inode> in_unlock(*in);
     int r = onfinish.wait();
 
     // if we get ENOENT from OSD, assume 0 bytes returned
