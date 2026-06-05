@@ -94,6 +94,9 @@ public:
     return true;
   }
 
+  // Reverse the action of locking, first release
+  // the client lock then reacquire the client_lock if
+  // was previously held.
   void unlock()
   {
     _rl.unlock();
@@ -171,6 +174,7 @@ public:
     _inner._abandon();
   }
 
+  // Let _inner destructor restore the lock
   ~unique_unlock() noexcept(false) = default;
 
   unique_unlock(const unique_unlock&) = delete;

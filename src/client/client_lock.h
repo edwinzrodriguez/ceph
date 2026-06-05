@@ -107,6 +107,10 @@ private:
 
 namespace ceph {
 
+// Used to temporarily release the lock on an Inode object
+// using unique_unlock<ReentrantLock> to correctly save and
+// restore the recursion count. The destructor should leave
+// the lock in the same state as it was before the unlock.
 template <>
 class unique_unlock<Client> {
 public:
