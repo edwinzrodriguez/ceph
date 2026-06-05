@@ -220,12 +220,14 @@ static void async_io_callback(struct ceph_ll_io_info* cb_info) {
     *(ctx->stop_signal_ptr) = true;
   }
   
-  ctx->completed = true;
-  
-  // Release semaphore to signal slot availability
+  // Release semaphore to signal slot availability BEFORE marking as completed
+  // This ensures the callback finishes all work before the main thread can proceed
   if (ctx->semaphore_ptr) {
     ctx->semaphore_ptr->release();
   }
+  
+  // Mark as completed last - this signals to the main thread that it's safe to proceed
+  ctx->completed = true;
 }
 
 // --- Setup Helper (Updated to use stream for output) ---
@@ -724,6 +726,14 @@ bench_async_write_worker(
       break;
     }
   }
+
+  // Wait for ALL outstanding I/Os to complete before exiting thread
+  // This includes any operations that may still be in flight
+  for (auto& ctx : io_queue) {
+    while (!ctx->completed.load()) {
+      std::this_thread::yield();
+    }
+  }
 }
 
 // Worker function for Read phase
@@ -1031,6 +1041,14 @@ bench_async_read_worker(
 
     if (read_error) {
       break;
+    }
+  }
+
+  // Wait for ALL outstanding I/Os to complete before exiting thread
+  // This includes any readahead operations that may have been triggered
+  for (auto& ctx : io_queue) {
+    while (!ctx->completed.load()) {
+      std::this_thread::yield();
     }
   }
 }
