@@ -328,7 +328,7 @@ private:
   // Protects Client state and the buffer cache.  Acquire only through
   // std::unique_lock<Client> / std::scoped_lock<Client> (client_lock.h).
   mutable ceph::ReentrantLock m_client_lock =
-    ceph::make_reentrant("Client::m_client_lock", false);
+    ceph::make_reentrant("Client::m_client_lock", true);
 
   ceph::ReentrantLock& get_client_lock() { return m_client_lock; }
 

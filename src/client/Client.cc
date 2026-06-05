@@ -6645,12 +6645,10 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
   }
 
   ceph_assert(root);
-  cl.unlock();
   {
     std::unique_lock root_lock(*root);
     _ll_get(root.get());
   }
-  cl.lock();
 
   // trace?
   if (!cct->_conf->client_trace.empty()) {
