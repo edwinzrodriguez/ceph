@@ -4165,11 +4165,10 @@ public:
       inode->set_async_err(r);
     }
     if (client->is_unmounting()) {
-      {
-        std::scoped_lock<Client> cl(*client);
-        client->delay_put_inodes(true);
-        client->mount_cond.notify_all();
-      }
+      // Wake the unmount thread only.  Do not call delay_put_inodes() here:
+      // this context runs on ObjectCacher's finisher, and _put_inode drains
+      // that finisher (wait_for_flush_callbacks), which deadlocks unmount.
+      client->mount_cond.notify_all_sloppy();
       client->check_caps(inode, Client::CHECK_CAPS_NODELAY);
     }
   }

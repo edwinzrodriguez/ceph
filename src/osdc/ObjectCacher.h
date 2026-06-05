@@ -792,7 +792,11 @@ public:
   }
 
   void wait_for_flush_callbacks() {
-    finisher.wait_for_empty();
+    // Never block the finisher thread on its own queue (e.g. _put_inode from a
+    // flush completion callback).
+    if (!finisher.am_self()) {
+      finisher.wait_for_empty();
+    }
   }
 
   void discard_set(ObjectSet *oset, const std::vector<ObjectExtent>& ex);
