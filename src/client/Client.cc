@@ -2293,9 +2293,14 @@ int Client::verify_reply_trace(int r, MetaSession *session,
 	    created_ino.val != target->ino.val) {
 	  ldout(cct, 5) << "create got ino " << created_ino
 			<< " but lookup returned " << target->ino
-			<< "; retrying after dropping stale dentry" << dendl;
+			<< "; clearing stale dentry and retrying" << dendl;
 	  if (d && d->dir) {
-	    unlink(d, true, false);
+	    auto dit = d->dir->dentries.find(d->name);
+	    if (dit != d->dir->dentries.end()) {
+	      Dentry *dn = dit->second;
+	      if (dn->inode && dn->inode->ino.val != created_ino.val)
+		unlink(dn, true, true);
+	    }
 	    target.reset();
 	    r = _do_lookup(d->dir->parent_inode, d->name,
 			   request->regetattr_mask, &target, perms);
@@ -3936,6 +3941,12 @@ void Client::_put_inode(Inode *in, int n)
     // inode_lock and block re-acquiring client_lock (trim_dentry), and finisher
     // callbacks may need client_lock.
     objectcacher->wait_for_flush_callbacks();
+    // _try_to_trim_inode only unlinks parent dentries when nref > 1, so an
+    // inode can reach its final pin with a stale dentry still on dentries.
+    while (!in->dentries.empty()) {
+      Dentry *dn = in->get_first_parent();
+      unlink(dn, true, true);
+    }
     in->iput();
   }
 }
