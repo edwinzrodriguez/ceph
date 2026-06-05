@@ -2360,9 +2360,9 @@ int SyntheticClient::object_rw(int nobj, int osize, int wrpc,
     object_locator_t oloc(SYNCLIENT_FIRST_POOL);
     SnapContext snapc;
     
+    utime_t start = ceph_clock_now();
     {
       std::scoped_lock<Client> client_guard(*client);
-      utime_t start = ceph_clock_now();
       if (write) {
         dout(10) << "write to " << oid << dendl;
 
