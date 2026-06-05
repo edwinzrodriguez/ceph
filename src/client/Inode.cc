@@ -198,6 +198,25 @@ void Inode::get_cap_ref(int cap)
   }
 }
 
+bool Inode::is_last_cap_ref(int c)
+{
+  auto it = cap_refs.find(c);
+  if (it == cap_refs.end()) {
+    return true; // No references means it's the last (or never existed)
+  }
+
+  if (c != CEPH_CAP_FILE_BUFFER) {
+    return it->second == 0;
+  }
+
+  int nref = 0;
+  if (is_write_delegated()) {
+    ++nref;
+  }
+
+  return it->second == nref;
+}
+
 int Inode::put_cap_ref(int cap)
 {
   int last = 0;
@@ -205,11 +224,13 @@ int Inode::put_cap_ref(int cap)
   while (cap) {
     if (cap & 1) {
       int c = 1 << n;
-      if (cap_refs[c] <= 0) {
+      auto it = cap_refs.find(c);
+      if (it == cap_refs.end() || it->second <= 0) {
 	lderr(client->cct) << "put_cap_ref " << ccap_string(c) << " went negative on " << *this << dendl;
-	ceph_assert(cap_refs[c] > 0);
+	ceph_assert(it != cap_refs.end() && it->second > 0);
       }
-      if (--cap_refs[c] == 0)
+      --it->second;
+      if (is_last_cap_ref(c))
         last |= c;
       //cout << "inode " << *this << " put " << cap_string(c) << " " << (cap_refs[c]+1) << " -> " << cap_refs[c] << std::endl;
     }
@@ -638,6 +659,21 @@ bool Inode::has_recalled_deleg()
   // Either all delegations are recalled or none are. Just check the first.
   Delegation& deleg = delegations.front();
   return deleg.is_recalled();
+}
+
+bool Inode::is_write_delegated()
+{
+  if (delegations.empty()) {
+    return false;
+  }
+
+  for (auto& deleg : delegations) {
+    if (deleg.is_write_delegated() && !deleg.is_recalled()) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 void Inode::recall_deleg(bool skip_read)
