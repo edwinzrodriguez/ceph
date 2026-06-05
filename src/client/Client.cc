@@ -3175,7 +3175,6 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
     ceph::unique_unlock<Client> cl_unlock(*this);
     insert_trace(request, session.get());
   }
-  cl.lock();
 
   // Handle unsafe reply
   if (!is_safe) {
@@ -3913,7 +3912,6 @@ void Client::delay_put_inodes(bool wakeup)
       _put_inode(in, cnt);
     }
   }
-  ceph::client_lock::reacquire_after_drop(*this);
 
   if (wakeup)
     mount_cond.notify_all();
@@ -4526,7 +4524,7 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
                                    offset, size, &onflush);
   if (!ret) {
     // wait for flush
-    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+    ceph::unique_unlock<Inode> in_unlock(*in);
     onflush.wait();
   }
 }
@@ -4587,7 +4585,14 @@ void Client::add_update_cap(Inode *in, MetaSession *mds_session, uint64_t cap_id
 			    unsigned issued, unsigned wanted, unsigned seq, unsigned mseq,
 			    inodeno_t realm, int flags, const UserPerm& cap_perms)
 {
-  client_caps->add_update_cap(in, mds_session, cap_id, issued, wanted, seq, mseq, realm, flags, cap_perms);
+  if (in->is_locked_by_me()) {
+    client_caps->add_update_cap(in, mds_session, cap_id, issued, wanted, seq, mseq,
+				realm, flags, cap_perms);
+    return;
+  }
+  std::unique_lock<Inode> in_lock(*in);
+  client_caps->add_update_cap(in, mds_session, cap_id, issued, wanted, seq, mseq,
+			      realm, flags, cap_perms);
 }
 
 void Client::remove_cap(Cap *cap, bool queue_release)
@@ -6307,7 +6312,6 @@ int Client::authenticate()
     ceph::unique_unlock<Client> c_unlock(*this);
     r = monclient->authenticate(std::chrono::duration<double>(mount_timeout).count());
   }
-  ceph::client_lock::reacquire_after_drop(*this);
   if (r < 0) {
     return r;
   }
@@ -6331,7 +6335,6 @@ int Client::fetch_fsmap(bool user)
     ceph::unique_unlock<Client> c_unlock(*this);
     std::tie(fsmap_latest, std::ignore) =
       monclient->get_version("fsmap", ca::use_blocked[ec]);
-    ceph::client_lock::reacquire_after_drop(*this);
   } while (ec == bs::errc::resource_unavailable_try_again);
 
   if (ec) {
@@ -6664,7 +6667,6 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
   if (cct->_conf.get_val<bool>("client_fscrypt_dummy_encryption")) {
     ceph::unique_unlock<Client> c_unlock(*this);
     r = fscrypt_dummy_encryption();
-    cl.lock();
     if (r < 0) {
       return r;
     }
@@ -6749,7 +6751,6 @@ void Client::_force_evict_unmount_cache()
       ceph::unique_unlock<Client> unlock(*this);
       client_caps->prepare_inode_unmount(in);
     }
-    ceph::client_lock::reacquire_after_drop(*this);
     {
       std::unique_lock in_lock(*in);
       if (!in->caps.empty())
@@ -6760,7 +6761,6 @@ void Client::_force_evict_unmount_cache()
       ceph::unique_unlock<Client> unlock(*this);
       check_caps(InodeRef(in), CHECK_CAPS_NODELAY);
     }
-    ceph::client_lock::reacquire_after_drop(*this);
     _try_to_trim_inode(in, false);
     int extra = 0;
     {
@@ -6772,7 +6772,6 @@ void Client::_force_evict_unmount_cache()
   }
 
   trim_cache();
-  ceph::client_lock::reacquire_after_drop(*this);
   delay_put_inodes(true);
   mount_cond.notify_all();
 }
@@ -12357,7 +12356,7 @@ int Client::WriteEncMgr::read_modify_write(Context *_iofinish)
 
   if (need_read && !async) {
 
-    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+    ceph::unique_unlock<Inode> in_unlock(*in);
     if (finish_read_start_ctx) {
       finish_read_start_ctx->wait();
     }
@@ -12761,7 +12760,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
     auto delay = get_injected_write_delay_secs();
     if (unlikely(delay > 0)) {
       ldout(cct, 20) << __func__ << ": delaying write for " << delay << " seconds" << dendl;
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+      ceph::unique_unlock<Inode> in_unlock(*in);
       sleep(delay);
     }
 
@@ -12782,7 +12781,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
     }
 
     {
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+      ceph::unique_unlock<Inode> in_unlock(*in);
 
       r = cond_iofinish->wait();
     }
@@ -12812,7 +12811,7 @@ done:
   if (nullptr != onuninline) {
     int uninline_ret = 0;
     {
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+      ceph::unique_unlock<Inode> in_unlock(*in);
 
       uninline_ret = onuninline->wait();
     }
@@ -13156,7 +13155,7 @@ int Client::_fsync(Inode *in, bool syncdataonly)
   }
 
   if (nullptr != object_cacher_completion) { // wait on a real reply instead of guessing
-    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+    ceph::unique_unlock<Inode> in_unlock(*in);
     ldout(cct, 15) << "waiting on data to flush" << dendl;
     r = object_cacher_completion->wait();
     ldout(cct, 15) << "got " << r << " from flush writeback" << dendl;
@@ -13380,7 +13379,7 @@ int Client::_statfs(Inode *in, struct statvfs *stbuf,
 
   int rval = 0;
   {
-    ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+    ceph::unique_unlock<Inode> in_unlock(*in);
     rval = cond.wait();
   }
 
@@ -17296,7 +17295,7 @@ int64_t Client::ll_preadv_pwritev(struct Fh *fh, const struct iovec *iov,
     if (retval < 0) {
       if (onfinish != nullptr) {
         //async io failed
-        ceph::unique_unlock<ceph::ReentrantLock> in_unlock(fh->inode->m_inode_lock);
+        unique_unlock in_unlock(*(fh->inode));
         onfinish->complete(retval);
         /* async call should always return zero to caller and allow the
         caller to wait on callback for the actual errno/retval. */
@@ -17483,7 +17482,7 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
       in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
       {
-        ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+        ceph::unique_unlock<Inode> in_unlock(*in);
         onfinish.wait();
       }
       put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
@@ -17513,7 +17512,7 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
   if (nullptr != onuninline) {
     int ret = 0;
     {
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+      ceph::unique_unlock<Inode> in_unlock(*in);
       ret = onuninline->wait();
     }
 
@@ -18229,12 +18228,11 @@ int Client::check_pool_perm(Inode *in, int need)
     int wr_ret = 0;
     {
       ceph::unique_unlock<Client> client_unlock(*this);
-      ceph::unique_unlock<ceph::ReentrantLock> in_unlock(in->m_inode_lock);
+      ceph::unique_unlock<Inode> in_unlock(*in);
 
       rd_ret = rd_cond.wait();
       wr_ret = wr_cond.wait();
     }
-    ceph::client_lock::reacquire_after_drop(*this);
 
     bool errored = false;
 

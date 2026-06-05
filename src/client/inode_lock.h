@@ -15,10 +15,10 @@
 namespace std {
 
 /**
- * Lock ordering: inode_lock before client_lock.  When client_lock is already
- * held, temporarily drop it via unique_unlock, take inode_lock, then restore
- * client_lock.  Inode::m_inode_lock is a ReentrantLock; lock()/unlock()
- * delegate to it the same way unique_lock<Client> delegates to m_client_lock.
+ * inode_lock before client_lock.  When client_lock is already held, drop the
+ * full client recursion depth via unique_unlock, take inode_lock, then
+ * restore client depth before returning.  unlock() releases only the inode
+ * level owned by this guard.
  */
 template <>
 class unique_lock<Inode> {
@@ -26,7 +26,7 @@ public:
   using mutex_type = Inode;
 
   unique_lock() noexcept
-    : _in(nullptr), _owns(false)
+    : _in(nullptr), _rl()
   {}
 
   explicit unique_lock(const Inode& in)
@@ -36,11 +36,11 @@ public:
   }
 
   unique_lock(const Inode& in, defer_lock_t) noexcept
-    : _in(&in), _owns(false)
+    : _in(&in), _rl(in.m_inode_lock, defer_lock)
   {}
 
   unique_lock(const Inode& in, adopt_lock_t) noexcept
-    : _in(&in), _owns(true)
+    : _in(&in), _rl(in.m_inode_lock, adopt_lock)
   {}
 
   unique_lock(const unique_lock&) = delete;
@@ -48,81 +48,68 @@ public:
   unique_lock(unique_lock&&) = delete;
   unique_lock& operator=(unique_lock&&) = delete;
 
-  ~unique_lock()
-  {
-    unlock();
-  }
+  ~unique_lock() = default;
 
   void lock()
   {
-    if (_owns && _in->is_locked_by_me()) {
+    if (!_in) {
       return;
     }
     auto& client = _in->get_client_lock();
+    ceph::unique_unlock<ceph::ReentrantLock> client_stash(client, std::defer_lock);
     if (client.is_locked_by_me()) {
-      _client_unlock = std::make_unique<ceph::unique_unlock<ceph::ReentrantLock>>(
-        client, std::defer_lock);
-      _client_unlock->release();
+      client_stash.release();
     }
-    auto& il = _in->m_inode_lock;
-    if (!il.is_locked_by_me()) {
-      il.lock();
+    _rl.lock();
+    if (client_stash.released()) {
+      client_stash.reacquire();
+      client_stash._abandon();
     }
-    if (_client_unlock) {
-      client.lock();
-    }
-    _owns = true;
   }
 
   bool try_lock()
   {
-    if (_owns && _in->is_locked_by_me()) {
+    if (!_in) {
+      return false;
+    }
+    if (_rl.owns_lock()) {
       return true;
     }
     auto& client = _in->get_client_lock();
-    const bool had_client = client.is_locked_by_me();
-    if (had_client) {
-      _client_unlock = std::make_unique<ceph::unique_unlock<ceph::ReentrantLock>>(
-        client, std::defer_lock);
-      _client_unlock->release();
+    ceph::unique_unlock<ceph::ReentrantLock> client_stash(client, std::defer_lock);
+    if (client.is_locked_by_me()) {
+      client_stash.release();
     }
-    if (_in->is_locked_by_me()) {
-      // already held at inode level
-    } else if (!_in->m_inode_lock.try_lock()) {
-      if (_client_unlock) {
-        _client_unlock->abandon();
-        _client_unlock.reset();
+    if (!_rl.try_lock()) {
+      if (client_stash.released()) {
+        client_stash.reacquire();
+        client_stash._abandon();
       }
       return false;
     }
-    if (_client_unlock) {
-      client.lock();
+    if (client_stash.released()) {
+      client_stash.reacquire();
+      client_stash._abandon();
     }
-    _owns = true;
     return true;
   }
 
   void unlock()
   {
-    if (!_owns) {
-      return;
-    }
-    _owns = false;
-    if (_in->is_locked_by_me()) {
-      _in->m_inode_lock.unlock();
-    }
-    if (_client_unlock) {
-      _client_unlock->abandon();
-      _client_unlock.reset();
-    }
+    _rl.unlock();
+  }
+
+  Inode *release() noexcept
+  {
+    _rl.release();
+    Inode *in = const_cast<Inode *>(_in);
+    _in = nullptr;
+    return in;
   }
 
   bool owns_lock() const noexcept
   {
-    if (!_owns || !_in) {
-      return false;
-    }
-    return _in->is_locked_by_me();
+    return _rl.owns_lock();
   }
 
   Inode *mutex() const noexcept
@@ -132,8 +119,7 @@ public:
 
 private:
   const Inode *_in;
-  bool _owns;
-  std::unique_ptr<ceph::unique_unlock<ceph::ReentrantLock>> _client_unlock;
+  std::unique_lock<ceph::ReentrantLock> _rl;
 };
 
 template <>
@@ -175,12 +161,16 @@ public:
     return _inner.released();
   }
 
-  void abandon() noexcept
+  void reacquire()
   {
-    _inner.abandon();
+    _inner.reacquire();
   }
 
-  // Restore m_inode_lock after a temporary drop (e.g. get_caps wait).
+  void _abandon() noexcept
+  {
+    _inner._abandon();
+  }
+
   ~unique_unlock() noexcept(false) = default;
 
   unique_unlock(const unique_unlock&) = delete;

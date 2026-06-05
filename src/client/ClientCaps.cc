@@ -1087,18 +1087,13 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	  ceph::unique_unlock<Inode> in_unlock(*in, std::defer_lock);
 	  in_unlock.release();
 	  wait_on_context_cond(cond, done);
-	  // Do not let ~unique_unlock try_lock-restore while handle_cap_grant may
-	  // still hold inode_lock on this thread.
-	  in_unlock.abandon();
+
 	}
 	if (!in->is_locked_by_me()) {
 	  in->m_inode_lock.lock();
 	}
       } else {
 	wait_on_context_cond(cond, done);
-      }
-      if (had_client) {
-	ceph::client_lock::reacquire_after_drop(*client);
       }
     }
   }

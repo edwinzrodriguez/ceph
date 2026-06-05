@@ -17,14 +17,9 @@
 namespace std {
 
 /**
- * Thin RAII wrapper around Client::m_client_lock (a ReentrantLock).
- * lock()/unlock() always delegate to ReentrantLock, which handles
- * same-thread reentrancy via owner/recursion_count.
- *
- * _owns means this guard object has taken one lock() and not yet unlock().
- * After a partner ceph::unique_unlock<Client> drops the lock, call lock()
- * again on the same guard; it re-acquires when is_locked_by_me() is false
- * even if _owns is still true.
+ * RAII for Client::m_client_lock.  Delegates to std::unique_lock<ReentrantLock>
+ * so each guard adds/removes one recursion level; ceph::unique_unlock<Client>
+ * stashes the full depth and restores it on scope exit.
  */
 template <>
 class unique_lock<Client> {
@@ -32,7 +27,7 @@ public:
   using mutex_type = Client;
 
   unique_lock() noexcept
-    : _client(nullptr), _owns(false)
+    : _client(nullptr), _rl()
   {}
 
   explicit unique_lock(Client& c)
@@ -42,11 +37,11 @@ public:
   }
 
   unique_lock(Client& c, defer_lock_t) noexcept
-    : _client(&c), _owns(false)
+    : _client(&c), _rl(c.get_client_lock(), defer_lock)
   {}
 
   unique_lock(Client& c, adopt_lock_t) noexcept
-    : _client(&c), _owns(true)
+    : _client(&c), _rl(c.get_client_lock(), adopt_lock)
   {}
 
   unique_lock(const unique_lock&) = delete;
@@ -54,58 +49,34 @@ public:
   unique_lock(unique_lock&&) = delete;
   unique_lock& operator=(unique_lock&&) = delete;
 
-  ~unique_lock()
-  {
-    unlock();
-  }
+  ~unique_lock() = default;
 
   void lock()
   {
-    auto& rl = _client->get_client_lock();
-    if (_owns && rl.is_locked_by_me()) {
-      return;
-    }
-    rl.lock();
-    _owns = true;
+    _rl.lock();
   }
 
   bool try_lock()
   {
-    auto& rl = _client->get_client_lock();
-    if (_owns && rl.is_locked_by_me()) {
-      return true;
-    }
-    if (!rl.try_lock()) {
-      return false;
-    }
-    _owns = true;
-    return true;
+    return _rl.try_lock();
   }
 
   void unlock()
   {
-    if (!_owns) {
-      return;
-    }
-    _owns = false;
-    auto& rl = _client->get_client_lock();
-    if (rl.is_locked_by_me()) {
-      rl.unlock();
-    }
+    _rl.unlock();
   }
 
   Client *release() noexcept
   {
-    _owns = false;
-    return _client;
+    _rl.release();
+    Client *c = _client;
+    _client = nullptr;
+    return c;
   }
 
   bool owns_lock() const noexcept
   {
-    if (!_owns || !_client) {
-      return false;
-    }
-    return _client->get_client_lock().is_locked_by_me();
+    return _rl.owns_lock();
   }
 
   Client *mutex() const noexcept
@@ -115,7 +86,7 @@ public:
 
 private:
   Client *_client;
-  bool _owns;
+  std::unique_lock<ceph::ReentrantLock> _rl;
 };
 
 template <>
@@ -157,17 +128,17 @@ public:
     return _inner.released();
   }
 
-  void abandon() noexcept
+  void reacquire()
   {
-    _inner.abandon();
+    _inner.reacquire();
   }
 
-  // Never try_lock-restore: a partner std::unique_lock<Client> may still
-  // have _owns set.  It re-acquires via lock() when is_locked_by_me() is false.
-  ~unique_unlock() noexcept(false)
+  void _abandon() noexcept
   {
-    _inner.abandon();
+    _inner._abandon();
   }
+
+  ~unique_unlock() noexcept(false) = default;
 
   unique_unlock(const unique_unlock&) = delete;
   unique_unlock& operator=(const unique_unlock&) = delete;
@@ -213,10 +184,9 @@ private:
 inline void wait_on(Client& c, reentrant_condition_variable& cond,
                     std::unique_lock<Client>& lock)
 {
-  lock.lock();
   auto& rl = detail::reentrant(c);
   if (!rl.is_locked_by_me()) {
-    rl.lock();
+    lock.lock();
   }
   std::unique_lock<ReentrantLock> rl_lock(rl, std::adopt_lock);
   cond.wait(rl_lock);
@@ -227,10 +197,9 @@ template <class Predicate>
 void wait_on(Client& c, reentrant_condition_variable& cond,
              std::unique_lock<Client>& lock, Predicate pred)
 {
-  lock.lock();
   auto& rl = detail::reentrant(c);
   if (!rl.is_locked_by_me()) {
-    rl.lock();
+    lock.lock();
   }
   std::unique_lock<ReentrantLock> rl_lock(rl, std::adopt_lock);
   cond.wait(rl_lock, std::move(pred));
@@ -252,10 +221,9 @@ template <class Rep, class Period>
 std::cv_status wait_mount_for(Client& c, std::unique_lock<Client>& lock,
                               const std::chrono::duration<Rep, Period>& rel_time)
 {
-  lock.lock();
   auto& rl = detail::reentrant(c);
   if (!rl.is_locked_by_me()) {
-    rl.lock();
+    lock.lock();
   }
   std::unique_lock<ReentrantLock> rl_lock(rl, std::adopt_lock);
   auto r = detail::mount(c).wait_for(rl_lock, rel_time);
@@ -268,10 +236,9 @@ bool wait_mount_for(Client& c, std::unique_lock<Client>& lock,
                     const std::chrono::duration<Rep, Period>& rel_time,
                     Predicate pred)
 {
-  lock.lock();
   auto& rl = detail::reentrant(c);
   if (!rl.is_locked_by_me()) {
-    rl.lock();
+    lock.lock();
   }
   std::unique_lock<ReentrantLock> rl_lock(rl, std::adopt_lock);
   bool r = detail::mount(c).wait_for(rl_lock, rel_time, std::move(pred));
@@ -279,7 +246,7 @@ bool wait_mount_for(Client& c, std::unique_lock<Client>& lock,
   return r;
 }
 
-/** Re-acquire after unique_unlock<Client> when no partner unique_lock exists. */
+/** Re-acquire after unique_unlock when no partner unique_lock exists. */
 inline void reacquire_after_drop(Client& c)
 {
   auto& rl = detail::reentrant(c);

@@ -323,6 +323,15 @@ class Client : public Dispatcher, public md_config_obs_t {
   friend class ceph::unique_unlock<Client>;
   friend class ceph::client_lock::scoped_drop;
   friend struct ceph::client_lock::detail;
+
+private:
+  // Protects Client state and the buffer cache.  Acquire only through
+  // std::unique_lock<Client> / std::scoped_lock<Client> (client_lock.h).
+  mutable ceph::ReentrantLock m_client_lock =
+    ceph::make_reentrant("Client::m_client_lock", false);
+
+  ceph::ReentrantLock& get_client_lock() { return m_client_lock; }
+
 public:
   friend class C_Block_Sync; // Calls block map and protected helpers
   friend class C_Client_CacheInvalidate;  // calls ino_invalidate_cb
@@ -2446,13 +2455,6 @@ private:
 
   std::locale m_locale;
 
-private:
-  // Protects Client state and the buffer cache.  Acquire only through
-  // std::unique_lock<Client> / std::scoped_lock<Client> (client_lock.h).
-  mutable ceph::ReentrantLock m_client_lock =
-    ceph::make_reentrant("Client::m_client_lock", false);
-
-  ceph::ReentrantLock& get_client_lock() { return m_client_lock; }
   ceph::reentrant_condition_variable& get_mount_cond() { return mount_cond; }
   ceph::reentrant_condition_variable& get_sync_cond() { return sync_cond; }
 };

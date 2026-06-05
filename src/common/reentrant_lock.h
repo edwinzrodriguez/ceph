@@ -111,6 +111,113 @@ ReentrantLock make_reentrant(Args&& ...args) {
   return ReentrantLock(std::forward<Args>(args)...);
 }
 
+} // namespace ceph
+
+namespace std {
+
+/**
+ * One reentrant lock level per guard.  lock()/unlock() pair with
+ * ReentrantLock::lock()/unlock(); a partner ceph::unique_unlock drops the
+ * full recursion depth and restores it on scope exit.
+ */
+template <>
+class unique_lock<ceph::ReentrantLock> {
+public:
+  using mutex_type = ceph::ReentrantLock;
+
+  unique_lock() noexcept
+    : _mutex(nullptr), _owns(false)
+  {}
+
+  explicit unique_lock(mutex_type& m)
+    : unique_lock(m, defer_lock)
+  {
+    lock();
+  }
+
+  unique_lock(mutex_type& m, defer_lock_t) noexcept
+    : _mutex(&m), _owns(false)
+  {}
+
+  unique_lock(mutex_type& m, adopt_lock_t) noexcept
+    : _mutex(&m), _owns(true)
+  {}
+
+  unique_lock(const unique_lock&) = delete;
+  unique_lock& operator=(const unique_lock&) = delete;
+  unique_lock(unique_lock&&) = delete;
+  unique_lock& operator=(unique_lock&&) = delete;
+
+  ~unique_lock()
+  {
+    unlock();
+  }
+
+  void lock()
+  {
+    if (!_mutex) {
+      return;
+    }
+    if (_owns && _mutex->is_locked_by_me()) {
+      return;
+    }
+    _mutex->lock();
+    _owns = true;
+  }
+
+  bool try_lock()
+  {
+    if (!_mutex) {
+      return false;
+    }
+    if (_owns && _mutex->is_locked_by_me()) {
+      return true;
+    }
+    if (!_mutex->try_lock()) {
+      return false;
+    }
+    _owns = true;
+    return true;
+  }
+
+  void unlock()
+  {
+    if (!_owns) {
+      return;
+    }
+    _owns = false;
+    if (_mutex && _mutex->is_locked_by_me()) {
+      _mutex->unlock();
+    }
+  }
+
+  mutex_type *release() noexcept
+  {
+    _owns = false;
+    mutex_type *m = _mutex;
+    _mutex = nullptr;
+    return m;
+  }
+
+  bool owns_lock() const noexcept
+  {
+    return _owns && _mutex && _mutex->is_locked_by_me();
+  }
+
+  mutex_type *mutex() const noexcept
+  {
+    return _mutex;
+  }
+
+private:
+  mutex_type *_mutex;
+  bool _owns;
+};
+
+} // namespace std
+
+namespace ceph {
+
 // condition_variable that accepts std::unique_lock<LockType> where LockType
 // provides a reentrant lock interface (lock/unlock/release_for_wait/restore_after_wait).
 //
@@ -270,9 +377,21 @@ public:
     return m_released;
   }
 
-  // Call when the lock is re-acquired before scope end and the destructor must
-  // not restore the saved recursion depth (e.g. inode_lock pairing).
-  void abandon() noexcept
+  /** Restore recursion depth saved by release(); partner guards keep _owns. */
+  void reacquire()
+  {
+    if (!m_released || m_saved <= 0) {
+      return;
+    }
+    ceph_assert(!m_lock.is_locked_by_me());
+    m_lock.native_mutex().lock();
+    m_lock.restore_after_wait(m_saved);
+    m_released = false;
+    m_saved = 0;
+  }
+
+  // Call when a partner guard already restored the lock (e.g. inode ordering).
+  void _abandon() noexcept
   {
     m_released = false;
     m_saved = 0;
@@ -280,23 +399,7 @@ public:
 
   ~unique_unlock() noexcept(false)
   {
-    if (!m_released || m_saved <= 0) {
-      return;
-    }
-    if (m_lock.is_locked_by_me()) {
-      // Same thread already re-acquired via lock() (e.g. monclient I/O).
-      m_lock.restore_after_wait(m_saved);
-      return;
-    }
-    // Another thread may have taken the lock after release().  Do not block
-    // on native_mutex().lock() here: that would restore owner/recursion_count
-    // on this thread after the other thread already owns the lock, leaking the
-    // pthread mutex to a stale owner (classic bench deadlock: main in join,
-    // ms_dispatch in wait_on, workers blocked on open).
-    if (!m_lock.native_mutex().try_lock()) {
-      return;
-    }
-    m_lock.restore_after_wait(m_saved);
+    reacquire();
   }
 
   unique_unlock(const unique_unlock&) = delete;
