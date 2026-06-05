@@ -998,6 +998,10 @@ void Client::trim_dentry(Dentry *dn)
 		 << dendl;
   if (dn->inode) {
     Inode *diri = dn->dir->parent_inode;
+    // clear_dir_complete_and_ordered takes inode_lock and then re-acquires
+    // client_lock; drop client_lock first so ms_dispatch/_put_inode cannot
+    // block unmount behind finisher wait while we hold a dir inode_lock.
+    ceph::unique_unlock<Client> ulock(*this);
     clear_dir_complete_and_ordered(diri, true);
   }
   unlink_locked(dn, false, false);  // drop dir, drop dentry
@@ -3861,30 +3865,35 @@ void Client::_put_inode(Inode *in, int n)
     left -= n;
   }
   if (left == 1) { // last ref is the inode_map pin
-    std::unique_lock<Client> c_lock(*this);
-    if (unmount_anchor_pins.count(in)) {
-      ldout(cct, 15) << __func__ << " defer delete (unmount anchor) " << *in
-		     << dendl;
-      return;
-    }
-    // release any caps
-    remove_all_caps(in);
-    ldout(cct, 10) << __func__ << " deleting " << *in << dendl;
     {
-      auto oc_lock = objectcacher->acquire_cache_lock();
-      bool unclean = objectcacher->release_set(&in->oset);
-      ceph_assert(!unclean);
-      inode_map.erase(in->vino());
-      if (use_faked_inos())
-        _release_faked_ino(in);
-
-      if (root == nullptr) {
-        root_ancestor = 0;
-        while (!root_parents.empty())
-          root_parents.erase(root_parents.begin());
+      std::unique_lock<Client> c_lock(*this);
+      if (unmount_anchor_pins.count(in)) {
+	ldout(cct, 15) << __func__ << " defer delete (unmount anchor) " << *in
+		       << dendl;
+	return;
       }
+      // release any caps
+      remove_all_caps(in);
+      ldout(cct, 10) << __func__ << " deleting " << *in << dendl;
+      {
+	auto oc_lock = objectcacher->acquire_cache_lock();
+	bool unclean = objectcacher->release_set(&in->oset);
+	ceph_assert(!unclean);
+	inode_map.erase(in->vino());
+	if (use_faked_inos())
+	  _release_faked_ino(in);
+
+	if (root == nullptr) {
+	  root_ancestor = 0;
+	  while (!root_parents.empty())
+	    root_parents.erase(root_parents.begin());
+	}
+      }
+      in_lock.unlock();
     }
-    in_lock.unlock();
+    // Do not hold client_lock across finisher drain: unmount may hold an
+    // inode_lock and block re-acquiring client_lock (trim_dentry), and finisher
+    // callbacks may need client_lock.
     objectcacher->wait_for_flush_callbacks();
     in->iput();
   }
