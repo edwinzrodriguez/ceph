@@ -11645,7 +11645,9 @@ void Client::C_Readahead::finish(int r) {
   lgeneric_subdout(client->cct, client, 20) << "client." << client->get_nodeid() << " " << "C_Readahead on " << f->inode << dendl;
   // put_cap_ref acquires inode_lock; do not block here on a second lock attempt
   // while a reader may hold inode_lock across an objectcacher wait.
-  client->put_cap_ref(f->inode.get(), CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
+  // Keep inode alive until after destructor runs, since put_cap_ref may free it
+  InodeRef inode_holder = f->inode;
+  client->put_cap_ref(inode_holder.get(), CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
   if (r > 0) {
     client->update_read_io_size(r);
     client->subvolume_tracker->add_metric(f->inode->ino, SimpleIOMetric(false, mono_clock_now()-start_time, r));
