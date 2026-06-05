@@ -188,6 +188,30 @@ void client_flush_set_callback(void *p, ObjectCacher::ObjectSet *oset)
   client->flush_set_callback(oset);
 }
 
+namespace {
+
+// Snapshot inode fields needed by ObjectCacher and pin the inode so it
+// cannot be torn down while inode_lock is dropped for cache I/O.
+struct InodeOCState {
+  InodeRef pin;
+  ObjectCacher::ObjectSet *oset;
+  file_layout_t layout;
+  SnapContext snapc;
+  snapid_t snapid;
+
+  explicit InodeOCState(Inode *in)
+    : pin(InodeRef(in)),
+      oset(&in->oset),
+      layout(in->layout),
+      snapc(in->snaprealm->get_snap_context()),
+      snapid(in->snapid)
+  {
+    ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  }
+};
+
+} // namespace
+
 bool Client::is_reserved_vino(vinodeno_t &vino) {
   if (MDS_IS_PRIVATE_INO(vino.ino)) {
     ldout(cct, -1) << __func__ << " attempt to access reserved inode number " << vino << dendl;
@@ -2264,13 +2288,30 @@ int Client::verify_reply_trace(int r, MetaSession *session,
 	target = in;
       }
       if (r >= 0) {
-	// verify ino returned in reply and trace_dist are the same
+	// verify ino returned in reply and trace are the same
 	if (got_created_ino &&
 	    created_ino.val != target->ino.val) {
-	  ldout(cct, 5) << "create got ino " << created_ino << " but then failed on lookup; EINTR?" << dendl;
-	  r = -EINTR;
+	  ldout(cct, 5) << "create got ino " << created_ino
+			<< " but lookup returned " << target->ino
+			<< "; retrying after dropping stale dentry" << dendl;
+	  if (d && d->dir) {
+	    unlink(d, true, false);
+	    target.reset();
+	    r = _do_lookup(d->dir->parent_inode, d->name,
+			   request->regetattr_mask, &target, perms);
+	  }
+	  if (r >= 0 && created_ino.val != target->ino.val) {
+	    auto it = inode_map.find(vinodeno_t(created_ino, CEPH_NOSNAP));
+	    if (it != inode_map.end()) {
+	      target = it->second;
+	    } else {
+	      ldout(cct, 5) << "create ino mismatch after retry; EINTR?"
+			    << dendl;
+	      r = -EINTR;
+	    }
+	  }
 	}
-	if (ptarget)
+	if (r >= 0 && ptarget)
 	  ptarget->swap(target);
       }
     }
@@ -8501,13 +8542,15 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
       std::vector<ObjectCacher::ObjHole> holes;
       auto target_len = std::min(read_len, stx->stx_size - offset);
 
-      r = objectcacher->file_read_ex(&in->oset, &in->layout, in->snapid,
-                                       read_start, target_len, &bl, 0, &holes, io_finish.get());
-
-
-      if (r == 0) {
+      InodeOCState oc(in);
+      {
         ceph::unique_unlock<Inode> in_unlock(*in);
-        r = io_finish_cond->wait();
+        r = objectcacher->file_read_ex(oc.oset, &oc.layout, oc.snapid,
+                                       read_start, target_len, &bl, 0, &holes,
+                                       io_finish.get());
+        if (r == 0) {
+          r = io_finish_cond->wait();
+        }
       }
       put_cap_ref(in, CEPH_CAP_FILE_CACHE);
 
@@ -11655,20 +11698,27 @@ void Client::C_Readahead::finish(int r) {
 
 void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
 {
+  std::unique_lock in_lock(*in);
   if(f->readahead.get_min_readahead_size() > 0) {
     pair<uint64_t, uint64_t> readahead_extent = f->readahead.update(off, len, in->effective_size());
     if (readahead_extent.second > 0) {
       ldout(cct, 20) << "readahead " << readahead_extent.first << "~" << readahead_extent.second
 		     << " (caller wants " << off << "~" << len << ")" << dendl;
       Context *onfinish2 = new C_Readahead(this, f);
-      int r2 = objectcacher->file_read(&in->oset, &in->layout, in->snapid,
+      get_cap_ref(in, CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
+      InodeOCState oc(in);
+      int r2 = 0;
+      {
+        ceph::unique_unlock<Inode> in_unlock(*in);
+        r2 = objectcacher->file_read(oc.oset, &oc.layout, oc.snapid,
                                      readahead_extent.first, readahead_extent.second,
-                                     NULL, 0, onfinish2);;
+                                     NULL, 0, onfinish2);
+      }
       if (r2 == 0) {
 	ldout(cct, 20) << "readahead initiated, c " << onfinish2 << dendl;
-	get_cap_ref(in, CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
       } else {
 	ldout(cct, 20) << "readahead was no-op, already cached" << dendl;
+	put_cap_ref(in, CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
 	delete onfinish2;
       }
     }
@@ -11781,8 +11831,13 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 
   std::vector<ObjectCacher::ObjHole> holes;
 
-  r = objectcacher->file_read_ex(&in->oset, &in->layout, in->snapid,
-                                   read_start, read_len, bl, 0, &holes, io_finish.get());
+  InodeOCState oc(in);
+  {
+    ceph::unique_unlock<Inode> in_unlock(*in);
+    r = objectcacher->file_read_ex(oc.oset, &oc.layout, oc.snapid,
+                                   read_start, read_len, bl, 0, &holes,
+                                   io_finish.get());
+  }
   if (onfinish != nullptr) {
     // put the cap ref since we're releasing C_Read_Async_Finisher
     put_cap_ref(in, CEPH_CAP_FILE_CACHE);
@@ -12514,13 +12569,17 @@ int Client::WriteEncMgr_Buffered::do_write()
   clnt->get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
   // async, caching, non-blocking.
-  int r = clnt->objectcacher->file_write(&in->oset, &in->layout,
-                                       in->snaprealm->get_snap_context(),
+  InodeOCState oc(in);
+  int r = 0;
+  {
+    ceph::unique_unlock<Inode> in_unlock(*in);
+    r = clnt->objectcacher->file_write(oc.oset, &oc.layout, oc.snapc,
                                        offset, size, *pbl, ceph::real_clock::now(),
                                        0, iofinish,
                                        !async
                                        ? clnt->objectcacher->CFG_block_writes_upfront()
                                        : false);
+  }
 
   return r;
 }
