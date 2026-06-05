@@ -8162,7 +8162,6 @@ int Client::_readlink(const InodeRef& diri, const char* relpath, char *buf, size
 
 int Client::_getattr(const InodeRef& in, int mask, const UserPerm& perms, bool force)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(*in));
   bool yes = in->caps_issued_mask(mask, true);
 
   ldout(cct, 10) << __func__ << " mask " << ccap_string(mask) << " issued=" << yes << dendl;
