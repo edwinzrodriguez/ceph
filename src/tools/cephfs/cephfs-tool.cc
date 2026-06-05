@@ -1021,6 +1021,17 @@ bench_async_read_worker(
       }
     }
 
+    // Flush all pending operations (including readahead) before closing
+    // This ensures no callbacks will try to access the inode after we release it
+    if (!read_error && !stop_signal) {
+      if (int fsync_rc = ceph_ll_fsync(cmount, fh, 0); fsync_rc < 0) {
+        ss << "Thread " << thread_id << " fsync error " << fname << ": " << strerror(-fsync_rc) << std::endl;
+        stats.errors++;
+        stop_signal = true;
+        read_error = true;
+      }
+    }
+
     if (!read_error && !stop_signal) {
       if (int close_rc = ceph_ll_close(cmount, fh); close_rc < 0) {
         ss << "Thread " << thread_id << " close error " << fname << ": " << strerror(-close_rc) << std::endl;
