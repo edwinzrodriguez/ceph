@@ -1589,19 +1589,15 @@ private:
                           FSCryptFDataDencRef denc,
 #endif
      			  uint64_t read_start,
-                          uint64_t read_len)
-      : clnt(clnt), onfinish(onfinish), f(f), in(in), bl(bl), off(off), len(len),
-        start_time(mono_clock_now()), 
-#if defined(__linux__)
-	denc(denc), 
-#endif
-	read_start(read_start), read_len(read_len) {}
+                          uint64_t read_len);
+
+    ~C_Read_Async_Finisher() override;
 
   private:
     Client *clnt;
     Context *onfinish;
     Fh *f;
-    Inode *in;
+    InodeRef in;
     bufferlist *bl;
     uint64_t off;
     uint64_t len;
@@ -2115,7 +2111,7 @@ private:
   void _ll_drop_pins();
 
   Fh *_create_fh(Inode *in, int flags, int cmode, const UserPerm& perms);
-  int _release_fh(Fh *fh);
+  int _release_fh(Fh *fh, bool drop_ref=true);
   void _put_fh(Fh *fh);
 
   std::pair<int, bool> _do_remount(bool retry_on_error);

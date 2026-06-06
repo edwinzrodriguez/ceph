@@ -10825,7 +10825,7 @@ Fh *Client::_create_fh(Inode *in, int flags, int cmode, const UserPerm& perms)
   return f;
 }
 
-int Client::_release_fh(Fh *f)
+int Client::_release_fh(Fh *f, bool drop_ref)
 {
   //ldout(cct, 3) << "op: client->close(open_files[ " << fh << " ]);" << dendl;
   //ldout(cct, 3) << "op: open_files.erase( " << fh << " );" << dendl;
@@ -10866,7 +10866,9 @@ int Client::_release_fh(Fh *f)
     ldout(cct, 10) << __func__ << " " << f << " on inode " << *in << " no async_err state" << dendl;
   }
 
-  _put_fh(f);
+  if (drop_ref) {
+    _put_fh(f);
+  }
 
   return err;
 }
@@ -11061,8 +11063,11 @@ int Client::_close(int fd)
       ldout(cct, 20) << " unpinning ll_put() call for " << *(fh->inode.get()) << dendl;
       _ll_put(fh->inode.get(), 1);
     }
-    err = _release_fh(fh);
+    err = _release_fh(fh, false);
   }
+  // Wait without inode_lock: readahead finishers take inode_lock in put_cap_ref.
+  fh->readahead.wait_for_pending();
+  _put_fh(fh);
   std::unique_lock<Client> lock(*this);
   fd_map.erase(fd);
   _put_fd(fd);
@@ -11708,6 +11713,9 @@ void Client::C_Readahead::finish(int r) {
 
 void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
 {
+  if (is_unmounting()) {
+    return;
+  }
   std::unique_lock in_lock(*in);
   if(f->readahead.get_min_readahead_size() > 0) {
     pair<uint64_t, uint64_t> readahead_extent = f->readahead.update(off, len, in->effective_size());
@@ -11735,6 +11743,28 @@ void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
   }
 }
 
+Client::C_Read_Async_Finisher::C_Read_Async_Finisher(
+    Client *clnt, Context *onfinish, Fh *f, Inode *in, bufferlist *bl,
+    uint64_t fpos, uint64_t off, uint64_t len,
+#if defined(__linux__)
+    FSCryptFDataDencRef denc,
+#endif
+    uint64_t read_start, uint64_t read_len)
+  : clnt(clnt), onfinish(onfinish), f(f), in(in), bl(bl), off(off), len(len),
+    start_time(mono_clock_now()),
+#if defined(__linux__)
+    denc(denc),
+#endif
+    read_start(read_start), read_len(read_len)
+{
+  f->get();
+}
+
+Client::C_Read_Async_Finisher::~C_Read_Async_Finisher()
+{
+  clnt->_put_fh(f);
+}
+
 void Client::C_Read_Async_Finisher::finish(int r)
 {
 #if defined(__linux__)
@@ -11750,8 +11780,8 @@ void Client::C_Read_Async_Finisher::finish(int r)
 #endif
   {
     // Do read ahead as long as we aren't completing with 0 bytes
-    if (r != 0)
-      clnt->do_readahead(f, in, off, len);
+    if (r != 0 && !clnt->is_unmounting())
+      clnt->do_readahead(f, in.get(), off, len);
   }
 
   onfinish->complete(r);
