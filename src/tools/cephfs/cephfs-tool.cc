@@ -876,6 +876,9 @@ bench_async_read_worker(
     io_queue.push_back(std::move(ctx));
   }
 
+  // Store file inodes to release at the end - keeps them alive during readahead
+  std::vector<Inode*> inodes_to_release;
+
   for (int file_iter = 0;; ++file_iter) {
     if (stop_signal) {
       break;
@@ -1046,6 +1049,11 @@ bench_async_read_worker(
       ceph_ll_close(cmount, fh);
     }
 
+    // Store inode for later cleanup - don't forget it yet as readahead may still be active
+    // We'll release all inodes at the end of the thread after all I/O completes
+    inodes_to_release.push_back(inode);
+    inode = nullptr;  // Don't release in this iteration
+
     if (inode) {
       ceph_ll_forget(cmount, inode, 1);
     }
@@ -1060,6 +1068,14 @@ bench_async_read_worker(
   for (auto& ctx : io_queue) {
     while (!ctx->completed.load()) {
       std::this_thread::yield();
+    }
+  }
+
+  // Now it's safe to release all inode references
+  // All async operations (including readahead) have completed
+  for (auto* inode_ptr : inodes_to_release) {
+    if (inode_ptr) {
+      ceph_ll_forget(cmount, inode_ptr, 1);
     }
   }
 }
