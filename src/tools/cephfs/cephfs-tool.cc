@@ -850,6 +850,9 @@ bench_async_read_worker(
     io_queue.push_back(std::move(ctx));
   }
 
+  // Store inodes to release at the end - keeps them alive during readahead
+  std::vector<std::pair<Inode*, Inode*>> inodes_to_release;  // (parent, file)
+
   for (int file_iter = 0;; ++file_iter) {
     if (stop_signal) {
       break;
@@ -995,17 +998,8 @@ bench_async_read_worker(
       }
     }
 
-    // Flush all pending operations (including readahead) before closing
-    // This ensures no callbacks will try to access the inode after we release it
-    if (!read_error && !stop_signal) {
-      if (int fsync_rc = ceph_ll_fsync(cmount, fh, 0); fsync_rc < 0) {
-        ss << "Thread " << thread_id << " fsync error " << fname << ": " << strerror(-fsync_rc) << std::endl;
-        stats.errors++;
-        stop_signal = true;
-        read_error = true;
-      }
-    }
-
+    // Close the file handle but DON'T release the inode reference yet
+    // The inode must stay alive until all readahead operations complete
     if (!read_error && !stop_signal) {
       if (int close_rc = ceph_ll_close(cmount, fh); close_rc < 0) {
         ss << "Thread " << thread_id << " close error " << fname << ": " << strerror(-close_rc) << std::endl;
@@ -1020,9 +1014,11 @@ bench_async_read_worker(
       ceph_ll_close(cmount, fh);
     }
 
-    if (inode) {
-      ceph_ll_forget(cmount, inode, 1);
-    }
+    // Store inodes for later cleanup - don't forget them yet as readahead may still be active
+    // We'll release all inodes at the end of the thread after all I/O completes
+    inodes_to_release.push_back({parent_inode, inode});
+    parent_inode = nullptr;  // Don't release in this iteration
+    inode = nullptr;         // Don't release in this iteration
 
     if (read_error) {
       break;
@@ -1034,6 +1030,17 @@ bench_async_read_worker(
   for (auto& ctx : io_queue) {
     while (!ctx->completed.load()) {
       std::this_thread::yield();
+    }
+  }
+
+  // Now it's safe to release all inode references
+  // All async operations (including readahead) have completed
+  for (auto& [parent, file] : inodes_to_release) {
+    if (parent) {
+      ceph_ll_forget(cmount, parent, 1);
+    }
+    if (file) {
+      ceph_ll_forget(cmount, file, 1);
     }
   }
 }
