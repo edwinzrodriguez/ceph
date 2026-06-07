@@ -11760,11 +11760,6 @@ Client::C_Read_Async_Finisher::C_Read_Async_Finisher(
   f->get();
 }
 
-Client::C_Read_Async_Finisher::~C_Read_Async_Finisher()
-{
-  clnt->_put_fh(f);
-}
-
 void Client::C_Read_Async_Finisher::finish(int r)
 {
 #if defined(__linux__)
@@ -11785,6 +11780,7 @@ void Client::C_Read_Async_Finisher::finish(int r)
   }
 
   onfinish->complete(r);
+  clnt->_put_fh(f);
 }
 
 int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
@@ -17698,7 +17694,10 @@ int Client::ll_release(Fh *fh)
     std::scoped_lock<Client> lock(*this);
     ll_unclosed_fh_set.erase(fh);
   }
-  return _release_fh(fh);
+  int err = _release_fh(fh, false);
+  fh->readahead.wait_for_pending();
+  _put_fh(fh);
+  return err;
 }
 
 int Client::ll_getlk(Fh *fh, struct flock *fl, uint64_t owner)

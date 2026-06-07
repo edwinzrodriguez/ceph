@@ -1591,8 +1591,6 @@ private:
      			  uint64_t read_start,
                           uint64_t read_len);
 
-    ~C_Read_Async_Finisher() override;
-
   private:
     Client *clnt;
     Context *onfinish;
