@@ -294,12 +294,22 @@ bool Inode::is_any_caps()
 
 bool Inode::cap_is_valid(const Cap &cap) const
 {
+  // cap_lease_valid takes session_lock.  When inode_lock is already held,
+  // avoid inverting lock order (inode_lock -> session_lock) with paths that
+  // take session_lock first (e.g. flush_caps_sync dirty_list iteration).
+  if (is_locked_by_me()) {
+    return cap.gen <= cap.session->cap_gen &&
+           ceph_clock_now() < cap.session->cap_ttl;
+  }
   return cap.session->cap_lease_valid(cap.gen);
 }
 
 int Inode::caps_issued(int *implemented) const
 {
-  std::unique_lock<Inode> in_lock(*this);
+  std::unique_lock<Inode> in_lock(*this, std::defer_lock);
+  if (!is_locked_by_me()) {
+    in_lock.lock();
+  }
 
   int c = snap_caps;
   int i = 0;

@@ -13,6 +13,8 @@
  *
  */
 
+#include <vector>
+
 #include "ClientCaps.h"
 #include "Client.h"
 #include "Inode.h"
@@ -1211,18 +1213,21 @@ void ClientCaps::flush_caps_sync()
   ldout(cct, 10) << __func__ << dendl;
   for (auto &q : client->mds_sessions) {
     auto s = q.second;
+    std::vector<Inode*> dirty_inodes;
     s->with_dirty_list([&](auto& dirty_list) {
-      xlist<Inode*>::iterator p = dirty_list.begin();
-      while (!p.end()) {
-        unsigned flags = CHECK_CAPS_NODELAY;
-        Inode *in = *p;
-        ++p;
-        if (p.end())
-          flags |= CHECK_CAPS_SYNCHRONOUS;
-        std::scoped_lock in_lock(*in);
-        check_caps(in, flags);
+      for (auto p = dirty_list.begin(); !p.end(); ++p) {
+        dirty_inodes.push_back(*p);
       }
     });
+    unsigned n = 0;
+    const unsigned total = dirty_inodes.size();
+    for (Inode *in : dirty_inodes) {
+      unsigned flags = CHECK_CAPS_NODELAY;
+      if (++n == total)
+        flags |= CHECK_CAPS_SYNCHRONOUS;
+      std::scoped_lock in_lock(*in);
+      check_caps(in, flags);
+    }
   }
 }
 
