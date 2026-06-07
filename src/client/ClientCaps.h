@@ -146,6 +146,7 @@ public:
   void wait_on_context_list(std::vector<Context*>& ls);
   // Wait on a cond after ls already contains a C_ReentrantCond (registered
   // under inode_lock so signal_caps_inode cannot run on an empty list).
+  // Must not hold caps_lock: signal_caps_inode takes it to finish contexts.
   void wait_on_context_cond(ceph::reentrant_condition_variable& cond, bool& done);
   void signal_context_list(std::vector<Context*>& ls) {
     finish_contexts(cct, ls, 0);

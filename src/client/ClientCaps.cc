@@ -522,6 +522,10 @@ void ClientCaps::prepare_inode_unmount(Inode *in)
       put_cap_ref(in, cap);
   }
 
+  // Wake threads blocked in get_caps so unmount can proceed.
+  signal_caps_inode(in);
+  signal_context_list(in->waitfor_commit);
+
   {
     std::unique_lock caps_lock_guard(caps_lock);
     in->delay_cap_item.remove_myself();
@@ -635,7 +639,10 @@ void ClientCaps::wait_on_context_list(std::vector<Context*>& ls)
 void ClientCaps::wait_on_context_cond(
   reentrant_condition_variable& cond, bool& done)
 {
-  std::unique_lock l{caps_lock};
+  // Do not wait while holding caps_lock: signal_caps_inode takes caps_lock to
+  // finish waitfor_caps contexts, which would deadlock get_caps here.
+  ReentrantLock wait_lock = make_reentrant("ClientCaps::wait_cond", false);
+  std::unique_lock l{wait_lock};
   cond.wait(l, [&done] { return done;});
 }
 
@@ -937,6 +944,9 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
   }
 
   while (1) {
+    if (client->is_unmounting())
+      return -ENOTCONN;
+
     int file_wanted = in->caps_file_wanted();
     if ((file_wanted & need) != need) {
       ldout(cct, 10) << "get_caps " << *in << " need " << ccap_string(need)
