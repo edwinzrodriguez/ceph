@@ -4915,8 +4915,21 @@ void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
     l.lock();
   }
   while (in->flushing_caps) {
+    if (in->flushing_cap_tids.empty()) {
+      lderr(cct) << __func__ << " " << *in
+                 << " has flushing_caps " << ccap_string(in->flushing_caps)
+                 << " but no flushing_cap_tids; clearing stale state" << dendl;
+      in->flushing_caps = 0;
+      client_caps->dec_num_flushing_caps();
+      if (in->auth_cap) {
+        MetaSession *session = in->auth_cap->session;
+        session->with_flushing_caps([in](auto& flushing_caps) {
+          in->flushing_cap_item.remove_myself();
+        });
+      }
+      break;
+    }
     map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
-    ceph_assert(it != in->flushing_cap_tids.end());
     if (it->first > want)
       break;
     ldout(cct, 10) << __func__ << " on " << *in << " flushing "
@@ -5489,12 +5502,23 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, con
   int cleaned = 0;
   int flushed = 0;
 
-  auto it = in->flushing_cap_tids.begin();
-  if (it->first < flush_ack_tid) {
-       ldout(cct, 0) << __func__ << " mds." << session->mds_num
-                   << " got unexpected flush ack tid " << flush_ack_tid
-                   << " expected is " << it->first << dendl;
+  if (in->flushing_cap_tids.empty()) {
+    ldout(cct, 10) << __func__ << " mds." << session->mds_num
+                   << " stray flush ack tid " << flush_ack_tid
+                   << " on " << *in << dendl;
+    return;
   }
+
+  auto match = in->flushing_cap_tids.find(flush_ack_tid);
+  if (match == in->flushing_cap_tids.end() || !match->second) {
+    auto it = in->flushing_cap_tids.begin();
+    ldout(cct, 0) << __func__ << " mds." << session->mds_num
+                  << " got unexpected flush ack tid " << flush_ack_tid
+                  << " expected is " << it->first << dendl;
+    return;
+  }
+
+  auto it = in->flushing_cap_tids.begin();
   for (; it != in->flushing_cap_tids.end(); ) {
     if (!it->second) {
       // cap snap
@@ -13146,8 +13170,22 @@ void Client::C_nonblocking_fsync_state::advance()
     // do equivalent of wait_sync_caps(in, flush_tid)
     if (in->flushing_caps) {
       ldout(clnt->cct, 15) << "Client::C_nonblocking_fsync_state::advance - flushing_caps" << dendl;
+      if (in->flushing_cap_tids.empty()) {
+        lderr(clnt->cct) << __func__ << " " << *in
+                         << " has flushing_caps " << ccap_string(in->flushing_caps)
+                         << " but no flushing_cap_tids; clearing stale state" << dendl;
+        in->flushing_caps = 0;
+        clnt->client_caps->dec_num_flushing_caps();
+        if (in->auth_cap) {
+          MetaSession *session = in->auth_cap->session;
+          Inode *pin = in;
+          session->with_flushing_caps([pin](auto& flushing_caps) {
+            pin->flushing_cap_item.remove_myself();
+          });
+        }
+        break;
+      }
       map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
-      ceph_assert(it != in->flushing_cap_tids.end());
 
       ldout(clnt->cct, 15) << "Client::C_nonblocking_fsync_state::advance" 
                            << " it->first " << it->first
