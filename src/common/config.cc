@@ -1520,29 +1520,26 @@ class assign_visitor
     : conf(conf_), val(val_)
   {}
 
-  // For trivially copyable types (integers, bool, double), use atomic store
+  // For small trivially copyable types (bool, double, etc.), use atomic store
   // with seq_cst ordering to avoid data races when other threads read these
-  // values directly without atomic loads. Sequential consistency ensures
-  // the write is visible to all threads.
+  // values directly without atomic loads.  Do not use this for larger types
+  // like uuid_d (16 bytes): they are not guaranteed to be lock-free or
+  // sufficiently aligned for std::atomic reinterpret_cast.
   template <typename T>
-  std::enable_if_t<std::is_trivially_copyable_v<T> && !std::is_same_v<T, uint64_t> && !std::is_same_v<T, int64_t>>
-  operator()(T ConfigValues::* ptr) const
+  void operator()(T ConfigValues::* ptr) const
   {
     T *member = const_cast<T *>(&(conf->*(ptr)));
-    std::atomic_store_explicit(
-      reinterpret_cast<std::atomic<T>*>(member),
-      std::get<T>(val),
-      std::memory_order_seq_cst);
-  }
-
-  // For non-trivially copyable types (strings, complex objects), use regular assignment
-  // These are typically not accessed concurrently without proper locking
-  template <typename T>
-  std::enable_if_t<!std::is_trivially_copyable_v<T>>
-  operator()(T ConfigValues::* ptr) const
-  {
-    T *member = const_cast<T *>(&(conf->*(ptr)));
-    *member = std::get<T>(val);
+    if constexpr (std::is_trivially_copyable_v<T> &&
+                  !std::is_same_v<T, uint64_t> &&
+                  !std::is_same_v<T, int64_t> &&
+                  (sizeof(T) <= sizeof(uint64_t))) {
+      std::atomic_store_explicit(
+        reinterpret_cast<std::atomic<T>*>(member),
+        std::get<T>(val),
+        std::memory_order_seq_cst);
+    } else {
+      *member = std::get<T>(val);
+    }
   }
 
   void operator()(uint64_t ConfigValues::* ptr) const
