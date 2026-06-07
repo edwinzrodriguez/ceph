@@ -641,9 +641,17 @@ void ClientCaps::wait_on_context_cond(
 {
   // Do not wait while holding caps_lock: signal_caps_inode takes caps_lock to
   // finish waitfor_caps contexts, which would deadlock get_caps here.
+  //
+  // Use a private wait_lock paired with cond.  C_ReentrantCond::finish() wakes
+  // via notify_all_sloppy() without holding wait_lock; that can race with an
+  // unbounded wait() and hang even after *done is set (seen in gdb with
+  // done==true).  Timed waits re-check *done so a missed notify cannot stall.
   ReentrantLock wait_lock = make_reentrant("ClientCaps::wait_cond", false);
   std::unique_lock l{wait_lock};
-  cond.wait(l, [&done] { return done;});
+  while (!done) {
+    cond.wait_for(l, std::chrono::milliseconds(200),
+                  [&done] { return done; });
+  }
 }
 
 void ClientCaps::signal_caps_inode(Inode *in)
@@ -1097,13 +1105,16 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	  ceph::unique_unlock<Inode> in_unlock(*in, std::defer_lock);
 	  in_unlock.release();
 	  wait_on_context_cond(cond, done);
-
+	  in_unlock._abandon();
 	}
 	if (!in->is_locked_by_me()) {
 	  in->m_inode_lock.lock();
 	}
       } else {
 	wait_on_context_cond(cond, done);
+      }
+      if (had_client) {
+	ceph::client_lock::reacquire_after_drop(*client);
       }
     }
   }
