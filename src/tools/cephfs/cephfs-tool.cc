@@ -698,8 +698,20 @@ bench_async_write_worker(
 
     // Wait for all outstanding I/Os to complete for this file
     for (auto& ctx : io_queue) {
-      while (!ctx->completed.load() && ctx->fh == fh && !stop_signal) {
+      while (!ctx->completed.load(std::memory_order_acquire) &&
+             ctx->fh == fh && !stop_signal) {
         std::this_thread::yield();
+      }
+    }
+
+    // Flush buffered data before close so files survive the post-write remount.
+    if (!write_error && !stop_signal) {
+      if (int fsync_rc = ceph_ll_fsync(cmount, fh, 0); fsync_rc < 0) {
+        ss << "Thread " << thread_id << " fsync error " << fname << ": "
+           << strerror(-fsync_rc) << std::endl;
+        stats.errors++;
+        stop_signal = true;
+        write_error = true;
       }
     }
 
@@ -895,38 +907,21 @@ bench_async_read_worker(
     string fname = config.subdir + "/" + config.prefix +
                    std::to_string(thread_id) + "_" + std::to_string(file_idx);
 
-    // Get just the filename without path
-    size_t last_slash = fname.find_last_of('/');
-    string filename = (last_slash != string::npos) ? fname.substr(last_slash + 1) : fname;
-    
-    // Get parent directory inode
-    Inode* parent_inode = nullptr;
-    struct ceph_statx parent_stx;
-    UserPerm* perms = ceph_userperm_new(config.uid, config.gid, 0, nullptr);
-    
-    int rc = ceph_ll_walk(cmount, config.subdir.c_str(), &parent_inode, &parent_stx,
-                          CEPH_STATX_INO, 0, perms);
-    
-    if (rc < 0) {
-      ss << "Thread " << thread_id << " walk parent dir failed " << config.subdir << ": " << strerror(-rc) << std::endl;
-      stats.errors++;
-      stop_signal = true;
-      ceph_userperm_destroy(perms);
-      break;
-    }
-
-    // Lookup file inode
+    // Walk the full path (same resolution model as sync ceph_open) rather than
+    // parent walk + ll_lookup, which can miss entries after remount.
     Inode* inode = nullptr;
     struct ceph_statx stx;
-    rc = ceph_ll_lookup(cmount, parent_inode, filename.c_str(), &inode, &stx,
-                        CEPH_STATX_INO, 0, perms);
-    
+    UserPerm* perms = ceph_userperm_new(config.uid, config.gid, 0, nullptr);
+
+    int rc = ceph_ll_walk(cmount, fname.c_str(), &inode, &stx,
+                          CEPH_STATX_INO, 0, perms);
+
     if (rc < 0) {
-      ss << "Thread " << thread_id << " lookup failed " << fname << ": " << strerror(-rc) << std::endl;
+      ss << "Thread " << thread_id << " walk failed " << fname << ": "
+         << strerror(-rc) << std::endl;
       stats.errors++;
       stop_signal = true;
       ceph_userperm_destroy(perms);
-      if (parent_inode) ceph_ll_forget(cmount, parent_inode, 1);
       break;
     }
 
@@ -934,11 +929,6 @@ bench_async_read_worker(
     Fh* fh = nullptr;
     rc = ceph_ll_open(cmount, inode, O_RDONLY, &fh, perms);
     ceph_userperm_destroy(perms);
-    
-    // Release parent inode reference
-    if (parent_inode) {
-      ceph_ll_forget(cmount, parent_inode, 1);
-    }
     
     if (rc < 0) {
       ss << "Thread " << thread_id << " ll_open failed " << fname << ": " << strerror(-rc) << std::endl;
@@ -1370,6 +1360,8 @@ int do_bench(BenchConfig& config) {
   std::vector<ThreadStats> write_stats(config.num_threads);
 
   for (int iter = 1; iter <= config.iterations; ++iter) {
+    stop_signal = false;
+
     cout << "\n--- Iteration " << iter << " of " << config.iterations << " ---" << std::endl;
 
     if (json_formatter) {
@@ -1448,6 +1440,23 @@ int do_bench(BenchConfig& config) {
       total_files += s.files;
     }
 
+    if (config.duration == 0 && total_files != (uint64_t)config.num_files) {
+      cerr << "Write phase completed only " << total_files << " of "
+           << config.num_files << " files" << endl;
+      if (int rc = ceph_unmount(shared_cmount); rc < 0) {
+        cerr << "Unmount error: " << strerror(-rc) << endl;
+      }
+      ceph_shutdown(shared_cmount);
+      return 1;
+    }
+
+    // Ensure all buffered writes are on the MDS before remounting for read.
+    if (int rc = ceph_sync_fs(shared_cmount); rc < 0) {
+      cerr << "ceph_sync_fs after write failed: " << strerror(-rc) << endl;
+      ceph_shutdown(shared_cmount);
+      return 1;
+    }
+
     double elapsed_sec = duration_cast<milliseconds>(end_time - start_time).count() / 1000.0;
 
     double w_rate = (double)total_write_bytes / 1024.0 / 1024.0 / elapsed_sec;
@@ -1517,16 +1526,16 @@ int do_bench(BenchConfig& config) {
     }
 
     for (int i = 0; i < config.num_threads; ++i) {
-      int f_count = files_per_thread + (i < remainder ? 1 : 0);
       struct ceph_mount_info *worker_mount = config.per_thread_mount ? NULL : shared_cmount;
+      int files_to_read = (int)write_stats[i].files.load();
       if (config.async_io) {
         threads.emplace_back(
-            bench_async_read_worker, i, f_count, config,
+            bench_async_read_worker, i, files_to_read, config,
             worker_mount, std::ref(read_stats[i]), std::ref(stop_signal),
             std::ref(thread_outputs[i]), start_time);
       } else {
         threads.emplace_back(
-            bench_read_worker, i, (int)write_stats[i].files.load(), config,
+            bench_read_worker, i, files_to_read, config,
             worker_mount, std::ref(read_stats[i]), std::ref(stop_signal),
             std::ref(thread_outputs[i]), start_time);
       }
