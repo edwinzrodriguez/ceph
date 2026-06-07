@@ -219,15 +219,13 @@ static void async_io_callback(struct ceph_ll_io_info* cb_info) {
     ctx->stats_ptr->errors++;
     *(ctx->stop_signal_ptr) = true;
   }
-  
-  // Release semaphore to signal slot availability BEFORE marking as completed
-  // This ensures the callback finishes all work before the main thread can proceed
+
+  // Mark the slot free before releasing the semaphore so a waiter always
+  // finds completed==true after acquire().
+  ctx->completed.store(true, std::memory_order_release);
   if (ctx->semaphore_ptr) {
     ctx->semaphore_ptr->release();
   }
-  
-  // Mark as completed last - this signals to the main thread that it's safe to proceed
-  ctx->completed = true;
 }
 
 // --- Setup Helper (Updated to use stream for output) ---
@@ -653,7 +651,7 @@ bench_async_write_worker(
       // Find available slot in queue
       AsyncIOContext* available_ctx = nullptr;
       for (auto& ctx : io_queue) {
-        if (ctx->completed.load()) {
+        if (ctx->completed.load(std::memory_order_acquire)) {
           available_ctx = ctx.get();
           break;
         }
@@ -670,7 +668,7 @@ bench_async_write_worker(
       uint64_t to_write = std::min(config.block_size, config.file_size - written);
       available_ctx->fh = fh;
       available_ctx->offset = written;
-      available_ctx->completed = false;
+      available_ctx->completed.store(false, std::memory_order_release);
       available_ctx->result = 0;
       
       // Setup iovec in context (must persist for async operation)
@@ -690,6 +688,7 @@ bench_async_write_worker(
         stats.errors++;
         stop_signal = true;
         write_error = true;
+        available_ctx->completed.store(true, std::memory_order_release);
         queue_semaphore.release();
         break;
       }
@@ -973,7 +972,7 @@ bench_async_read_worker(
       // Find available slot in queue
       AsyncIOContext* available_ctx = nullptr;
       for (auto& ctx : io_queue) {
-        if (ctx->completed.load()) {
+        if (ctx->completed.load(std::memory_order_acquire)) {
           available_ctx = ctx.get();
           break;
         }
@@ -990,7 +989,7 @@ bench_async_read_worker(
       uint64_t to_read = std::min(config.block_size, config.file_size - total_read);
       available_ctx->fh = fh;
       available_ctx->offset = total_read;
-      available_ctx->completed = false;
+      available_ctx->completed.store(false, std::memory_order_release);
       available_ctx->result = 0;
       
       // Setup iovec in context (must persist for async operation)
@@ -1010,6 +1009,7 @@ bench_async_read_worker(
         stats.errors++;
         stop_signal = true;
         read_error = true;
+        available_ctx->completed.store(true, std::memory_order_release);
         queue_semaphore.release();
         break;
       }
