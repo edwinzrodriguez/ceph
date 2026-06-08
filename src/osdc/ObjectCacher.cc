@@ -2036,7 +2036,7 @@ int ObjectCacher::_wait_for_write(OSDWrite *wr, uint64_t len, ObjectSet *oset,
   } else {
     // write-thru!  flush what we just wrote.
     ceph::reentrant_condition_variable cond;
-    bool done = false;
+    std::atomic<bool> done{false};
     Context *fin = block_writes_upfront ?
       new C_ReentrantCond(cond, &done, &ret) : onfreespace;
     ceph_assert(fin);
@@ -2046,7 +2046,9 @@ int ObjectCacher::_wait_for_write(OSDWrite *wr, uint64_t len, ObjectSet *oset,
 		   << " bytes" << dendl;
     if (block_writes_upfront) {
       std::unique_lock l{cache_lock, std::adopt_lock};
-      cond.wait(l, [&done] { return done; });
+      cond.wait(l, [&done] {
+	return done.load(std::memory_order_acquire);
+      });
       l.release();
       ldout(cct, 10) << "wait_for_write woke up, ret " << ret << dendl;
       if (onfreespace)

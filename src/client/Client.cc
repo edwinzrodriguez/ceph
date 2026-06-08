@@ -2431,12 +2431,13 @@ int Client::make_request(MetaRequest *request,
       if (session->state == MetaSession::STATE_OPENING) {
 	ldout(cct, 10) << "waiting for session to mds." << mds << " to open" << dendl;
 	ceph::reentrant_condition_variable open_cond;
-	bool open_done = false;
+	std::atomic<bool> open_done{false};
 	int open_r = 0;
 	session->waiting_for_open.push_back(
 	  new C_ReentrantCond(open_cond, &open_done, &open_r));
-	ceph::client_lock::wait_on(*this, open_cond, l,
-				  [&open_done] { return open_done; });
+	ceph::client_lock::wait_on(*this, open_cond, l, [&open_done] {
+	  return open_done.load(std::memory_order_acquire);
+	});
 	continue;
       }
 
@@ -4425,12 +4426,16 @@ void Client::signal_cond_list(list<ceph::reentrant_condition_variable*>& ls)
 
 void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
-  std::unique_lock<Client> l{*this};
   ceph::reentrant_condition_variable cond;
-  bool done = false;
+  std::atomic<bool> done{false};
   int r;
-  ls.push_back(new C_ReentrantCond(cond, &done, &r));
-  ceph::client_lock::wait_on(*this, cond, l, [&done] { return done;});
+  {
+    std::unique_lock<Client> l{*this};
+    ls.push_back(new C_ReentrantCond(cond, &done, &r));
+  }
+  // Wait without client_lock so ms_dispatch can take it in handle_client_reply
+  // to signal this list (finish_contexts -> C_ReentrantCond::finish).
+  client_caps->wait_on_context_cond(cond, done);
 }
 
 void Client::signal_caps_inode(Inode *in)
@@ -13157,7 +13162,11 @@ void Client::C_nonblocking_fsync_state::advance()
       ldout(clnt->cct, 15) << "waiting on unsafe requests, last tid " << req->get_tid() <<  dendl;
 
       req->get();
-      req->waitfor_safe.push_back(advancer);
+      {
+        ceph::unique_unlock<Inode> in_unlock(*in);
+        std::unique_lock<Client> cl_lock(*clnt);
+        req->waitfor_safe.push_back(advancer);
+      }
       // ------------  here is a state machine break point
       return;
     }
@@ -13363,7 +13372,7 @@ int Client::_fsync(Inode *in, bool syncdataonly)
     req->get();
     {
       ceph::unique_unlock<Inode> in_unlock(*in);
-      client_caps->wait_on_context_list(req->waitfor_safe);
+      wait_on_context_list(req->waitfor_safe);
     }
     put_request(req);
   }
@@ -13378,8 +13387,14 @@ int Client::_fsync(Inode *in, bool syncdataonly)
     while (!in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
       ldout(cct, 10) << "ino " << in->ino << " has " << in->cap_refs[CEPH_CAP_FILE_BUFFER]
 		     << " uncommitted, waiting" << dendl;
-      ceph::unique_unlock<Inode> in_unlock(*in);
-      client_caps->wait_on_context_list(in->waitfor_commit);
+      ceph::reentrant_condition_variable cond;
+      std::atomic<bool> done{false};
+      int wr = 0;
+      {
+        std::unique_lock<Inode> in_lock(*in);
+        in->waitfor_commit.push_back(new C_ReentrantCond(cond, &done, &wr));
+      }
+      client_caps->wait_on_context_cond(cond, done);
     }
   }
 

@@ -13,8 +13,6 @@
  *
  */
 
-#include <vector>
-
 #include "ClientCaps.h"
 #include "Client.h"
 #include "Inode.h"
@@ -524,10 +522,6 @@ void ClientCaps::prepare_inode_unmount(Inode *in)
       put_cap_ref(in, cap);
   }
 
-  // Wake threads blocked in get_caps so unmount can proceed.
-  signal_caps_inode(in);
-  signal_context_list(in->waitfor_commit);
-
   {
     std::unique_lock caps_lock_guard(caps_lock);
     in->delay_cap_item.remove_myself();
@@ -632,28 +626,22 @@ int ClientCaps::get_caps_issued(const char *path, const UserPerm& perms)
 void ClientCaps::wait_on_context_list(std::vector<Context*>& ls)
 {
   reentrant_condition_variable cond;
-  bool done = false;
+  std::atomic<bool> done{false};
   int r;
-  ls.push_back(new C_ReentrantCond(cond, &done, &r));
+  {
+    std::unique_lock l{caps_lock};
+    ls.push_back(new C_ReentrantCond(cond, &done, &r));
+  }
   wait_on_context_cond(cond, done);
 }
 
 void ClientCaps::wait_on_context_cond(
-  reentrant_condition_variable& cond, bool& done)
+  reentrant_condition_variable& cond, std::atomic<bool>& done)
 {
-  // Do not wait while holding caps_lock: signal_caps_inode takes caps_lock to
-  // finish waitfor_caps contexts, which would deadlock get_caps here.
-  //
-  // Use a private wait_lock paired with cond.  C_ReentrantCond::finish() wakes
-  // via notify_all_sloppy() without holding wait_lock; that can race with an
-  // unbounded wait() and hang even after *done is set (seen in gdb with
-  // done==true).  Timed waits re-check *done so a missed notify cannot stall.
-  ReentrantLock wait_lock = make_reentrant("ClientCaps::wait_cond", false);
-  std::unique_lock l{wait_lock};
-  while (!done) {
-    cond.wait_for(l, std::chrono::milliseconds(200),
-                  [&done] { return done; });
-  }
+  std::unique_lock l{caps_lock};
+  cond.wait(l, [&done] {
+    return done.load(std::memory_order_acquire);
+  });
 }
 
 void ClientCaps::signal_caps_inode(Inode *in)
@@ -954,9 +942,6 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
   }
 
   while (1) {
-    if (client->is_unmounting())
-      return -ENOTCONN;
-
     int file_wanted = in->caps_file_wanted();
     if ((file_wanted & need) != need) {
       ldout(cct, 10) << "get_caps " << *in << " need " << ccap_string(need)
@@ -1060,7 +1045,7 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
     if (waitfor_caps || waitfor_commit) {
       auto& wait_list = waitfor_caps ? in->waitfor_caps : in->waitfor_commit;
       reentrant_condition_variable cond;
-      bool done = false;
+      std::atomic<bool> done{false};
       int r = 0;
       // Register before check_caps / ms_dispatch: a grant can arrive as soon as
       // the MDS sees our cap update; signaling an empty waitfor_caps leaves the
@@ -1107,16 +1092,13 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	  ceph::unique_unlock<Inode> in_unlock(*in, std::defer_lock);
 	  in_unlock.release();
 	  wait_on_context_cond(cond, done);
-	  in_unlock._abandon();
+
 	}
 	if (!in->is_locked_by_me()) {
 	  in->m_inode_lock.lock();
 	}
       } else {
 	wait_on_context_cond(cond, done);
-      }
-      if (had_client) {
-	ceph::client_lock::reacquire_after_drop(*client);
       }
     }
   }
@@ -1213,21 +1195,18 @@ void ClientCaps::flush_caps_sync()
   ldout(cct, 10) << __func__ << dendl;
   for (auto &q : client->mds_sessions) {
     auto s = q.second;
-    std::vector<Inode*> dirty_inodes;
     s->with_dirty_list([&](auto& dirty_list) {
-      for (auto p = dirty_list.begin(); !p.end(); ++p) {
-        dirty_inodes.push_back(*p);
+      xlist<Inode*>::iterator p = dirty_list.begin();
+      while (!p.end()) {
+        unsigned flags = CHECK_CAPS_NODELAY;
+        Inode *in = *p;
+        ++p;
+        if (p.end())
+          flags |= CHECK_CAPS_SYNCHRONOUS;
+        std::scoped_lock in_lock(*in);
+        check_caps(in, flags);
       }
     });
-    unsigned n = 0;
-    const unsigned total = dirty_inodes.size();
-    for (Inode *in : dirty_inodes) {
-      unsigned flags = CHECK_CAPS_NODELAY;
-      if (++n == total)
-        flags |= CHECK_CAPS_SYNCHRONOUS;
-      std::scoped_lock in_lock(*in);
-      check_caps(in, flags);
-    }
   }
 }
 
