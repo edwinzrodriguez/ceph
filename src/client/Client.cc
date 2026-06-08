@@ -4625,12 +4625,31 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
   }
 }
 
+static int oset_flush_cap_refs(Inode *in)
+{
+  int caps = 0;
+  if (auto it = in->cap_refs.find(CEPH_CAP_FILE_CACHE);
+      it != in->cap_refs.end() && it->second > 0) {
+    caps |= CEPH_CAP_FILE_CACHE;
+  }
+  if (auto it = in->cap_refs.find(CEPH_CAP_FILE_BUFFER);
+      it != in->cap_refs.end() && it->second > 0) {
+    caps |= CEPH_CAP_FILE_BUFFER;
+  }
+  return caps;
+}
+
 void Client::_flushed(Inode *in)
 {
   ldout(cct, 10) << "_flushed " << *in << dendl;
   ceph_assert(ceph_mutex_is_locked_by_me(*in));
 
-  put_cap_ref(in, CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_BUFFER);
+  // ObjectCacher may coalesce flush callbacks; per-write BUFFER refs are
+  // dropped in C_Write_Finisher::finish_io.  Only drop refs we still hold.
+  int caps = oset_flush_cap_refs(in);
+  if (caps) {
+    put_cap_ref(in, caps);
+  }
 }
 
 
@@ -12269,7 +12288,10 @@ void Client::C_Write_Finisher::finish_io(int r)
   bool fini;
 
   std::unique_lock in_lock(*in);
-  clnt->put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
+  if (auto it = in->cap_refs.find(CEPH_CAP_FILE_BUFFER);
+      it != in->cap_refs.end() && it->second > 0) {
+    clnt->put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
+  }
 
   if (r >= 0) {
     if (is_file_write) {
