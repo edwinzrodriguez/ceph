@@ -8377,11 +8377,14 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
   if (in->snapid != CEPH_NOSNAP) {
     return -EROFS;
   }
-  if ((mask & CEPH_SETATTR_SIZE) &&
-      (uint64_t)stx->stx_size > in->effective_size() &&
-      is_quota_bytes_exceeded(in, (uint64_t)stx->stx_size - in->effective_size(),
-			      perms)) {
-    return -EDQUOT;
+  if (mask & CEPH_SETATTR_SIZE) {
+    const uint64_t new_bytes = (uint64_t)stx->stx_size - in->effective_size();
+    if ((uint64_t)stx->stx_size > in->effective_size()) {
+      ceph::unique_unlock<Inode> in_unlock(*in);
+      if (is_quota_bytes_exceeded(in, new_bytes, perms)) {
+	return -EDQUOT;
+      }
+    }
   }
 
   // Can't set fscrypt_auth and file at the same time!
@@ -12262,7 +12265,12 @@ int64_t Client::_write_success(Fh *f, utime_t start, uint64_t fpos,
     in->size = totalwritten + offset;
     in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
-    if (is_quota_bytes_approaching(in, f->actor_perms)) {
+    bool quota_approaching = false;
+    {
+      ceph::unique_unlock<Inode> in_unlock(*in);
+      quota_approaching = is_quota_bytes_approaching(in, f->actor_perms);
+    }
+    if (quota_approaching) {
       check_caps(in, CHECK_CAPS_NODELAY);
     } else if (ClientCaps::is_max_size_approaching(in)) {
       check_caps(in, 0);
@@ -12733,9 +12741,12 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
 
   // check quota
   uint64_t endoff = offset + size;
-  if (endoff > in->size && is_quota_bytes_exceeded(in, endoff - in->size,
-						   f->actor_perms)) {
-    return -EDQUOT;
+  if (endoff > in->size) {
+    const int64_t new_bytes = endoff - in->size;
+    ceph::unique_unlock<Inode> in_unlock(*in);
+    if (is_quota_bytes_exceeded(in, new_bytes, f->actor_perms)) {
+      return -EDQUOT;
+    }
   }
 
   //bool lazy = f->mode == CEPH_FILE_MODE_LAZY;
@@ -16156,6 +16167,13 @@ int Client::_mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& p
     return -EEXIST;
   }
 
+  if (wdr.diri->snapid != CEPH_NOSNAP && wdr.diri->snapid != CEPH_SNAPDIR) {
+    return -EROFS;
+  }
+  if (is_quota_files_exceeded(wdr.diri.get(), perm)) {
+    return -EDQUOT;
+  }
+
   MetaRequest *req = nullptr;
   int res = 0;
   {
@@ -16164,12 +16182,6 @@ int Client::_mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& p
       if (int rc = may_create(wdr.diri, perm); rc < 0) {
         return rc;
       }
-    }
-    if (wdr.diri->snapid != CEPH_NOSNAP && wdr.diri->snapid != CEPH_SNAPDIR) {
-      return -EROFS;
-    }
-    if (is_quota_files_exceeded(wdr.diri.get(), perm)) {
-      return -EDQUOT;
     }
 
   bool is_snap_op = wdr.diri->snapid == CEPH_SNAPDIR;
@@ -16772,7 +16784,6 @@ int Client::_link(Inode *diri_from, const char* path_from, Inode* diri_to, const
   }
 
   auto* in = wdr_from.target.get();
-  std::unique_lock in_lock(*in);
 
   if (in->snapid != CEPH_NOSNAP || wdr_to.diri->snapid != CEPH_NOSNAP) {
     return -EROFS;
@@ -17601,9 +17612,12 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 
   uint64_t size = offset + length;
   if (!(mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)) &&
-      size > in->size &&
-      is_quota_bytes_exceeded(in, size - in->size, fh->actor_perms)) {
-    return -EDQUOT;
+      size > in->size) {
+    const int64_t new_bytes = size - in->size;
+    ceph::unique_unlock<Inode> in_unlock(*in);
+    if (is_quota_bytes_exceeded(in, new_bytes, fh->actor_perms)) {
+      return -EDQUOT;
+    }
   }
 
   int have;
@@ -17682,8 +17696,13 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
       in->change_attr++;
       in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
-      if (is_quota_bytes_approaching(in, fh->actor_perms)) {
-        check_caps(in, CHECK_CAPS_NODELAY);
+      bool quota_approaching = false;
+      {
+	ceph::unique_unlock<Inode> in_unlock(*in);
+	quota_approaching = is_quota_bytes_approaching(in, fh->actor_perms);
+      }
+      if (quota_approaching) {
+	check_caps(in, CHECK_CAPS_NODELAY);
       } else if (ClientCaps::is_max_size_approaching(in)) {
 	check_caps(in, 0);
       }
@@ -18251,7 +18270,6 @@ bool Client::ms_handle_refused(Connection *con)
 
 Inode *Client::get_quota_root(Inode *in, const UserPerm& perms, quota_max_t type)
 {
-  std::scoped_lock<Client> cl(*this);
   Inode *quota_in = root_ancestor;
   SnapRealm *realm = in->snaprealm;
 
@@ -18261,12 +18279,21 @@ Inode *Client::get_quota_root(Inode *in, const UserPerm& perms, quota_max_t type
   while (realm) {
     ldout(cct, 10) << __func__ << " realm " << realm->ino << dendl;
     if (realm->ino != in->ino) {
-      auto p = inode_map.find(vinodeno_t(realm->ino, CEPH_NOSNAP));
-      if (p == inode_map.end())
-	break;
-
-      if (p->second->quota.is_enabled(type)) {
-	quota_in = p->second;
+      Inode *candidate = nullptr;
+      {
+	std::scoped_lock<Client> cl(*this);
+	auto p = inode_map.find(vinodeno_t(realm->ino, CEPH_NOSNAP));
+	if (p == inode_map.end())
+	  break;
+	candidate = p->second;
+      }
+      bool enabled = false;
+      {
+	std::scoped_lock<Inode> realm_in_lock(*candidate);
+	enabled = candidate->quota.is_enabled(type);
+      }
+      if (enabled) {
+	quota_in = candidate;
 	break;
       }
     }
@@ -18288,15 +18315,20 @@ bool Client::check_quota_condition(Inode *in, const UserPerm& perms,
 
   while (true) {
     ceph_assert(in != NULL);
-    if (test(*in)) {
-      return true;
+    {
+      std::scoped_lock<Inode> in_lock(*in);
+      if (test(*in)) {
+	return true;
+      }
     }
 
     if (in == root_ancestor) {
       // We're done traversing, drop out
       return false;
     } else {
-      // Continue up the tree
+      // Continue up the tree.  Do not hold any inode_lock here:
+      // get_quota_root may lock quota ancestors while path_walk holds
+      // parent/child locks in the opposite order.
       in = get_quota_root(in, perms);
     }
   }
