@@ -5,6 +5,8 @@
 #ifndef CEPH_REENTRANT_LOCK_H
 #define CEPH_REENTRANT_LOCK_H
 
+#include <atomic>
+
 #include <common/ceph_mutex.h>
 #include <include/Context.h>
 
@@ -19,8 +21,16 @@ class ReentrantLockImpl {
 public:
   ReentrantLockImpl() = default;
 
+#ifdef CEPH_LOCKSTAT
+  explicit ReentrantLockImpl(
+      const lockstat_detail::LockStatTraits* traits,
+      bool ld = true,
+      bool bt = false) : mtx(traits, ld, bt) {}
+#else
   template <typename ...Args>
-  explicit ReentrantLockImpl(Args&& ...args) : mtx(std::forward<Args>(args)...) {}
+  explicit ReentrantLockImpl(Args&& ...args)
+    : mtx(ceph::make_mutex(std::forward<Args>(args)...)) {}
+#endif
 
   void lock() {
     auto tid = std::this_thread::get_id();
@@ -101,26 +111,20 @@ public:
 
 using ReentrantLock = ReentrantLockImpl<ceph::mutex>;
 
+#ifndef CEPH_LOCKSTAT
+template <typename ...Args>
+ReentrantLock make_reentrant(Args&& ...args) {
+  return ReentrantLock(std::forward<Args>(args)...);
+}
+#endif
+
 } // namespace ceph
 
-// make_reentrant must be a macro when CEPH_LOCKSTAT is defined so that LOCKSTAT(name)
-// captures __builtin_FILE/__builtin_LINE at the call site.
-//
-// Mirror the same three-way split that make_mutex uses in ceph_mutex.h:
-//  - CEPH_DEBUG_MUTEX: mutex_debug_impl takes (traits*, bool ld, bool bt), pass all args
-//  - CEPH_LOCKSTAT only: mutex_lockstat_impl takes only (traits*), drop extra args
-//  - neither: plain std::mutex, no args needed
-#ifdef CEPH_DEBUG_MUTEX
-#define make_reentrant(name, ...) ReentrantLock(LOCKSTAT(name), ##__VA_ARGS__)
-#elif defined(CEPH_LOCKSTAT)
-#define make_reentrant(name, ...) ReentrantLock(LOCKSTAT(name))
-#else
-namespace ceph {
-template <typename ...Args>
-inline ReentrantLock make_reentrant(Args&& ...) {
-  return ReentrantLock{};
-}
-} // namespace ceph
+// make_mutex is a macro when CEPH_LOCKSTAT is enabled; the lock name must be
+// expanded at the call site, so make_reentrant is a macro too.
+#ifdef CEPH_LOCKSTAT
+#define make_reentrant(name, ...) \
+  ReentrantLockImpl<ceph::mutex>(LOCKSTAT(name), ##__VA_ARGS__)
 #endif
 
 namespace std {
@@ -339,18 +343,19 @@ struct C_ReentrantLock : public Context {
 template <typename LockType = ReentrantLock>
 class C_ReentrantCond : public Context {
   reentrant_condition_variable_impl<LockType>& cond;   ///< Cond to signal
-  bool *done;   ///< true if finish() has been called
+  std::atomic<bool> *done;   ///< true if finish() has been called
   int *rval;    ///< return value
 public:
-  C_ReentrantCond(reentrant_condition_variable_impl<LockType> &c, bool *d, int *r) : cond(c), done(d), rval(r) {
-    *done = false;
+  C_ReentrantCond(reentrant_condition_variable_impl<LockType> &c,
+                  std::atomic<bool> *d, int *r)
+    : cond(c), done(d), rval(r) {
+    done->store(false, std::memory_order_relaxed);
   }
   void finish(int r) override {
     *rval = r;
-    *done = true;
-    std::atomic_thread_fence(std::memory_order_seq_cst);
     // finish() often runs from another thread that does not hold the
     // waiter's lock (e.g. cap grant on ms_dispatch waking get_caps).
+    done->store(true, std::memory_order_release);
     cond.notify_all_sloppy();
   }
 };
