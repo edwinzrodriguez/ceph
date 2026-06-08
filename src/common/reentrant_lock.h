@@ -16,16 +16,11 @@ class ReentrantLockImpl {
   std::atomic<std::thread::id> owner{};
   std::atomic<int> recursion_count{0};  // Or plain int + proper fencing
 
-  template <typename ...Args>
-  static Mutex make_mutex(Args&& ...args) {
-    return ceph::make_mutex(std::forward<Args>(args)...);
-  }
-
 public:
   ReentrantLockImpl() = default;
 
   template <typename ...Args>
-  explicit ReentrantLockImpl(Args&& ...args) : mtx(make_mutex(std::forward<Args>(args)...)) {}
+  explicit ReentrantLockImpl(Args&& ...args) : mtx(std::forward<Args>(args)...) {}
 
   void lock() {
     auto tid = std::this_thread::get_id();
@@ -106,12 +101,27 @@ public:
 
 using ReentrantLock = ReentrantLockImpl<ceph::mutex>;
 
-template <typename ...Args>
-ReentrantLock make_reentrant(Args&& ...args) {
-  return ReentrantLock(std::forward<Args>(args)...);
-}
-
 } // namespace ceph
+
+// make_reentrant must be a macro when CEPH_LOCKSTAT is defined so that LOCKSTAT(name)
+// captures __builtin_FILE/__builtin_LINE at the call site.
+//
+// Mirror the same three-way split that make_mutex uses in ceph_mutex.h:
+//  - CEPH_DEBUG_MUTEX: mutex_debug_impl takes (traits*, bool ld, bool bt), pass all args
+//  - CEPH_LOCKSTAT only: mutex_lockstat_impl takes only (traits*), drop extra args
+//  - neither: plain std::mutex, no args needed
+#ifdef CEPH_DEBUG_MUTEX
+#define make_reentrant(name, ...) ReentrantLock(LOCKSTAT(name), ##__VA_ARGS__)
+#elif defined(CEPH_LOCKSTAT)
+#define make_reentrant(name, ...) ReentrantLock(LOCKSTAT(name))
+#else
+namespace ceph {
+template <typename ...Args>
+inline ReentrantLock make_reentrant(Args&& ...) {
+  return ReentrantLock{};
+}
+} // namespace ceph
+#endif
 
 namespace std {
 
