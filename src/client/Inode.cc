@@ -295,8 +295,7 @@ bool Inode::is_any_caps()
 bool Inode::cap_is_valid(const Cap &cap) const
 {
   // cap_lease_valid takes session_lock.  When inode_lock is already held,
-  // drop it briefly so we do not invert lock order (inode_lock -> session_lock)
-  // and do not read cap_ttl/cap_gen without session_lock.
+  // drop it briefly so we do not invert lock order (inode_lock -> session_lock).
   // Snapshot cap.gen under inode_lock first; it is updated by add_update_cap.
   MetaSession *session = cap.session;
   __u32 gen = cap.gen;
@@ -309,10 +308,7 @@ bool Inode::cap_is_valid(const Cap &cap) const
 
 int Inode::caps_issued(int *implemented) const
 {
-  std::unique_lock<Inode> in_lock(*this, std::defer_lock);
-  if (!is_locked_by_me()) {
-    in_lock.lock();
-  }
+  std::unique_lock<Inode> in_lock(*this);
 
   int c = snap_caps;
   int i = 0;

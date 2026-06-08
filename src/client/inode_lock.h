@@ -147,11 +147,11 @@ template <>
 class unique_unlock<Inode> {
 public:
   explicit unique_unlock(Inode& in)
-    : _inner(in.m_inode_lock)
+    : _in(&in), _inner(in.m_inode_lock)
   {}
 
   unique_unlock(Inode& in, std::defer_lock_t)
-    : _inner(in.m_inode_lock, std::defer_lock)
+    : _in(&in), _inner(in.m_inode_lock, std::defer_lock)
   {}
 
   void release()
@@ -166,7 +166,19 @@ public:
 
   void reacquire()
   {
+    if (!_inner.released()) {
+      return;
+    }
+    auto& client = _in->get_client_lock();
+    ceph::unique_unlock<ceph::ReentrantLock> client_stash(client, std::defer_lock);
+    if (client.is_locked_by_me()) {
+      client_stash.release();
+    }
     _inner.reacquire();
+    if (client_stash.released()) {
+      client_stash.reacquire();
+      client_stash._abandon();
+    }
   }
 
   void _abandon() noexcept
@@ -174,13 +186,16 @@ public:
     _inner._abandon();
   }
 
-  // Let _inner destructor restore the lock
-  ~unique_unlock() noexcept(false) = default;
+  ~unique_unlock() noexcept(false)
+  {
+    reacquire();
+  }
 
   unique_unlock(const unique_unlock&) = delete;
   unique_unlock& operator=(const unique_unlock&) = delete;
 
 private:
+  Inode *_in;
   unique_unlock<ReentrantLock> _inner;
 };
 

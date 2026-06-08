@@ -4931,33 +4931,43 @@ void Client::flush_caps_sync()
 
 void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
 {
-  const bool held = ceph_mutex_is_locked_by_me(*this);
-  std::unique_lock<Client> l(*this, std::defer_lock);
-  if (!held) {
-    l.lock();
-  }
-  while (in->flushing_caps) {
-    if (in->flushing_cap_tids.empty()) {
-      lderr(cct) << __func__ << " " << *in
-                 << " has flushing_caps " << ccap_string(in->flushing_caps)
-                 << " but no flushing_cap_tids; clearing stale state" << dendl;
-      in->flushing_caps = 0;
-      client_caps->dec_num_flushing_caps();
-      if (in->auth_cap) {
-        MetaSession *session = in->auth_cap->session;
-        session->with_flushing_caps([in](auto& flushing_caps) {
-          in->flushing_cap_item.remove_myself();
-        });
+  while (true) {
+    bool wait = false;
+    {
+      std::unique_lock<Inode> in_lock(*in, std::defer_lock);
+      if (!in->is_locked_by_me()) {
+        in_lock.lock();
       }
+      if (!in->flushing_caps) {
+        break;
+      }
+      if (in->flushing_cap_tids.empty()) {
+        lderr(cct) << __func__ << " " << *in
+                   << " has flushing_caps " << ccap_string(in->flushing_caps)
+                   << " but no flushing_cap_tids; clearing stale state" << dendl;
+        in->flushing_caps = 0;
+        client_caps->dec_num_flushing_caps();
+        if (in->auth_cap) {
+          MetaSession *session = in->auth_cap->session;
+          session->with_flushing_caps([in](auto& flushing_caps) {
+            in->flushing_cap_item.remove_myself();
+          });
+        }
+        break;
+      }
+      map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
+      if (it->first > want) {
+        break;
+      }
+      ldout(cct, 10) << __func__ << " on " << *in << " flushing "
+                     << ccap_string(it->second) << " want " << want
+                     << " last " << it->first << dendl;
+      wait = true;
+    }
+    if (!wait) {
       break;
     }
-    map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
-    if (it->first > want)
-      break;
-    ldout(cct, 10) << __func__ << " on " << *in << " flushing "
-		   << ccap_string(it->second) << " want " << want
-		   << " last " << it->first << dendl;
-    wait_on_context_list(in->waitfor_caps);
+    client_caps->wait_on_context_list(in->waitfor_caps);
   }
 }
 
@@ -5317,7 +5327,7 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
 {
   mds_rank_t mds = mds_rank_t(m->get_source().num());
 
-  std::scoped_lock<Client> cl(*this);
+  std::unique_lock<Client> cl(*this);
   auto session = _get_mds_session(mds, m->get_connection().get());
   if (!session) {
     return;
@@ -5389,7 +5399,11 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
 
   switch (m->get_op()) {
     case CEPH_CAP_OP_EXPORT: return handle_cap_export(session.get(), in, m);
-    case CEPH_CAP_OP_FLUSHSNAP_ACK: return handle_cap_flushsnap_ack(session.get(), in, m);
+    case CEPH_CAP_OP_FLUSHSNAP_ACK: {
+      cl.unlock();
+      std::scoped_lock<Inode> in_lock(*in);
+      return handle_cap_flushsnap_ack(session.get(), in, m);
+    }
     case CEPH_CAP_OP_IMPORT: /* no return */ handle_cap_import(session.get(), in, m);
   }
 
@@ -5404,7 +5418,11 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
         std::unique_lock<Inode> in_lock(*in);
         return handle_cap_grant(session.get(), in, &cap, m);
       }
-      case CEPH_CAP_OP_FLUSH_ACK: return handle_cap_flush_ack(session.get(), in, &cap, m);
+      case CEPH_CAP_OP_FLUSH_ACK: {
+        cl.unlock();
+        std::scoped_lock<Inode> in_lock(*in);
+        return handle_cap_flush_ack(session.get(), in, &cap, m);
+      }
     }
   } else {
     ldout(cct, 5) << __func__ << " don't have " << *in << " cap on mds." << mds << dendl;
@@ -5519,6 +5537,7 @@ void Client::handle_cap_trunc(MetaSession *session, Inode *in, const MConstRef<M
 
 void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, const MConstRef<MClientCaps>& m)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
   ceph_tid_t flush_ack_tid = m->get_client_tid();
   int dirty = m->get_dirty();
   int cleaned = 0;
@@ -5603,6 +5622,7 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, con
 
 void Client::handle_cap_flushsnap_ack(MetaSession *session, Inode *in, const MConstRef<MClientCaps>& m)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
   ceph_tid_t flush_ack_tid = m->get_client_tid();
   mds_rank_t mds = session->mds_num;
   ceph_assert(in->caps.count(mds));
@@ -13341,7 +13361,10 @@ int Client::_fsync(Inode *in, bool syncdataonly)
     ldout(cct, 15) << "waiting on unsafe requests, last tid " << req->get_tid() <<  dendl;
 
     req->get();
-    client_caps->wait_on_context_list(req->waitfor_safe);
+    {
+      ceph::unique_unlock<Inode> in_unlock(*in);
+      client_caps->wait_on_context_list(req->waitfor_safe);
+    }
     put_request(req);
   }
 
@@ -13355,6 +13378,7 @@ int Client::_fsync(Inode *in, bool syncdataonly)
     while (!in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
       ldout(cct, 10) << "ino " << in->ino << " has " << in->cap_refs[CEPH_CAP_FILE_BUFFER]
 		     << " uncommitted, waiting" << dendl;
+      ceph::unique_unlock<Inode> in_unlock(*in);
       client_caps->wait_on_context_list(in->waitfor_commit);
     }
   }
