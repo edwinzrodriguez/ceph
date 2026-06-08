@@ -627,21 +627,25 @@ void ClientCaps::wait_on_context_list(std::vector<Context*>& ls)
 {
   reentrant_condition_variable cond;
   std::atomic<bool> done{false};
+  std::atomic<bool> wake_complete{false};
   int r;
   {
     std::unique_lock l{caps_lock};
-    ls.push_back(new C_ReentrantCond(cond, &done, &r));
+    ls.push_back(new C_ReentrantCond(cond, &done, &r, &wake_complete));
   }
-  wait_on_context_cond(cond, done);
+  wait_on_context_cond(cond, done, wake_complete);
 }
 
 void ClientCaps::wait_on_context_cond(
-  reentrant_condition_variable& cond, std::atomic<bool>& done)
+  reentrant_condition_variable& cond,
+  std::atomic<bool>& done,
+  std::atomic<bool>& wake_complete)
 {
   std::unique_lock l{caps_lock};
   cond.wait(l, [&done] {
     return done.load(std::memory_order_acquire);
   });
+  ceph::wait_for_reentrant_cond_broadcast(wake_complete);
 }
 
 void ClientCaps::signal_caps_inode(Inode *in)
@@ -1046,11 +1050,12 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
       auto& wait_list = waitfor_caps ? in->waitfor_caps : in->waitfor_commit;
       reentrant_condition_variable cond;
       std::atomic<bool> done{false};
+      std::atomic<bool> wake_complete{false};
       int r = 0;
       // Register before check_caps / ms_dispatch: a grant can arrive as soon as
       // the MDS sees our cap update; signaling an empty waitfor_caps leaves the
       // waiter stuck with done=false even after max_size is granted.
-      wait_list.push_back(new C_ReentrantCond(cond, &done, &r));
+      wait_list.push_back(new C_ReentrantCond(cond, &done, &r, &wake_complete));
       if (waitfor_caps) {
 	// We may have already sent a max_size request (requested_max_size ==
 	// wanted_max_size) but the MDS grant was still too small.  Allow
@@ -1091,14 +1096,14 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	{
 	  ceph::unique_unlock<Inode> in_unlock(*in, std::defer_lock);
 	  in_unlock.release();
-	  wait_on_context_cond(cond, done);
+	  wait_on_context_cond(cond, done, wake_complete);
 
 	}
 	if (!in->is_locked_by_me()) {
 	  in->m_inode_lock.lock();
 	}
       } else {
-	wait_on_context_cond(cond, done);
+	wait_on_context_cond(cond, done, wake_complete);
       }
     }
   }
@@ -1195,18 +1200,20 @@ void ClientCaps::flush_caps_sync()
   ldout(cct, 10) << __func__ << dendl;
   for (auto &q : client->mds_sessions) {
     auto s = q.second;
+    std::vector<Inode*> dirty_inodes;
     s->with_dirty_list([&](auto& dirty_list) {
-      xlist<Inode*>::iterator p = dirty_list.begin();
-      while (!p.end()) {
-        unsigned flags = CHECK_CAPS_NODELAY;
-        Inode *in = *p;
-        ++p;
-        if (p.end())
-          flags |= CHECK_CAPS_SYNCHRONOUS;
-        std::scoped_lock in_lock(*in);
-        check_caps(in, flags);
+      for (auto p = dirty_list.begin(); !p.end(); ++p) {
+        dirty_inodes.push_back(*p);
       }
     });
+    for (size_t i = 0; i < dirty_inodes.size(); ++i) {
+      unsigned flags = CHECK_CAPS_NODELAY;
+      if (i + 1 == dirty_inodes.size()) {
+        flags |= CHECK_CAPS_SYNCHRONOUS;
+      }
+      std::scoped_lock in_lock(*dirty_inodes[i]);
+      check_caps(dirty_inodes[i], flags);
+    }
   }
 }
 

@@ -2432,12 +2432,14 @@ int Client::make_request(MetaRequest *request,
 	ldout(cct, 10) << "waiting for session to mds." << mds << " to open" << dendl;
 	ceph::reentrant_condition_variable open_cond;
 	std::atomic<bool> open_done{false};
+	std::atomic<bool> open_wake_complete{false};
 	int open_r = 0;
 	session->waiting_for_open.push_back(
-	  new C_ReentrantCond(open_cond, &open_done, &open_r));
+	  new C_ReentrantCond(open_cond, &open_done, &open_r, &open_wake_complete));
 	ceph::client_lock::wait_on(*this, open_cond, l, [&open_done] {
 	  return open_done.load(std::memory_order_acquire);
 	});
+	ceph::wait_for_reentrant_cond_broadcast(open_wake_complete);
 	continue;
       }
 
@@ -4428,14 +4430,15 @@ void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
   ceph::reentrant_condition_variable cond;
   std::atomic<bool> done{false};
+  std::atomic<bool> wake_complete{false};
   int r;
   {
     std::unique_lock<Client> l{*this};
-    ls.push_back(new C_ReentrantCond(cond, &done, &r));
+    ls.push_back(new C_ReentrantCond(cond, &done, &r, &wake_complete));
   }
   // Wait without client_lock so ms_dispatch can take it in handle_client_reply
   // to signal this list (finish_contexts -> C_ReentrantCond::finish).
-  client_caps->wait_on_context_cond(cond, done);
+  client_caps->wait_on_context_cond(cond, done, wake_complete);
 }
 
 void Client::signal_caps_inode(Inode *in)
@@ -13389,12 +13392,14 @@ int Client::_fsync(Inode *in, bool syncdataonly)
 		     << " uncommitted, waiting" << dendl;
       ceph::reentrant_condition_variable cond;
       std::atomic<bool> done{false};
+      std::atomic<bool> wake_complete{false};
       int wr = 0;
       {
         std::unique_lock<Inode> in_lock(*in);
-        in->waitfor_commit.push_back(new C_ReentrantCond(cond, &done, &wr));
+        in->waitfor_commit.push_back(
+	  new C_ReentrantCond(cond, &done, &wr, &wake_complete));
       }
-      client_caps->wait_on_context_cond(cond, done);
+      client_caps->wait_on_context_cond(cond, done, wake_complete);
     }
   }
 
