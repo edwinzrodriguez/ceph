@@ -6,6 +6,7 @@
 #define CEPH_REENTRANT_LOCK_H
 
 #include <atomic>
+#include <thread>
 
 #include <common/ceph_mutex.h>
 #include <include/Context.h>
@@ -324,6 +325,15 @@ public:
 
 using reentrant_condition_variable = reentrant_condition_variable_impl<ReentrantLock>;
 
+// finish() may call notify_all_sloppy() from another thread.  Wait until that
+// broadcast completes before destroying a stack-allocated cond.
+inline void wait_for_reentrant_cond_broadcast(std::atomic<bool>& wake_complete)
+{
+  while (!wake_complete.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+}
+
 struct C_ReentrantLock : public Context {
   ceph::ReentrantLock *lock;
   Context *fin;
@@ -344,12 +354,17 @@ template <typename LockType = ReentrantLock>
 class C_ReentrantCond : public Context {
   reentrant_condition_variable_impl<LockType>& cond;   ///< Cond to signal
   std::atomic<bool> *done;   ///< true if finish() has been called
+  std::atomic<bool> *wake_complete;  ///< true after notify_all_sloppy()
   int *rval;    ///< return value
 public:
   C_ReentrantCond(reentrant_condition_variable_impl<LockType> &c,
-                  std::atomic<bool> *d, int *r)
-    : cond(c), done(d), rval(r) {
+                  std::atomic<bool> *d, int *r,
+                  std::atomic<bool> *wc = nullptr)
+    : cond(c), done(d), wake_complete(wc), rval(r) {
     done->store(false, std::memory_order_relaxed);
+    if (wake_complete) {
+      wake_complete->store(false, std::memory_order_relaxed);
+    }
   }
   void finish(int r) override {
     *rval = r;
@@ -357,6 +372,9 @@ public:
     // waiter's lock (e.g. cap grant on ms_dispatch waking get_caps).
     done->store(true, std::memory_order_release);
     cond.notify_all_sloppy();
+    if (wake_complete) {
+      wake_complete->store(true, std::memory_order_release);
+    }
   }
 };
 
