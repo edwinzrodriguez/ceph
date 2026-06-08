@@ -241,7 +241,7 @@ public: // Methods
   [[nodiscard]] LockStatEntry*
   get_lockstat_entry() const
   {
-    return m_lockstat_entry;
+    return m_lockstat_entry.load(std::memory_order_acquire);
   }
 
   ///
@@ -284,12 +284,12 @@ protected: // members
   ///
   /// @brief hash value of lock derived from lock name, function, source file and line
   ///
-  uint64_t m_lockstat_hash;
+  std::atomic<uint64_t> m_lockstat_hash;
 
   ///
   /// @brief Pointer to entry in table
   ///
-  LockStatEntry* m_lockstat_entry;
+  std::atomic<LockStatEntry*> m_lockstat_entry;
 
   ///
   /// @brief Lock for managing access to the other fields
@@ -487,7 +487,10 @@ public: // member variables
   ///
   /// @brief Type of lock for tracking
   ///
-  LockStatTraits::LockStatType m_lock_type;
+  /// Shared across all lock instances with the same name; updated concurrently
+  /// when multiple mutexes are constructed in parallel.
+  ///
+  std::atomic<uint8_t> m_lock_type;
 
   ///
   /// @brief enable tripwire for this lock
@@ -706,13 +709,14 @@ LockStatTraits::get_lockstat_traits(
 {
   if (g_global_enable) {
     LockStatTraitsTableT& traits_table = get_traits_table();
-    if (traits_table[lock_index].m_lockstat_hash == hash_index) {
-      ceph_assert(traits_table[lock_index].m_lockstat_entry != nullptr);
-      ceph_assert(traits_table[lock_index].get_name().find(name) == 0);
-      ceph_assert(
-          traits_table[lock_index].m_lockstat_entry->get_lock_id() ==
-          lock_index);
-      return &traits_table[lock_index];
+    LockStatTraits& traits = traits_table[lock_index];
+    if (traits.m_lockstat_hash.load(std::memory_order_acquire) == hash_index) {
+      LockStatEntry *entry =
+        traits.m_lockstat_entry.load(std::memory_order_relaxed);
+      ceph_assert(entry != nullptr);
+      ceph_assert(entry->m_lock_name.find(name) == 0);
+      ceph_assert(entry->get_lock_id() == lock_index);
+      return &traits;
     } else {
       return _get_lockstat_traits_impl(
           name, hash_index, lock_index, file_name, line_number, function_name);
@@ -743,7 +747,8 @@ LockStatTraits::get_unique_name(uintptr_t value) const
 inline LockStatTraits::LockStatType
 LockStatTraits::get_lock_type() const
 {
-  return get_lockstat_entry()->m_lock_type;
+  return static_cast<LockStatType>(
+    get_lockstat_entry()->m_lock_type.load(std::memory_order_relaxed));
 }
 
 }; // namespace lockstat_detail

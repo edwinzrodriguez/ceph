@@ -39,15 +39,18 @@ std::atomic<size_t> LockStatTraits::g_lock_collisions;
 
 LockStatTraits::LockStatTraits() :
   m_lockstat_hash(0), m_lockstat_entry(nullptr)
-{}
+{
+}
 
 LockStatTraits::~LockStatTraits() = default;
 
 void
 LockStatTraits::_set_locktype_impl(const LockStatType lockType) const
 {
-  if (m_lockstat_entry && m_lockstat_entry->get_lock_id() != 0) {
-    m_lockstat_entry->m_lock_type = lockType;
+  LockStatEntry *entry = m_lockstat_entry.load(std::memory_order_acquire);
+  if (entry && entry->get_lock_id() != 0) {
+    entry->m_lock_type.store(
+      static_cast<uint8_t>(lockType), std::memory_order_relaxed);
   }
 }
 
@@ -65,28 +68,28 @@ LockStatTraits::_get_lockstat_traits_impl(
   for (uint64_t i = 0; i < kHash_table_max_size; i++) {
     LockStatTraits* traits = iter;
 
-    if (traits->m_lockstat_hash == hash_index) {
-      ceph_assert(traits->m_lockstat_entry != nullptr);
+    if (traits->m_lockstat_hash.load(std::memory_order_acquire) == hash_index) {
+      ceph_assert(traits->m_lockstat_entry.load(std::memory_order_relaxed) != nullptr);
       ceph_assert(traits->get_name().find(name) == 0);
       return traits;
     }
 
     // If this slot is unused, return it
-    if (traits->m_lockstat_hash == 0) {
+    if (traits->m_lockstat_hash.load(std::memory_order_relaxed) == 0) {
       // Try to lock the traits object before updating its fields
       std::unique_lock _(traits->m_lockstat_mutex);
 
       // Perhaps another thread has already acquired this
       // trait for us
-      if (traits->m_lockstat_hash == hash_index) {
-        ceph_assert(traits->m_lockstat_entry != nullptr);
+      if (traits->m_lockstat_hash.load(std::memory_order_relaxed) == hash_index) {
+        ceph_assert(traits->m_lockstat_entry.load(std::memory_order_relaxed) != nullptr);
         ceph_assert(traits->get_name().find(name) == 0);
         return traits;
       }
 
       // Perhaps another thread acquired the traits object for
       // a different hash, in which case move on to the next
-      if (traits->m_lockstat_hash != 0) {
+      if (traits->m_lockstat_hash.load(std::memory_order_relaxed) != 0) {
         continue;
       }
 
@@ -99,11 +102,13 @@ LockStatTraits::_get_lockstat_traits_impl(
       lockstat_entry->m_lock_name =
           get_lockstat_name(name, file_name, line, func);
       ceph_assert(lockstat_entry->m_lock_id == entry_index);
-      lockstat_entry->m_lock_type = LockStatType::UNKNOWN;
+      lockstat_entry->m_lock_type.store(
+        static_cast<uint8_t>(LockStatType::UNKNOWN),
+        std::memory_order_relaxed);
       lockstat_entry->reset();
 
-      traits->m_lockstat_entry = lockstat_entry;
-      traits->m_lockstat_hash = hash_index;
+      traits->m_lockstat_entry.store(lockstat_entry, std::memory_order_relaxed);
+      traits->m_lockstat_hash.store(hash_index, std::memory_order_release);
       ceph_assert(
           LockStatEntry::get_lockstat_table()[entry_index].m_lock_name.find(
               name) == 0);
@@ -220,10 +225,14 @@ LockStatTraits::record_wait_time(
     const lockstat_clock::duration wait_time,
     const LockMode mode)
 {
-  if (!traits || !traits->m_lockstat_entry) {
+  if (!traits) {
     return;
   }
-  LockStatEntry* lockstat_entry = traits->m_lockstat_entry;
+  LockStatEntry* lockstat_entry =
+    traits->m_lockstat_entry.load(std::memory_order_acquire);
+  if (!lockstat_entry) {
+    return;
+  }
 
   LockStatEntry::LockStats& stats(lockstat_entry->m_stats_table[sched_getcpu()]);
   stats.m_wait_count[static_cast<size_t>(mode)]++;
@@ -270,7 +279,7 @@ LockStatEntry::LockStatEntry() :
   m_lock_id(0),
   m_num_instances(0),
   m_max_wait{},
-  m_lock_type(LockStatTraits::LockStatType::UNKNOWN),
+  m_lock_type(static_cast<uint8_t>(LockStatTraits::LockStatType::UNKNOWN)),
   m_tripwire_enabled(false)
 
 {
@@ -282,7 +291,7 @@ LockStatEntry::LockStatEntry(const LockStatEntry& other) :
   m_lock_id(other.m_lock_id),
   m_num_instances(other.m_num_instances.load()),
   m_lock_name(other.m_lock_name),
-  m_lock_type(other.m_lock_type),
+  m_lock_type(other.m_lock_type.load(std::memory_order_relaxed)),
   m_tripwire_enabled(other.m_tripwire_enabled)
 
 {}
@@ -446,7 +455,8 @@ LockStatEntry::dump_formatted(Formatter* f)
         f->open_object_section("entry");
         f->dump_unsigned("id", li.get_lock_id());
         f->dump_string("name", li.m_lock_name);
-        f->dump_int("type", static_cast<int>(li.m_lock_type));
+        f->dump_int("type", static_cast<int>(
+          li.m_lock_type.load(std::memory_order_relaxed)));
         f->dump_unsigned(
             "num_instances", li.m_num_instances.load(std::memory_order_relaxed));
         f->dump_unsigned(
