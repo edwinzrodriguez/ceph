@@ -295,11 +295,11 @@ bool Inode::is_any_caps()
 bool Inode::cap_is_valid(const Cap &cap) const
 {
   // cap_lease_valid takes session_lock.  When inode_lock is already held,
-  // avoid inverting lock order (inode_lock -> session_lock) with paths that
-  // take session_lock first (e.g. flush_caps_sync dirty_list iteration).
+  // drop it briefly so we do not invert lock order (inode_lock -> session_lock)
+  // and do not read cap_ttl/cap_gen without session_lock.
+  ceph::unique_unlock<Inode> in_unlock(const_cast<Inode&>(*this), std::defer_lock);
   if (is_locked_by_me()) {
-    return cap.gen <= cap.session->cap_gen &&
-           ceph_clock_now() < cap.session->cap_ttl;
+    in_unlock.release();
   }
   return cap.session->cap_lease_valid(cap.gen);
 }
