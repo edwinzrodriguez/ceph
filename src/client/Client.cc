@@ -3282,6 +3282,7 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
       session->with_unsafe_requests([&](auto&) {
         request->unsafe_item.remove_myself();
       });
+      cl.unlock();
       if (is_dir_operation(request)) {
         Inode *dir = request->inode();
         ceph_assert(dir);
@@ -3293,6 +3294,7 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
         request->unsafe_target_item.remove_myself();
       }
       signal_context_list(request->waitfor_safe);
+      cl.lock();
     }
     session->with_requests([&](auto&) {
       request->item.remove_myself();
@@ -5423,7 +5425,8 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
       case CEPH_CAP_OP_IMPORT:
       case CEPH_CAP_OP_REVOKE:
       case CEPH_CAP_OP_GRANT: {
-        std::unique_lock<Inode> in_lock(*in);
+        cl.unlock();
+        std::scoped_lock<Inode> in_lock(*in);
         return handle_cap_grant(session.get(), in, &cap, m);
       }
       case CEPH_CAP_OP_FLUSH_ACK: {
@@ -6340,8 +6343,8 @@ int Client::_getattr_for_perm(const InodeRef& in, const UserPerm& perms)
 
 vinodeno_t Client::_get_vino(Inode *in)
 {
-  /* The caller must hold the client lock */
-  std::unique_lock in_lock(*in);
+  // Caller must hold client_lock or inode_lock for a consistent view; do not
+  // take both (see lock_order.h).
   return vinodeno_t(in->ino, in->snapid);
 }
 
@@ -7108,7 +7111,9 @@ void Client::_unmount(bool abort)
       });
     }
   } else {
+    lock.unlock();
     flush_caps_sync();
+    lock.lock();
     wait_sync_caps(last_flush_tid);
   }
 
@@ -7168,8 +7173,9 @@ void Client::_unmount(bool abort)
       for (Inode *in : pinned)
 	put_inode(in, 1);
     }
-    lock.lock();
+    lock.unlock();
     flush_caps_sync();
+    lock.lock();
     wait_sync_caps(last_flush_tid);
     delay_put_inodes(true);
     trim_cache();
@@ -14159,8 +14165,11 @@ int Client::_sync_fs()
     objectcacher->flush_all(cond.get());
   }
 
-  // flush caps
-  flush_caps_sync();
+  // flush caps (inode_lock only; see lock_order.h)
+  {
+    ceph::unique_unlock<Client> cl_drop(*this);
+    flush_caps_sync();
+  }
   ceph_tid_t flush_tid = last_flush_tid;
 
   // flush the mdlog before waiting for unsafe requests.

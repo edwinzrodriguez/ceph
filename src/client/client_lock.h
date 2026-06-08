@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 
+#include "client/lock_order.h"
 #include "common/ceph_mutex.h"
 #include "common/reentrant_lock.h"
 
@@ -53,11 +54,13 @@ public:
 
   void lock()
   {
+    ceph::client_lock::order::assert_no_inode_lock();
     _rl.lock();
   }
 
   bool try_lock()
   {
+    ceph::client_lock::order::assert_no_inode_lock();
     return _rl.try_lock();
   }
 

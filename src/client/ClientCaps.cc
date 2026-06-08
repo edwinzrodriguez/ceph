@@ -939,6 +939,7 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 
   int r = 0;
   {
+    ceph::unique_unlock<Inode> in_drop(*in);
     std::unique_lock<Client> lock(*client);
     r = client->check_pool_perm(in, need);
     if (r < 0)
@@ -1047,6 +1048,7 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
     }
 
     if (waitfor_caps || waitfor_commit) {
+      std::unique_lock<Inode> in_relock(*in, std::defer_lock);
       auto& wait_list = waitfor_caps ? in->waitfor_caps : in->waitfor_commit;
       reentrant_condition_variable cond;
       std::atomic<bool> done{false};
@@ -1100,7 +1102,7 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 
 	}
 	if (!in->is_locked_by_me()) {
-	  in->m_inode_lock.lock();
+	  in_relock.lock();
 	}
       } else {
 	wait_on_context_cond(cond, done, wake_complete);
@@ -1195,8 +1197,8 @@ void ClientCaps::early_kick_flushing_caps(MetaSession *session)
 
 void ClientCaps::flush_caps_sync()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->m_client_lock));
-  
+  ceph_assert(ceph_mutex_is_not_locked_by_me(client->m_client_lock));
+
   ldout(cct, 10) << __func__ << dendl;
   for (auto &q : client->mds_sessions) {
     auto s = q.second;

@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 
+#include "client/lock_order.h"
 #include "common/ceph_mutex.h"
 #include "common/reentrant_lock.h"
 
@@ -15,10 +16,11 @@
 namespace std {
 
 /**
- * inode_lock before client_lock.  When client_lock is already held, drop the
- * full client recursion depth via unique_unlock, take inode_lock, then
- * restore client depth before returning.  unlock() releases only the inode
- * level owned by this guard.
+ * RAII for Inode::m_inode_lock.
+ *
+ * client_lock and inode_lock must not be held by the same thread at the same
+ * time.  Drop client_lock (e.g. unique_unlock<Client> or cl.unlock()) before
+ * taking inode_lock.
  */
 template <>
 class unique_lock<Inode> {
@@ -41,30 +43,28 @@ public:
 
   unique_lock(const Inode& in, adopt_lock_t) noexcept
     : _in(&in), _rl(in.m_inode_lock, adopt_lock)
-  {}
+  {
+    ceph::client_lock::order::on_inode_locked();
+  }
 
   unique_lock(const unique_lock&) = delete;
   unique_lock& operator=(const unique_lock&) = delete;
   unique_lock(unique_lock&&) = delete;
   unique_lock& operator=(unique_lock&&) = delete;
 
-  ~unique_lock() = default;
+  ~unique_lock()
+  {
+    unlock();
+  }
 
   void lock()
   {
-    if (!_in) {
+    if (!_in || _rl.owns_lock()) {
       return;
     }
-    auto& client = _in->get_client_lock();
-    ceph::unique_unlock<ceph::ReentrantLock> client_stash(client, std::defer_lock);
-    if (client.is_locked_by_me()) {
-      client_stash.release();
-    }
+    ceph::client_lock::order::assert_no_client_lock(_in->get_client_lock());
     _rl.lock();
-    if (client_stash.released()) {
-      client_stash.reacquire();
-      client_stash._abandon();
-    }
+    ceph::client_lock::order::on_inode_locked();
   }
 
   bool try_lock()
@@ -75,35 +75,27 @@ public:
     if (_rl.owns_lock()) {
       return true;
     }
-    auto& client = _in->get_client_lock();
-    ceph::unique_unlock<ceph::ReentrantLock> client_stash(client, std::defer_lock);
-    if (client.is_locked_by_me()) {
-      client_stash.release();
-    }
+    ceph::client_lock::order::assert_no_client_lock(_in->get_client_lock());
     if (!_rl.try_lock()) {
-      if (client_stash.released()) {
-        client_stash.reacquire();
-        client_stash._abandon();
-      }
       return false;
     }
-    if (client_stash.released()) {
-      client_stash.reacquire();
-      client_stash._abandon();
-    }
+    ceph::client_lock::order::on_inode_locked();
     return true;
   }
 
-  // Reverse the action of locking, first release
-  // the client lock then reacquire the client_lock if
-  // was previously held.
   void unlock()
   {
-    _rl.unlock();
+    if (_rl.owns_lock()) {
+      ceph::client_lock::order::on_inode_unlocked();
+      _rl.unlock();
+    }
   }
 
   Inode *release() noexcept
   {
+    if (_rl.owns_lock()) {
+      ceph::client_lock::order::on_inode_unlocked();
+    }
     _rl.release();
     Inode *in = const_cast<Inode *>(_in);
     _in = nullptr;
@@ -147,8 +139,10 @@ template <>
 class unique_unlock<Inode> {
 public:
   explicit unique_unlock(Inode& in)
-    : _in(&in), _inner(in.m_inode_lock)
-  {}
+    : _in(&in), _inner(in.m_inode_lock, std::defer_lock)
+  {
+    release();
+  }
 
   unique_unlock(Inode& in, std::defer_lock_t)
     : _in(&in), _inner(in.m_inode_lock, std::defer_lock)
@@ -156,6 +150,9 @@ public:
 
   void release()
   {
+    if (!_inner.released() && _in->m_inode_lock.is_locked_by_me()) {
+      ceph::client_lock::order::on_inode_unlocked();
+    }
     _inner.release();
   }
 
@@ -169,20 +166,16 @@ public:
     if (!_inner.released()) {
       return;
     }
-    auto& client = _in->get_client_lock();
-    ceph::unique_unlock<ceph::ReentrantLock> client_stash(client, std::defer_lock);
-    if (client.is_locked_by_me()) {
-      client_stash.release();
-    }
+    ceph::client_lock::order::assert_no_client_lock(_in->get_client_lock());
     _inner.reacquire();
-    if (client_stash.released()) {
-      client_stash.reacquire();
-      client_stash._abandon();
-    }
+    ceph::client_lock::order::on_inode_locked();
   }
 
   void _abandon() noexcept
   {
+    if (!_inner.released() && _in->m_inode_lock.is_locked_by_me()) {
+      ceph::client_lock::order::on_inode_unlocked();
+    }
     _inner._abandon();
   }
 
