@@ -1648,9 +1648,9 @@ void Client::clear_dir_complete_and_ordered(Inode *diri, bool complete)
  * insert results from readdir or lssnap into the metadata cache.
  */
 void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
-                                    Inode *diri, Inode *diri_other) {
-
-  auto reply = request->reply;
+                                    Inode *diri, Inode *diri_other,
+				    const ceph::cref_t<MClientReply>& reply)
+{
   ConnectionRef con = reply->get_connection();
   uint64_t features;
   if(session->mds_features.test(CEPHFS_FEATURE_REPLY_ENCODING)) {
@@ -1844,9 +1844,9 @@ void Client::insert_readdir_results(MetaRequest *request, MetaSession *session,
  *
  * insert a trace from a MDS reply into the cache.
  */
-Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
+Inode* Client::insert_trace(MetaRequest *request, MetaSession *session,
+			    const ceph::cref_t<MClientReply>& reply)
 {
-  auto reply = request->reply;  // Copy intrusive_ptr to prevent race condition
   int op = request->get_op();
 
   ldout(cct, 10) << "insert_trace from " << request->sent_stamp << " mds." << session->mds_num
@@ -2017,7 +2017,8 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
       insert_readdir_results(request,
 	session,
 	in,
-	nullptr);
+	nullptr,
+	reply);
     } else if (op == CEPH_MDS_OP_LOOKUPNAME) {
       // hack: return parent inode instead
       in = diri;
@@ -2027,7 +2028,8 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session)
       insert_readdir_results(request,
 	session,
 	request->inode(),
-	in);
+	in,
+	reply);
     }
 
     if (request->dentry() == NULL && in != request->inode()) {
@@ -3220,10 +3222,11 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
   request->reply = reply;
 
   // Release m_client_lock before calling insert_trace to avoid lock ordering issues
-  // insert_trace -> add_update_inode acquires inode_lock
+  // insert_trace -> add_update_inode acquires inode_lock.  Pass reply by value so
+  // insert_trace does not read request->reply after make_request may move it.
   {
     ceph::unique_unlock<Client> cl_unlock(*this);
-    insert_trace(request, session.get());
+    insert_trace(request, session.get(), reply);
   }
 
   // Handle unsafe reply
@@ -16778,6 +16781,7 @@ int Client::_link(Inode *diri_from, const char* path_from, Inode* diri_to, const
     return -EDQUOT;
   }
 
+  std::unique_lock in_lock(*in);
   in->break_all_delegs();
   MetaRequest *req = new MetaRequest(CEPH_MDS_OP_LINK);
 
