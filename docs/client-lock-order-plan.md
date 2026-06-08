@@ -70,6 +70,7 @@ Hot paths (`ll_read` / `ll_write`) keep **inode_lock only**. Metadata paths (`ms
 | `Client.cc` `_get_vino` | client + inode lock | **fixed** (no inode lock) |
 | `inode_lock.h` | stash/reacquire bridge | **removed** |
 | `Client.cc` path walk / setattr / … | client then inode | pending |
+| `ClientCaps::add_update_cap` / `remove_cap` | inode + `get_snap_realm` | **fixed** |
 
 ## Finding violations
 

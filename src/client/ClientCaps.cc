@@ -40,6 +40,18 @@
 
 using std::string;
 
+SnapRealm *ClientCaps::_get_snap_realm_unlocked(Inode *in, inodeno_t realm)
+{
+  ceph::unique_unlock<Inode> in_drop(*in);
+  return client->get_snap_realm(realm);
+}
+
+void ClientCaps::_put_snap_realm_unlocked(Inode *in, SnapRealm *realm)
+{
+  ceph::unique_unlock<Inode> in_drop(*in);
+  client->put_snap_realm(realm);
+}
+
 ClientCaps::ClientCaps(Client *client, CephContext *cct)
   : client(client),
     cct(cct),
@@ -145,7 +157,7 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session,
   ceph_assert(ceph_mutex_is_locked_by_me(*in));
   if (!in->is_any_caps()) {
     ceph_assert(in->snaprealm == 0);
-    in->snaprealm = client->get_snap_realm(realm);
+    in->snaprealm = _get_snap_realm_unlocked(in, realm);
     in->snaprealm->inodes_with_caps.push_back(&in->snaprealm_item);
     ldout(cct, 15) << __func__ << " first one, opened snaprealm " << in->snaprealm << dendl;
   } else {
@@ -154,9 +166,9 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session,
 	realm != inodeno_t(-1) && in->snaprealm->ino != realm) {
       in->snaprealm_item.remove_myself();
       auto oldrealm = in->snaprealm;
-      in->snaprealm = client->get_snap_realm(realm);
+      in->snaprealm = _get_snap_realm_unlocked(in, realm);
       in->snaprealm->inodes_with_caps.push_back(&in->snaprealm_item);
-      client->put_snap_realm(oldrealm);
+      _put_snap_realm_unlocked(in, oldrealm);
     }
   }
 
@@ -301,7 +313,7 @@ void ClientCaps::remove_cap(Cap *cap, bool queue_release)
   if (!in.is_any_caps()) {
     ldout(cct, 15) << __func__ << " last one, closing snaprealm " << in.snaprealm << dendl;
     in.snaprealm_item.remove_myself();
-    client->put_snap_realm(in.snaprealm);
+    _put_snap_realm_unlocked(&in, in.snaprealm);
     in.snaprealm = 0;
   }
 }

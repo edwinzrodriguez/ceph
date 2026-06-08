@@ -28,6 +28,7 @@
 
 class Client;
 class Inode;
+class SnapRealm;
 class Cap;
 class MetaSession;
 class Fh;
@@ -174,7 +175,10 @@ private:
   // Capability release delay
   std::chrono::seconds caps_release_delay;
   
-  // Helper methods
+  // Helper methods (drop inode_lock briefly for client_lock-only snaprealm ops)
+  SnapRealm *_get_snap_realm_unlocked(Inode *in, inodeno_t realm);
+  void _put_snap_realm_unlocked(Inode *in, SnapRealm *realm);
+
   void _check_cap_issue(Inode *in, unsigned issued);
   int _get_caps_used(Inode *in);
   void _remove_cap(Cap *cap, bool queue_release);
