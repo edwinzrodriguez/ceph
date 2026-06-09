@@ -71,6 +71,18 @@ Hot paths (`ll_read` / `ll_write`) keep **inode_lock only**. Metadata paths (`ms
 | `inode_lock.h` | stash/reacquire bridge | **removed** |
 | `Client.cc` path walk / setattr / … | client then inode | pending |
 | `ClientCaps::add_update_cap` / `remove_cap` | inode + `get_snap_realm` | **fixed** |
+| `ClientCaps::get_caps` / `check_pool_perm` | inode dropped but perm still asserted inode lock | **fixed** |
+| `Client::_unmount` / `_ll_drop_pins` / `_ll_put` | `client_lock` + `inode_lock` / dentry put | **fixed** |
+| `Client::handle_cap_grant` | inode only + `delay_put_inodes` / `_try_to_trim_inode` | **fixed** |
+| `Client::_put_inode` | `client_lock` + `remove_all_caps` (needs inode) | **fixed** |
+| `MetaSession::enqueue_cap_release` / flush | unprotected `release->caps` vector race | **fixed** |
+| `remove_all_caps` during unmount | queue cap release while session torn down | **fixed** |
+| `make_request` / `_do_lookup` | `client_lock` + `make_nosnap_relative_path` | **fixed** |
+| `Client::handle_caps` | `client_lock` + `Inode::print` in ldout | **fixed** |
+| `Client::dump_cache` / `dump_inode` | `client_lock` + `make_long_path` / `Inode::dump` | **fixed** |
+| `insert_trace` / `touch_dn` | `inode_lock` + `client_lock` via `touch_dn` | **fixed** |
+| `Client::mount` | `cl` + root `inode_lock` | **fixed** |
+| `Client::_mkdir` / `_rmdir` / `_rename` | inode lock + `Dentry::get` (`client_lock`) | **fixed** |
 
 ## Finding violations
 
