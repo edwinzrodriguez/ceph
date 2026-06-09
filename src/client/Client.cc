@@ -2294,6 +2294,7 @@ int Client::verify_reply_trace(int r, MetaSession *session,
 	Inode *in = request->inode();
 	ldout(cct, 10) << "make_request got traceless reply, forcing getattr on #"
 		       << in->ino << dendl;
+        unique_unlock<Client> cl_unlock(*this);
 	r = _getattr(in, request->regetattr_mask, perms, true);
 	target = in;
       }
