@@ -3080,12 +3080,12 @@ ref_t<MClientRequest> Client::build_client_request(MetaRequest *request, mds_ran
     Inode *in = request->inode();
     Dentry *de = request->dentry();
     if (in)
-      in->make_nosnap_relative_path(request->path);
+      _nosnap_relative_path(in, request->path);
     else if (de) {
       if (de->inode)
-	de->inode->make_nosnap_relative_path(request->path);
+	_nosnap_relative_path(de->inode.get(), request->path);
       else if (de->dir) {
-	de->dir->parent_inode->make_nosnap_relative_path(request->path);
+	_nosnap_relative_path(de->dir->parent_inode, request->path);
 	request->path.push_dentry(de->name);
       }
       else ldout(cct, 1) << "Warning -- unable to construct a filepath!"
@@ -7161,16 +7161,16 @@ void Client::_unmount(bool abort)
       std::vector<Inode*> pinned;
       pinned.reserve(inode_map.size());
       for (auto& [vino, in] : inode_map) {
-	in->iget();
-	pinned.push_back(in);
+        in->iget();
+        pinned.push_back(in);
       }
 
       std::vector<Inode*> caps_inodes;
-      for (Inode *in : pinned) {
-	{
-	  ceph::unique_unlock<Client> unlock(*this);
-	  client_caps->prepare_inode_unmount(in);
-	}
+      for (Inode* in : pinned) {
+        {
+          ceph::unique_unlock<Client> unlock(*this);
+          client_caps->prepare_inode_unmount(in);
+        }
         if (!in->caps.empty())
           caps_inodes.push_back(in);
       }
@@ -7181,15 +7181,16 @@ void Client::_unmount(bool abort)
         ceph::unique_unlock<Client> unlock(*this);
         check_caps(InodeRef(caps_inodes[i]), flags);
       }
-      for (Inode *in : pinned) {
-	std::unique_lock in_lock(*in);
-	if (!in->caps.empty()) {
-	  remove_all_caps(in);
-	  in->cap_snaps.clear();
-	}
+      for (Inode* in : pinned) {
+        unique_unlock<Client> unlock(*this);
+        std::unique_lock in_lock(*in);
+        if (!in->caps.empty()) {
+          remove_all_caps(in);
+          in->cap_snaps.clear();
+        }
       }
-      for (Inode *in : pinned)
-	put_inode(in, 1);
+      for (Inode* in : pinned)
+        put_inode(in, 1);
     }
     lock.unlock();
     flush_caps_sync();
@@ -7642,13 +7643,23 @@ void Client::renew_caps(MetaSession *session)
 // ===============================================================
 // high level (POSIXy) interface
 
+void Client::_nosnap_relative_path(Inode *in, filepath& p)
+{
+  if (ceph_mutex_is_locked_by_me(*this)) {
+    ceph::unique_unlock<Client> cl_unlock(*this);
+    in->make_nosnap_relative_path(p);
+  } else {
+    in->make_nosnap_relative_path(p);
+  }
+}
+
 int Client::_do_lookup(const InodeRef& dir, const string& name, int mask,
 		       InodeRef *target, const UserPerm& perms)
 {
   int op = dir->snapid == CEPH_SNAPDIR ? CEPH_MDS_OP_LOOKUPSNAP : CEPH_MDS_OP_LOOKUP;
   MetaRequest *req = new MetaRequest(op);
   filepath path;
-  dir->make_nosnap_relative_path(path);
+  _nosnap_relative_path(dir.get(), path);
   path.push_dentry(name);
   req->set_filepath(path);
   req->set_inode(dir);
@@ -8331,7 +8342,7 @@ int Client::_getattr(const InodeRef& in, int mask, const UserPerm& perms, bool f
 
   MetaRequest *req = new MetaRequest(CEPH_MDS_OP_GETATTR);
   filepath path;
-  in->make_nosnap_relative_path(path);
+  _nosnap_relative_path(in.get(), path);
   req->set_filepath(path);
   req->set_inode(in);
   req->head.args.getattr.mask = mask;

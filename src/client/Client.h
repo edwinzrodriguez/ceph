@@ -2130,6 +2130,7 @@ private:
 
   // internal interface
   //   call these with client_lock held!
+  void _nosnap_relative_path(Inode *in, filepath& p);
   int _do_lookup(const InodeRef& dir, const std::string& name, int mask, InodeRef *target,
 		 const UserPerm& perms);
 
