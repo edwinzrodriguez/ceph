@@ -6934,13 +6934,16 @@ void Client::_force_evict_unmount_cache()
 
   for (Inode *in : inodes) {
     if (in->dirty_caps) {
+      ceph::unique_unlock<Client> unlock(*this);
       std::unique_lock in_lock(*in);
       in->mark_caps_clean();
     }
     {
       ceph::unique_unlock<Client> unlock(*this);
       client_caps->prepare_inode_unmount(in);
-
+    }
+    {
+      ceph::unique_unlock<Client> unlock(*this);
       std::unique_lock in_lock(*in);
       if (!in->caps.empty()) {
         remove_all_caps(in);
@@ -6951,9 +6954,13 @@ void Client::_force_evict_unmount_cache()
       ceph::unique_unlock<Client> unlock(*this);
       check_caps(InodeRef(in), CHECK_CAPS_NODELAY);
     }
-    _try_to_trim_inode(in, false);
+    {
+      ceph::unique_unlock<Client> unlock(*this);
+      _try_to_trim_inode(in, false);
+    }
     int extra = 0;
     {
+      ceph::unique_unlock<Client> unlock(*this);
       std::unique_lock in_lock(*in);
       extra = in->get_nref() - 1;
     }
