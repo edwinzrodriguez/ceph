@@ -4035,6 +4035,7 @@ void Client::ensure_dentry_lru(Dentry *dn)
 {
   if (dn->lru_is_cached())
     return;
+  unique_unlock<Inode> in_lock(*(dn->dir->parent_inode));
   std::unique_lock<Client> lock(*this);
   if (!dn->lru_is_cached())
     lru.lru_insert_mid(dn);
@@ -7643,6 +7644,7 @@ bool Client::_dentry_valid(const Dentry *dn)
   // is dn lease valid?
   utime_t now = ceph_clock_now();
   if (dn->lease_mds >= 0 && dn->lease_ttl > now) {
+    unique_unlock<Inode> in_unlock(*(dn->dir->parent_inode));
     std::unique_lock<Client> lock(*this);
     if (auto it = mds_sessions.find(dn->lease_mds); it != mds_sessions.end()) {
       auto s = it->second;
@@ -7830,8 +7832,10 @@ Dentry *Client::get_or_create(Inode *dir, const std::string& name)
     dir->dir = new Dir(dir);
     ldout(cct, 15) << "open_dir " << dir->dir << " on " << dir << dendl;
     ceph_assert(dir->dentries.size() < 2);
-    if (!dir->dentries.empty())
+    if (!dir->dentries.empty()) {
+      unique_unlock<Inode> dir_unlock(*dir);
       dir->get_first_parent()->get();
+    }
     dir->iget();
   }
   Dir *d = dir->dir;
@@ -7840,7 +7844,6 @@ Dentry *Client::get_or_create(Inode *dir, const std::string& name)
     ensure_dentry_lru(it->second);
     return it->second;
   }
-  diri_lock.unlock();
   Dentry *dn = new Dentry(d, name);
   ensure_dentry_lru(dn);
   return dn;
@@ -9226,6 +9229,7 @@ void Client::fill_statx(Inode *in, unsigned int mask, struct ceph_statx *stx)
 
 void Client::touch_dn(Dentry *dn)
 {
+  unique_unlock<Inode> in_unlock(*(dn->dir->parent_inode));
   std::unique_lock<Client> lock(*this);
   lru.lru_touch(dn);
 }
@@ -16279,9 +16283,9 @@ int Client::_mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& p
   if (bl.length() > 0) {
     req->set_data(bl);
   }
-
-  req->set_dentry(wdr.dn);
   }
+
+  req->set_dentry(std::move(wdr.dn));
 
   ldout(cct, 10) << "_mkdir: making request" << dendl;
   res = make_request(req, perm, inp);
@@ -16575,17 +16579,17 @@ int Client::_rmdir(Inode *dir, const char *name, const UserPerm& perms, bool che
   }
 
   MetaRequest *req = nullptr;
+  int op = 0;
   {
     std::unique_lock in_lock(*wdr.diri);
     if (wdr.diri->snapid != CEPH_NOSNAP && wdr.diri->snapid != CEPH_SNAPDIR) {
       return -EROFS;
     }
 
-    int op = wdr.diri->snapid == CEPH_SNAPDIR ? CEPH_MDS_OP_RMSNAP : CEPH_MDS_OP_RMDIR;
+    op = wdr.diri->snapid == CEPH_SNAPDIR ? CEPH_MDS_OP_RMSNAP : CEPH_MDS_OP_RMDIR;
     req = new MetaRequest(op);
 
     if (op == CEPH_MDS_OP_RMDIR) {
-      req->set_dentry(wdr.dn);
       req->dentry_drop = CEPH_CAP_FILE_SHARED;
       req->dentry_unless = CEPH_CAP_FILE_EXCL;
       req->other_inode_drop = CEPH_CAP_LINK_SHARED | CEPH_CAP_LINK_EXCL;
@@ -16599,6 +16603,10 @@ int Client::_rmdir(Inode *dir, const char *name, const UserPerm& perms, bool che
       unlink(wdr.dn.get(), true, true);
     }
     req->set_other_inode(wdr.target);
+  }
+
+  if (op == CEPH_MDS_OP_RMDIR) {
+    req->set_dentry(std::move(wdr.dn));
   }
 
   int res = make_request(req, perms);
@@ -16739,14 +16747,17 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
 #if defined(__linux__)
   wdr_to.diri->gen_inherited_fscrypt_auth(&req->fscrypt_auth);
 #endif
+  in_lock.unlock();
+  in_lock2.unlock();
+
   int res;
   if (op == CEPH_MDS_OP_RENAME) {
-    req->set_old_dentry(wdr_from.dn);
+    wdr_to.dn->is_renaming = true;
+    req->set_old_dentry(std::move(wdr_from.dn));
     req->old_dentry_drop = CEPH_CAP_FILE_SHARED;
     req->old_dentry_unless = CEPH_CAP_FILE_EXCL;
 
-    wdr_to.dn->is_renaming = true;
-    req->set_dentry(wdr_to.dn);
+    req->set_dentry(std::move(wdr_to.dn));
     req->dentry_drop = CEPH_CAP_FILE_SHARED;
     req->dentry_unless = CEPH_CAP_FILE_EXCL;
 
@@ -16773,9 +16784,11 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
   ldout(cct, 10) << "rename result is " << res << dendl;
 
   // if rename fails it will miss waking up the waiters
-  if (op == CEPH_MDS_OP_RENAME && wdr_to.dn->is_renaming) {
-    wdr_to.dn->is_renaming = false;
-    signal_cond_list(waiting_for_rename);
+  if (op == CEPH_MDS_OP_RENAME) {
+    if (Dentry *to_dn = req->dentry(); to_dn && to_dn->is_renaming) {
+      to_dn->is_renaming = false;
+      signal_cond_list(waiting_for_rename);
+    }
   }
 
   // renamed item from our cache
@@ -16846,8 +16859,10 @@ int Client::_link(Inode *diri_from, const char* path_from, Inode* diri_to, const
     return -EDQUOT;
   }
 
-  std::unique_lock in_lock(*in);
-  in->break_all_delegs();
+  {
+    std::unique_lock in_lock(*in);
+    in->break_all_delegs();
+  }
   MetaRequest *req = new MetaRequest(CEPH_MDS_OP_LINK);
 
   req->set_filepath(wdr_to.getpath());
@@ -16859,7 +16874,7 @@ int Client::_link(Inode *diri_from, const char* path_from, Inode* diri_to, const
   req->set_inode(wdr_to.diri);
   req->inode_drop = CEPH_CAP_FILE_SHARED;
   req->inode_unless = CEPH_CAP_FILE_EXCL;
-  req->set_dentry(wdr_to.dn);
+  req->set_dentry(std::move(wdr_to.dn));
 
   int res = make_request(req, perm);
 
