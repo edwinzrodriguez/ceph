@@ -5767,7 +5767,14 @@ void Client::_schedule_invalidate_dentry_callback(Dentry *dn, bool del)
 void Client::_try_to_trim_inode(Inode *in, bool sched_inval)
 {
   int ref = in->get_nref();
-  ldout(cct, 5) << __func__ << " in " << *in <<dendl;
+  {
+    unique_unlock cl_unlock(*this, std::defer_lock);
+
+    if (this->is_locked_by_me()) {
+      cl_unlock.release();
+    }
+    ldout(cct, 5) << __func__ << " in " << *in <<dendl;
+  }
 
   if (in->dir && !in->dir->dentries.empty()) {
     for (auto p = in->dir->dentries.begin();
@@ -6933,11 +6940,11 @@ void Client::_force_evict_unmount_cache()
     {
       ceph::unique_unlock<Client> unlock(*this);
       client_caps->prepare_inode_unmount(in);
-    }
-    {
+
       std::unique_lock in_lock(*in);
-      if (!in->caps.empty())
-	remove_all_caps(in);
+      if (!in->caps.empty()) {
+        remove_all_caps(in);
+      }
       in->cap_snaps.clear();
     }
     {
