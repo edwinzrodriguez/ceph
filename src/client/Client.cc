@@ -2071,6 +2071,7 @@ mds_rank_t Client::choose_target_mds(MetaRequest *req, Inode** phash_diri)
   if (in) {
     ldout(cct, 20) << __func__ << " starting with req->inode " << *in << dendl;
     if (req->path.depth()) {
+      unique_unlock<Client> cl_unlock(*this);
       std::unique_lock in_lock(*in);
       hash = in->hash_dentry_name(req->path[0]);
       ldout(cct, 20) << __func__ << " inode dir hash is " << (int)in->dir_layout.dl_dir_hash
@@ -2115,9 +2116,10 @@ mds_rank_t Client::choose_target_mds(MetaRequest *req, Inode** phash_diri)
              << " hash=" << hash << dendl;
   
     {
+      unique_unlock<Client> cl_unlock(*this);
       std::unique_lock in_lock(*in);
       if (req->get_op() == CEPH_MDS_OP_GETATTR)
-	issued = req->inode()->caps_issued();
+        issued = req->inode()->caps_issued();
 
       if (is_hash && S_ISDIR(in->mode) && (!in->fragmap.empty() || !in->frag_repmap.empty())) {
 	frag_t fg = in->dirfragtree[hash];
@@ -6782,10 +6784,8 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
   }
 
   ceph_assert(root);
-  {
-    std::unique_lock root_lock(*root);
-    _ll_get(root.get());
-  }
+  cl.unlock();
+  _ll_get(root.get());
 
   // trace?
   if (!cct->_conf->client_trace.empty()) {
@@ -7840,6 +7840,7 @@ Dentry *Client::get_or_create(Inode *dir, const std::string& name)
     ensure_dentry_lru(it->second);
     return it->second;
   }
+  diri_lock.unlock();
   Dentry *dn = new Dentry(d, name);
   ensure_dentry_lru(dn);
   return dn;
