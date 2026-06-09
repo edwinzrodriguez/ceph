@@ -5314,10 +5314,12 @@ void Client::handle_snap(const MConstRef<MClientSnap>& m)
 	}
 	ldout(cct, 10) << " moving " << *in << " from " << *in->snaprealm << dendl;
 
-
-	in->snaprealm_item.remove_myself();
 	to_move[in] = in->snaprealm->get_snap_context();
-	put_snap_realm(in->snaprealm);
+	SnapRealm *oldrealm = in->snaprealm;
+	in_lock.unlock();
+	in->snaprealm_item.remove_myself();
+	put_snap_realm(oldrealm);
+	in->snaprealm = nullptr;
       }
     }
 
