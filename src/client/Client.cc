@@ -3900,66 +3900,71 @@ void Client::handle_lease(const MConstRef<MClientLease>& m)
   }
 }
 
-void Client::_put_inode(Inode *in, int n)
-{
-  ceph_assert(ceph_mutex_is_not_locked_by_me(*this));
+  void
+  Client::_put_inode(Inode* in, int n)
+  {
+    ceph_assert(ceph_mutex_is_not_locked_by_me(*this));
 
-  ldout(cct, 10) << __func__ << " on " << *in << " n = " << n << dendl;
-  // ceph_assert(ceph_mutex_is_locked_by_me(*in));
-  std::unique_lock in_lock(*in);
+    ldout(cct, 10) << __func__ << " on " << *in << " n = " << n << dendl;
+    // ceph_assert(ceph_mutex_is_locked_by_me(*in));
+    std::unique_lock in_lock(*in);
 
-  int left = in->get_nref();
-  // Clamp n to avoid releasing more references than available
-  // (keeping at least 1 for the inode_map)
-  if (left < n + 1) {
-    ldout(cct, 1) << __func__ << " WARNING: inode " << *in
-                  << " has only " << left << " refs but trying to put " << n
-                  << ", clamping to " << (left - 1) << dendl;
-    n = left - 1;
-  }
-  if (n > 0) {
-    in->iput(n);
-    left -= n;
-  }
-  if (left == 1) { // last ref is the inode_map pin
-    {
-      std::unique_lock<Client> c_lock(*this);
-      if (unmount_anchor_pins.count(in)) {
-	ldout(cct, 15) << __func__ << " defer delete (unmount anchor) " << *in
-		       << dendl;
-	return;
-      }
-      // release any caps
-      remove_all_caps(in);
-      ldout(cct, 10) << __func__ << " deleting " << *in << dendl;
+    int left = in->get_nref();
+    // Clamp n to avoid releasing more references than available
+    // (keeping at least 1 for the inode_map)
+    if (left < n + 1) {
+      ldout(cct, 1) << __func__ << " WARNING: inode " << *in << " has only "
+                    << left << " refs but trying to put " << n
+                    << ", clamping to " << (left - 1) << dendl;
+      n = left - 1;
+    }
+    if (n > 0) {
+      in->iput(n);
+      left -= n;
+    }
+    if (left == 1) { // last ref is the inode_map pin
       {
-	auto oc_lock = objectcacher->acquire_cache_lock();
-	bool unclean = objectcacher->release_set(&in->oset);
-	ceph_assert(!unclean);
-	inode_map.erase(in->vino());
-	if (use_faked_inos())
-	  _release_faked_ino(in);
-
-	if (root == nullptr) {
-	  root_ancestor = 0;
-	  while (!root_parents.empty())
-	    root_parents.erase(root_parents.begin());
-	}
+        in_lock.unlock();
+        std::unique_lock<Client> c_lock(*this);
+        if (unmount_anchor_pins.count(in)) {
+          ldout(cct, 15) << __func__ << " defer delete (unmount anchor) " << *in
+                         << dendl;
+          return;
+        }
       }
-      in_lock.unlock();
+      in_lock.lock();
+      remove_all_caps(in);
+      {
+        in_lock.unlock();
+        std::unique_lock<Client> c_lock(*this);
+        ldout(cct, 10) << __func__ << " deleting " << *in << dendl;
+        {
+          auto oc_lock = objectcacher->acquire_cache_lock();
+          bool unclean = objectcacher->release_set(&in->oset);
+          ceph_assert(!unclean);
+          inode_map.erase(in->vino());
+          if (use_faked_inos())
+            _release_faked_ino(in);
+
+          if (root == nullptr) {
+            root_ancestor = 0;
+            while (!root_parents.empty())
+              root_parents.erase(root_parents.begin());
+          }
+        }
+      }
+      // Do not hold client_lock across finisher drain: unmount may hold an
+      // inode_lock and block re-acquiring client_lock (trim_dentry), and finisher
+      // callbacks may need client_lock.
+      objectcacher->wait_for_flush_callbacks();
+      // _try_to_trim_inode only unlinks parent dentries when nref > 1, so an
+      // inode can reach its final pin with a stale dentry still on dentries.
+      while (!in->dentries.empty()) {
+        Dentry* dn = in->get_first_parent();
+        unlink(dn, true, true);
+      }
+      in->iput();
     }
-    // Do not hold client_lock across finisher drain: unmount may hold an
-    // inode_lock and block re-acquiring client_lock (trim_dentry), and finisher
-    // callbacks may need client_lock.
-    objectcacher->wait_for_flush_callbacks();
-    // _try_to_trim_inode only unlinks parent dentries when nref > 1, so an
-    // inode can reach its final pin with a stale dentry still on dentries.
-    while (!in->dentries.empty()) {
-      Dentry *dn = in->get_first_parent();
-      unlink(dn, true, true);
-    }
-    in->iput();
-  }
 }
 
 void Client::delay_put_inodes(bool wakeup)
@@ -5938,13 +5943,14 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
     signal_caps_inode(in);
   }
 
-  // may drop inode's last ref
-  if (deleted_inode)
-    _try_to_trim_inode(in, true);
-
-  if (is_unmounting()) {
-    delay_put_inodes(true);
-    mount_cond.notify_all();
+  // may drop inode's last ref; unmount may have queued puts from cap paths
+  if (deleted_inode || is_unmounting()) {
+    ceph::unique_unlock<Inode> in_unlock(*in);
+    std::unique_lock<Client> cl(*this);
+    if (deleted_inode)
+      _try_to_trim_inode(in, true);
+    if (is_unmounting())
+      delay_put_inodes(true);
   }
 }
 
@@ -14597,41 +14603,56 @@ void Client::_ll_get(Inode *in)
 
 int Client::_ll_put(Inode *in, uint64_t num)
 {
-  std::unique_lock in_lock(*in);
-  in->ll_put(num);
-  ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " " << num << " -> " << in->ll_ref << dendl;
-  if (in->ll_ref == 0) {
+  Dentry *parent_dn = nullptr;
+  snapid_t snapid = CEPH_NOSNAP;
+
+  {
+    std::unique_lock in_lock(*in);
+    in->ll_put(num);
+    ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " " << num
+		   << " -> " << in->ll_ref << dendl;
+    if (in->ll_ref != 0)
+      return in->ll_ref;
+
     if (in->is_dir() && !in->dentries.empty()) {
       ceph_assert(in->dentries.size() == 1); // dirs can't be hard-linked
-      in->get_first_parent()->put(); // unpin dentry
+      parent_dn = in->get_first_parent();
     }
-    if (in->snapid != CEPH_NOSNAP) {
-      auto p = ll_snap_ref.find(in->snapid);
-      ceph_assert(p != ll_snap_ref.end());
-      ceph_assert(p->second > 0);
-      if (--p->second == 0)
-	ll_snap_ref.erase(p);
-    }
-    put_inode(in);
-    return 0;
-  } else {
-    return in->ll_ref;
+    if (in->snapid != CEPH_NOSNAP)
+      snapid = in->snapid;
   }
+
+  if (parent_dn)
+    parent_dn->put();
+
+  if (snapid != CEPH_NOSNAP) {
+    std::scoped_lock<Client> cl(*this);
+    auto p = ll_snap_ref.find(snapid);
+    ceph_assert(p != ll_snap_ref.end());
+    ceph_assert(p->second > 0);
+    if (--p->second == 0)
+      ll_snap_ref.erase(p);
+  }
+
+  put_inode(in);
+  return 0;
 }
 
 void Client::_ll_drop_pins()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
+
   ldout(cct, 10) << __func__ << dendl;
-  std::set<InodeRef> to_be_put; //this set will be deconstructed item by item when exit
-  std::unordered_map<vinodeno_t, Inode*>::iterator next;
-  for (auto it = inode_map.begin(); it != inode_map.end(); it = next) {
-    Inode *in = it->second;
-    next = it;
-    ++next;
-    if (in->ll_ref){
-      to_be_put.insert(in);
-      _ll_put(in, in->ll_ref);
-    }
+  std::vector<std::pair<Inode*, uint64_t>> pending;
+  pending.reserve(inode_map.size());
+  for (auto& [vino, in] : inode_map) {
+    if (in->ll_ref)
+      pending.emplace_back(in, in->ll_ref);
+  }
+
+  for (auto& [in, num] : pending) {
+    ceph::unique_unlock<Client> cl_unlock(*this);
+    _ll_put(in, num);
   }
 }
 
