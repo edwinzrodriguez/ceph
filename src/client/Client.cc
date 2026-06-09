@@ -586,6 +586,10 @@ InodeRef Client::get_cwd_ref()
 
 void Client::dump_inode(Formatter *f, Inode *in, set<Inode*>& did, bool disconnected)
 {
+  ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+  if (ceph_mutex_is_locked_by_me(*this))
+    cl_drop.release();
+
   filepath path;
   in->make_long_path(path);
   ldout(cct, 1) << "dump_inode: "
