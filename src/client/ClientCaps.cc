@@ -318,12 +318,12 @@ void ClientCaps::remove_cap(Cap *cap, bool queue_release)
   }
 }
 
-void ClientCaps::remove_all_caps(Inode *in)
+void ClientCaps::remove_all_caps(Inode *in, bool queue_release)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(*in));
-  
+
   while (!in->caps.empty())
-    remove_cap(&in->caps.begin()->second, true);
+    remove_cap(&in->caps.begin()->second, queue_release);
 }
 
 void ClientCaps::remove_session_caps(MetaSession *s, int err)
@@ -544,29 +544,38 @@ void ClientCaps::prepare_inode_unmount(Inode *in)
 void ClientCaps::flush_cap_releases()
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client->m_client_lock));
-  
+
   uint64_t nr_caps = 0;
 
   // send any cap releases
   for (auto &p : client->mds_sessions) {
     auto session = p.second;
-    if (session->release && client->mdsmap->is_clientreplay_or_active_or_stopping(
-            p.first)) {
-      nr_caps += session->release->caps.size();
-      for (const auto &cap: session->release->caps) {
-        ldout(cct, 10) << __func__ << " removing " 
-                       << static_cast<inodeno_t>(cap.ino) <<
-        " from subvolume tracker" << dendl;
-        client->subvolume_tracker->remove_inode(static_cast<inodeno_t>(cap.ino));
+    ceph::ref_t<MClientCapRelease> to_send;
+    std::vector<ceph_mds_cap_item> released_caps;
+    {
+      std::scoped_lock s_lock(session->session_lock);
+      if (session->release && client->mdsmap->is_clientreplay_or_active_or_stopping(
+              p.first)) {
+        released_caps = session->release->caps;
+        nr_caps += released_caps.size();
+        if (cct->_conf->client_inject_release_failure) {
+          ldout(cct, 20) << __func__
+                         << " injecting failure to send cap release message"
+                         << dendl;
+        } else {
+          to_send = std::move(session->release);
+        }
+        session->release.reset();
       }
-      if (cct->_conf->client_inject_release_failure) {
-        ldout(cct, 20) << __func__ 
-                       << " injecting failure to send cap release message" 
-                       << dendl;
-      } else {
-        session->con->send_message2(std::move(session->release));
-      }
-      session->release.reset();
+    }
+    for (const auto &cap : released_caps) {
+      ldout(cct, 10) << __func__ << " removing "
+                     << static_cast<inodeno_t>(cap.ino)
+                     << " from subvolume tracker" << dendl;
+      client->subvolume_tracker->remove_inode(static_cast<inodeno_t>(cap.ino));
+    }
+    if (to_send) {
+      session->con->send_message2(std::move(to_send));
     }
   }
 

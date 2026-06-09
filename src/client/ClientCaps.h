@@ -67,7 +67,7 @@ public:
                       unsigned mseq, inodeno_t realm, int flags, 
                       const UserPerm& perms);
   void remove_cap(Cap *cap, bool queue_release);
-  void remove_all_caps(Inode *in);
+  void remove_all_caps(Inode *in, bool queue_release);
   void remove_session_caps(MetaSession *session, int err);
   
   // Capability flushing

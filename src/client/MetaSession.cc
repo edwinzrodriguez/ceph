@@ -45,6 +45,7 @@ void MetaSession::dump(Formatter *f, bool cap_dump) const
 void MetaSession::enqueue_cap_release(inodeno_t ino, uint64_t cap_id, ceph_seq_t iseq,
     ceph_seq_t mseq, epoch_t osd_barrier)
 {
+  std::scoped_lock lock(session_lock);
   if (!release) {
     release = ceph::make_message<MClientCapRelease>();
   }
