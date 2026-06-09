@@ -1122,6 +1122,7 @@ protected:
   MetaSessionRef _get_mds_session(mds_rank_t mds, Connection *con);  ///< return session for mds *and* con; null otherwise
   MetaSessionRef _get_or_open_mds_session(mds_rank_t mds);
   MetaSessionRef _open_mds_session(mds_rank_t mds);
+  void _send_session_open(MetaSession *session);
   void _close_mds_session(MetaSession *s);
   void _closed_mds_session(MetaSession *s, int err=0, bool rejected=false);
   bool _any_stale_sessions() const;

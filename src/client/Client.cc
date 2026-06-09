@@ -1405,8 +1405,7 @@ Dentry *Client::insert_dentry_inode(Dir *dir, const string& dname, LeaseStat *dl
       }
       unlink(old_dentry, dir == old_dentry->dir, false);  // drop dentry, keep dir open if its the same dir
     }
-    Inode *diri = dir->parent_inode;
-    clear_dir_complete_and_ordered(diri, false);
+    clear_dir_complete_and_ordered(dir->parent_inode, false);
     dn = link(dir, dname, in, dn);
 
     if (old_dentry) {
@@ -1956,27 +1955,30 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session,
     std::unique_lock diri_lock(*diri);
     update_dir_dist(diri, &dst, from_mds);  // dir stat info is attached to ..
 
-    if (in) {
-      std::unique_lock in_lock(*in);
+    Dir *dir = nullptr;
+    if (in)
+      dir = diri->open_dir();
+    diri_lock.unlock();
 
-      Dir *dir = diri->open_dir();
+    if (in) {
       insert_dentry_inode(dir, dname, &dlease, in, request->sent_stamp, session,
                           (op == CEPH_MDS_OP_RENAME) ? request->old_dentry() : NULL);
     } else {
       Dentry *dn = NULL;
       if (diri->dir) {
         auto it = diri->dir->dentries.find(dname);
-        if (it != diri->dir->dentries.end()) {
+        if (it != diri->dir->dentries.end())
 	  dn = it->second;
-	  if (dn->inode) {
-	    clear_dir_complete_and_ordered(diri, false);
-	    unlink(dn, true, true);  // keep dir, dentry
-	  }
-	}
+      }
+      if (dn && dn->inode) {
+	clear_dir_complete_and_ordered(diri, false);
+	unlink(dn, true, true);  // keep dir, dentry
       }
       if (dlease.duration_ms > 0) {
 	if (!dn) {
-	  Dir *dir = diri->open_dir();
+	  std::unique_lock diri_lock2(*diri);
+	  dir = diri->open_dir();
+	  diri_lock2.unlock();
 	  dn = link(dir, dname, NULL, NULL);
 	}
 	update_dentry_lease(dn, &dlease, request->sent_stamp, session);
@@ -2442,10 +2444,18 @@ int Client::make_request(MetaRequest *request,
 	int open_r = 0;
 	session->waiting_for_open.push_back(
 	  new C_ReentrantCond(open_cond, &open_done, &open_r, &open_wake_complete));
-	ceph::client_lock::wait_on(*this, open_cond, l, [&open_done] {
-	  return open_done.load(std::memory_order_acquire);
-	});
+	if (session->state == MetaSession::STATE_OPEN) {
+	  continue;
+	}
+	// (Re)send in case a prior open raced with waiter registration or the
+	// connection was reset while the session stayed in STATE_OPENING.
+	_send_session_open(session.get());
+	l.unlock();
+	while (!open_done.load(std::memory_order_acquire)) {
+	  std::this_thread::yield();
+	}
 	ceph::wait_for_reentrant_cond_broadcast(open_wake_complete);
+	l.lock();
 	continue;
       }
 
@@ -2699,7 +2709,7 @@ bool Client::have_open_session(mds_rank_t mds)
 
 MetaSessionRef Client::_get_mds_session(mds_rank_t mds, Connection *con)
 {
-  std::unique_lock<Client> c_lock(*this);
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
   const auto &it = mds_sessions.find(mds);
   if (it == mds_sessions.end() || it->second->con != con) {
     return NULL;
@@ -2710,7 +2720,7 @@ MetaSessionRef Client::_get_mds_session(mds_rank_t mds, Connection *con)
 
 MetaSessionRef Client::_get_or_open_mds_session(mds_rank_t mds)
 {
-  std::unique_lock<Client> c_lock(*this);
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
   auto it = mds_sessions.find(mds);
   return it == mds_sessions.end() ? _open_mds_session(mds) : it->second;
 }
@@ -2786,9 +2796,19 @@ void Client::update_metadata(std::string const &k, std::string const &v)
   metadata[k] = v;
 }
 
+void Client::_send_session_open(MetaSession *session)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
+  auto m = make_message<MClientSession>(CEPH_SESSION_REQUEST_OPEN);
+  m->metadata = metadata;
+  m->supported_features = myfeatures;
+  m->metric_spec = feature_bitset_t(CEPHFS_METRIC_FEATURES_ALL);
+  session->con->send_message2(std::move(m));
+}
+
 MetaSessionRef Client::_open_mds_session(mds_rank_t mds)
 {
-  std::unique_lock<Client> c_lock(*this);
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
   ldout(cct, 10) << __func__ << " mds." << mds << dendl;
   auto addrs = mdsmap->get_addrs(mds);
   auto em = mds_sessions.emplace(std::piecewise_construct,
@@ -2796,12 +2816,7 @@ MetaSessionRef Client::_open_mds_session(mds_rank_t mds)
       std::forward_as_tuple(new MetaSession(mds, messenger->connect_to_mds(addrs), addrs)));
   ceph_assert(em.second); /* not already present */
   auto session = em.first->second;
-
-  auto m = make_message<MClientSession>(CEPH_SESSION_REQUEST_OPEN);
-  m->metadata = metadata;
-  m->supported_features = myfeatures;
-  m->metric_spec = feature_bitset_t(CEPHFS_METRIC_FEATURES_ALL);
-  session->con->send_message2(std::move(m));
+  _send_session_open(session.get());
   return session;
 }
 
@@ -2862,6 +2877,8 @@ void Client::handle_client_session(const MConstRef<MClientSession>& m)
 	// than the one before the upgrade - so, refresh the feature
 	// bits the client holds.
 	reinit_mds_features(session.get(), m);
+	// A waiter may have registered after an earlier OPEN was processed.
+	signal_context_list(session->waiting_for_open);
         return;
       }
       /*
@@ -4079,11 +4096,9 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
       ensure_dentry_lru(dn);
     }
 
-    if(in) {
-      ceph_assert(ceph_mutex_is_locked_by_me(*in));
-
-      ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' to inode " << *in
-		     << " dn " << *dn << " (new dn)" << dendl;
+    if (in) {
+      ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' to inode "
+		     << in->vino() << " dn " << *dn << " (new dn)" << dendl;
     } else {
       ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' "
         << " dn " << *dn << " (new dn)" << dendl;
@@ -4096,7 +4111,7 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
   }
 
   if (in) {    // link to inode
-    ceph_assert(ceph_mutex_is_locked_by_me(*in));
+    std::unique_lock in_lock(*in);
     InodeRef tmp_ref;
     // only one parent for directories!
     if (in->is_dir() && !in->dentries.empty()) {
@@ -4105,7 +4120,9 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
       ceph_assert(olddn->dir != dir || olddn->name != name);
       Inode *old_diri = olddn->dir->parent_inode;
       clear_dir_complete_and_ordered(old_diri, true);
+      in_lock.unlock();
       unlink(olddn, true, true);  // keep dir, dentry
+      in_lock.lock();
     }
 
     dn->link(in);
@@ -6795,7 +6812,9 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
     MetaRequest *req = new MetaRequest(CEPH_MDS_OP_GETATTR);
     req->set_filepath(fp);
     req->head.args.getattr.mask = CEPH_STAT_CAP_INODE_ALL;
+    cl.unlock();
     int res = make_request(req, perms);
+    cl.lock();
     if (res < 0) {
       if (res == -EACCES && root) {
 	ldout(cct, 1) << __func__ << " EACCES on parent of mount point; quotas may not work" << dendl;
@@ -7823,7 +7842,9 @@ relookup:
       ldout(cct, 1) << __func__ << " dir " << *dir
                     << " rename is on the way, will wait for dn '"
                     << dname << "'" << dendl;
+      dir_lock.unlock();
       wait_on_list(waiting_for_rename);
+      dir_lock.lock();
       goto relookup;
     }
   } else {
