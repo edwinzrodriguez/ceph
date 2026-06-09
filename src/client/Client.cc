@@ -5440,7 +5440,11 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
     Cap &cap = in->caps.at(mds);
 
     switch (m->get_op()) {
-      case CEPH_CAP_OP_TRUNC: return handle_cap_trunc(session.get(), in, m);
+      case CEPH_CAP_OP_TRUNC: {
+        cl.unlock();
+        std::scoped_lock<Inode> in_lock(*in);
+        return handle_cap_trunc(session.get(), in, m);
+      }
       case CEPH_CAP_OP_IMPORT:
       case CEPH_CAP_OP_REVOKE:
       case CEPH_CAP_OP_GRANT: {
@@ -5455,6 +5459,7 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
       }
     }
   } else {
+    cl.unlock();
     ldout(cct, 5) << __func__ << " don't have " << *in << " cap on mds." << mds << dendl;
     return;
   }
