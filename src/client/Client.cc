@@ -18450,20 +18450,19 @@ enum {
   POOL_WRITE = 8,
 };
 
-int Client::check_pool_perm(Inode *in, int need)
+int Client::check_pool_perm(const PoolPermInodeInfo& in, int need)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(*this));
-  ceph_assert(ceph_mutex_is_locked_by_me(*in));
 
   if (!cct->_conf->client_check_pool_perm)
     return 0;
 
   /* Only need to do this for regular files */
-  if (!in->is_file())
+  if (!in.is_file)
     return 0;
 
-  int64_t pool_id = in->layout.pool_id;
-  std::string pool_ns = in->layout.pool_ns;
+  int64_t pool_id = in.layout.pool_id;
+  std::string pool_ns = in.layout.pool_ns;
   std::pair<int64_t, std::string> perm_key(pool_id, pool_ns);
   int have = 0;
   while (true) {
@@ -18481,7 +18480,7 @@ int Client::check_pool_perm(Inode *in, int need)
   }
 
   if (!have) {
-    if (in->snapid != CEPH_NOSNAP) {
+    if (in.snapid != CEPH_NOSNAP) {
       // pool permission check needs to write to the first object. But for snapshot,
       // head of the first object may have already been deleted. To avoid creating
       // orphan object, skip the check for now.
@@ -18491,7 +18490,7 @@ int Client::check_pool_perm(Inode *in, int need)
     pool_perms[perm_key] = POOL_CHECKING;
 
     char oid_buf[32];
-    snprintf(oid_buf, sizeof(oid_buf), "%llx.00000000", (unsigned long long)in->ino);
+    snprintf(oid_buf, sizeof(oid_buf), "%llx.00000000", (unsigned long long)in.ino);
     object_t oid = oid_buf;
 
     SnapContext nullsnapc;
@@ -18500,21 +18499,20 @@ int Client::check_pool_perm(Inode *in, int need)
     ObjectOperation rd_op;
     rd_op.stat(nullptr, nullptr, nullptr);
 
-    objecter->mutate(oid, OSDMap::file_to_object_locator(in->layout), rd_op,
+    objecter->mutate(oid, OSDMap::file_to_object_locator(in.layout), rd_op,
 		     nullsnapc, ceph::real_clock::now(), 0, &rd_cond);
 
     C_SaferCond wr_cond;
     ObjectOperation wr_op;
     wr_op.create(true);
 
-    objecter->mutate(oid, OSDMap::file_to_object_locator(in->layout), wr_op,
+    objecter->mutate(oid, OSDMap::file_to_object_locator(in.layout), wr_op,
 		     nullsnapc, ceph::real_clock::now(), 0, &wr_cond);
 
     int rd_ret = 0;
     int wr_ret = 0;
     {
       ceph::unique_unlock<Client> client_unlock(*this);
-      ceph::unique_unlock<Inode> in_unlock(*in);
 
       rd_ret = rd_cond.wait();
       wr_ret = wr_cond.wait();

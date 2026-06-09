@@ -949,11 +949,17 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
   Inode *in = fh->inode.get();
   ceph_assert(ceph_mutex_is_locked_by_me(*in));
 
+  Client::PoolPermInodeInfo pool_info;
+  pool_info.is_file = in->is_file();
+  pool_info.snapid = in->snapid;
+  pool_info.ino = in->ino;
+  pool_info.layout = in->layout;
+
   int r = 0;
   {
     ceph::unique_unlock<Inode> in_drop(*in);
     std::unique_lock<Client> lock(*client);
-    r = client->check_pool_perm(in, need);
+    r = client->check_pool_perm(pool_info, need);
     if (r < 0)
       return r;
   }

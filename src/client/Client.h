@@ -1323,7 +1323,13 @@ protected:
 			       const UserPerm& perms);
   bool is_quota_bytes_approaching(Inode *in, const UserPerm& perms);
 
-  int check_pool_perm(Inode *in, int need);
+  struct PoolPermInodeInfo {
+    bool is_file = false;
+    snapid_t snapid = CEPH_NOSNAP;
+    ino_t ino = 0;
+    file_layout_t layout;
+  };
+  int check_pool_perm(const PoolPermInodeInfo& in, int need);
 
   void handle_client_reclaim_reply(const MConstRef<MClientReclaimReply>& reply);
 
