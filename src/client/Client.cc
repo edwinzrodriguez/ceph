@@ -3236,6 +3236,7 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
 
   // Handle unsafe reply
   if (!is_safe) {
+    unique_unlock<Client> cl_unlock(*this);
     request->got_unsafe = true;
     session->with_unsafe_requests([request](auto& unsafe_requests) {
       unsafe_requests.push_back(&request->unsafe_item);
