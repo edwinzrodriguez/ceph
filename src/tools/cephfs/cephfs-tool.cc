@@ -31,7 +31,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <fstream>
+
 #include "common/Formatter.h"
 #include "common/ceph_context.h"
 #include "common/cmdparse.h"
@@ -46,6 +46,10 @@
 #include <boost/program_options.hpp>
 
 #include "cls/journal/cls_journal_types.h"
+
+#ifdef CEPH_LOCKSTAT
+#include "common/lockstat.h"
+#endif    
 
 using std::cerr;
 using std::cout;
@@ -72,29 +76,48 @@ uint64_t parse_size(const string& val) {
 
   if (end_pos < val.length()) {
     string suffix_str = val.substr(end_pos);
-    for (auto & c: suffix_str) c = std::toupper(c);
+    for (auto& c : suffix_str)
+      c = std::toupper(c);
 
     // Check for "iB" suffix (e.g. KiB, MiB, GiB, TiB)
-    bool is_binary = (suffix_str.length() >= 3 && suffix_str.substr(1, 2) == "IB");
+    bool is_binary =
+        (suffix_str.length() >= 3 && suffix_str.substr(1, 2) == "IB");
     // Check for "B" suffix (e.g. KB, MB, GB, TB)
-    bool is_si = (suffix_str.length() >= 2 && suffix_str[1] == 'B' && !is_binary);
+    bool is_si =
+        (suffix_str.length() >= 2 && suffix_str[1] == 'B' && !is_binary);
 
     char suffix = suffix_str[0];
     uint64_t multiplier = 1;
     if (is_si) {
       switch (suffix) {
-        case 'K': multiplier = 1000ULL; break;
-        case 'M': multiplier = 1000ULL * 1000; break;
-        case 'G': multiplier = 1000ULL * 1000 * 1000; break;
-        case 'T': multiplier = 1000ULL * 1000 * 1000 * 1000; break;
+      case 'K':
+        multiplier = 1000ULL;
+        break;
+      case 'M':
+        multiplier = 1000ULL * 1000;
+        break;
+      case 'G':
+        multiplier = 1000ULL * 1000 * 1000;
+        break;
+      case 'T':
+        multiplier = 1000ULL * 1000 * 1000 * 1000;
+        break;
       }
     } else {
       // Binary or single letter (default to binary)
       switch (suffix) {
-        case 'K': multiplier = 1024ULL; break;
-        case 'M': multiplier = 1024ULL * 1024; break;
-        case 'G': multiplier = 1024ULL * 1024 * 1024; break;
-        case 'T': multiplier = 1024ULL * 1024 * 1024 * 1024; break;
+      case 'K':
+        multiplier = 1024ULL;
+        break;
+      case 'M':
+        multiplier = 1024ULL * 1024;
+        break;
+      case 'G':
+        multiplier = 1024ULL * 1024 * 1024;
+        break;
+      case 'T':
+        multiplier = 1024ULL * 1024 * 1024 * 1024;
+        break;
       }
     }
     num *= multiplier;
@@ -196,7 +219,6 @@ static void async_io_callback(struct ceph_ll_io_info* cb_info) {
     ctx->stats_ptr->errors++;
     *(ctx->stop_signal_ptr) = true;
   }
-  
 
   // Mark the slot free before releasing the semaphore so a waiter always
   // finds completed==true after acquire().
@@ -204,7 +226,6 @@ static void async_io_callback(struct ceph_ll_io_info* cb_info) {
   if (ctx->semaphore_ptr) {
     ctx->semaphore_ptr->release();
   }
-
 }
 
 // --- Setup Helper (Updated to use stream for output) ---
@@ -402,6 +423,7 @@ bench_write_worker(
 {
 
   struct ceph_mount_info *cmount = shared_cmount;
+  ceph_pthread_setname(("wr-worker-" + std::to_string(thread_id)).c_str());
   auto duration_limit = std::chrono::seconds(config.duration);
 
   ceph_pthread_setname(("wr-worker-" + std::to_string(thread_id)).c_str());
@@ -522,6 +544,7 @@ bench_async_write_worker(
     std::stringstream& ss,
     steady_clock::time_point phase_start_time)
 {
+  ceph_pthread_setname(("wr-worker-" + std::to_string(thread_id)).c_str());
   auto duration_limit = std::chrono::seconds(config.duration);
 
   // Semaphore for queue depth management
@@ -726,8 +749,8 @@ bench_read_worker(
 {
 
   struct ceph_mount_info *cmount = shared_cmount;
-  auto duration_limit = std::chrono::seconds(config.duration);
   ceph_pthread_setname(("rd-worker-" + std::to_string(thread_id)).c_str());
+  auto duration_limit = std::chrono::seconds(config.duration);
 
   if (config.per_thread_mount) {
     if (int rc = setup_mount(&cmount, config, ss); rc < 0) {
@@ -830,6 +853,7 @@ bench_async_read_worker(
     std::stringstream& ss,
     steady_clock::time_point phase_start_time)
 {
+  ceph_pthread_setname(("rd-worker-" + std::to_string(thread_id)).c_str());
   auto duration_limit = std::chrono::seconds(config.duration);
 
   // Semaphore for queue depth management
@@ -851,8 +875,7 @@ bench_async_read_worker(
     io_queue.push_back(std::move(ctx));
   }
 
-  // Store inodes to release at thread exit
-  // This prevents race conditions with readahead operations
+  // Store file inodes to release at the end - keeps them alive during readahead
   std::vector<Inode*> inodes_to_release;
 
   for (int file_iter = 0;; ++file_iter) {
@@ -1001,6 +1024,17 @@ bench_async_read_worker(
       }
     }
 
+    // Flush all pending operations (including readahead) before closing
+    // This ensures no callbacks will try to access the inode after we release it
+    if (!read_error && !stop_signal) {
+      if (int fsync_rc = ceph_ll_fsync(cmount, fh, 0); fsync_rc < 0) {
+        ss << "Thread " << thread_id << " fsync error " << fname << ": " << strerror(-fsync_rc) << std::endl;
+        stats.errors++;
+        stop_signal = true;
+        read_error = true;
+      }
+    }
+
     if (!read_error && !stop_signal) {
       if (int close_rc = ceph_ll_close(cmount, fh); close_rc < 0) {
         ss << "Thread " << thread_id << " close error " << fname << ": " << strerror(-close_rc) << std::endl;
@@ -1015,10 +1049,13 @@ bench_async_read_worker(
       ceph_ll_close(cmount, fh);
     }
 
-    // Defer inode release until thread exit to avoid race with readahead
+    // Store inode for later cleanup - don't forget it yet as readahead may still be active
+    // We'll release all inodes at the end of the thread after all I/O completes
+    inodes_to_release.push_back(inode);
+    inode = nullptr;  // Don't release in this iteration
+
     if (inode) {
-      inodes_to_release.push_back(inode);
-      inode = nullptr;
+      ceph_ll_forget(cmount, inode, 1);
     }
 
     if (read_error) {
@@ -1027,20 +1064,18 @@ bench_async_read_worker(
   }
 
   // Wait for ALL outstanding I/Os to complete before exiting thread
+  // This includes any readahead operations that may have been triggered
   for (auto& ctx : io_queue) {
     while (!ctx->completed.load()) {
       std::this_thread::yield();
     }
   }
 
-  // Brief sleep to allow any pending readahead operations to complete
-  // Readahead callbacks may still be in flight even after our I/O completes
-  std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-  // Now safe to release all inode references
-  for (auto* in : inodes_to_release) {
-    if (in) {
-      ceph_ll_forget(cmount, in, 1);
+  // Now it's safe to release all inode references
+  // All async operations (including readahead) have completed
+  for (auto* inode_ptr : inodes_to_release) {
+    if (inode_ptr) {
+      ceph_ll_forget(cmount, inode_ptr, 1);
     }
   }
 }
@@ -1073,6 +1108,38 @@ execute_perf_dump(struct ceph_mount_info* cmount, const string& output_path)
     cout << "Performance counters dumped to " << output_path << endl;
   }
 }
+
+#ifdef CEPH_LOCKSTAT
+// Helper function to dump lockstat data to a file with iteration and phase suffix
+void dump_lockstat_data(const string& base_path, int iteration, const string& phase) {
+  if (base_path.empty()) {
+    return;
+  }
+
+  // Create filename with iteration and phase: base_iter1_write.json
+  string output_path = base_path;
+  size_t dot_pos = output_path.find_last_of('.');
+  string extension = "";
+  if (dot_pos != string::npos) {
+    extension = output_path.substr(dot_pos);
+    output_path = output_path.substr(0, dot_pos);
+  }
+  output_path += "_iter" + std::to_string(iteration) + "_" + phase + extension;
+
+  std::ofstream ofs(output_path);
+  if (!ofs.is_open()) {
+    cerr << "Error: Could not open " << output_path << " for writing lockstat data." << endl;
+    return;
+  }
+
+  ceph::JSONFormatter formatter(true);
+  ceph::lockstat_detail::LockStatEntry::dump_formatted(&formatter);
+  formatter.flush(ofs);
+  ofs.close();
+
+  cout << "Lockstat data dumped to " << output_path << endl;
+}
+#endif
 
 // Worker function for Cleanup (Unlink) phase
 void bench_cleanup_worker(int thread_id,
@@ -1115,7 +1182,13 @@ void bench_cleanup_worker(int thread_id,
   }
 }
 
-void print_statistics(const string& type, const vector<double>& rates, const string& unit, ceph::Formatter* f = nullptr) {
+void
+print_statistics(
+    const string& type,
+    const vector<double>& rates,
+    const string& unit,
+    ceph::Formatter* f = nullptr)
+{
   if (rates.empty()) {
     return;
   }
@@ -1175,6 +1248,20 @@ int do_bench(BenchConfig& config) {
     return 1;
   }
 
+#ifdef CEPH_LOCKSTAT
+  // Start lockstat collection if enabled
+  if (!config.lockstat_dump_path.empty()) {
+    auto threshold_ns = std::chrono::nanoseconds(config.lockstat_threshold_ns);
+    auto threshold = std::chrono::duration_cast<ceph::lockstat_detail::lockstat_clock::duration>(threshold_ns);
+    int rc = ceph::lockstat_detail::LockStatEntry::start(threshold);
+    if (rc != 0) {
+      cerr << "Warning: Failed to start lockstat collection: " << strerror(rc) << endl;
+    } else {
+      cout << "Lockstat collection started with threshold " << config.lockstat_threshold_ns << " ns" << endl;
+    }
+  }
+#endif
+
   // Create Main Mount
   struct ceph_mount_info *shared_cmount = NULL;
   if (int rc = setup_mount(&shared_cmount, config, cerr); rc < 0) {
@@ -1195,7 +1282,9 @@ int do_bench(BenchConfig& config) {
     json_formatter->dump_int("files", config.num_files);
     json_formatter->dump_unsigned("file_size", config.file_size);
     json_formatter->dump_unsigned("block_size", config.block_size);
-    json_formatter->dump_string("filesystem", config.filesystem.empty() ? "(default)" : config.filesystem);
+    json_formatter->dump_string(
+        "filesystem",
+        config.filesystem.empty() ? "(default)" : config.filesystem);
     json_formatter->dump_string("root", config.mount_root);
     json_formatter->dump_string("subdirectory", config.subdir);
     json_formatter->dump_int("uid", config.uid);
@@ -1231,7 +1320,8 @@ int do_bench(BenchConfig& config) {
 
   cout << "Benchmark Configuration:" << std::endl;
   cout << "  Threads: " << config.num_threads << " | Iterations: " << config.iterations << std::endl;
-  cout << "  Files: " << config.num_files << " | Size: " << config.file_size << " bytes" << std::endl;
+  cout << "  Files: " << config.num_files << " | Size: " << config.file_size
+       << " bytes" << std::endl;
   cout << "  Filesystem: " << (config.filesystem.empty() ? "(default)" : config.filesystem) << std::endl;
   cout << "  Root: " << config.mount_root << std::endl;
   cout << "  Subdirectory: " << config.subdir << std::endl;
@@ -1289,6 +1379,13 @@ int do_bench(BenchConfig& config) {
 
     // --- WRITE PHASE ---
     cout << "Starting Write Phase..." << std::endl;
+
+#ifdef CEPH_LOCKSTAT
+    // Reset lockstat data before write phase
+    if (!config.lockstat_dump_path.empty()) {
+      ceph::lockstat_detail::LockStatEntry::reset_data();
+    }
+#endif
     std::vector<std::thread> threads;
     for (auto& s : write_stats) {
       s.bytes_transferred = 0;
@@ -1375,6 +1472,13 @@ int do_bench(BenchConfig& config) {
       json_formatter->close_section(); // write
     }
 
+#ifdef CEPH_LOCKSTAT
+    // Dump lockstat data after write phase
+    if (!config.lockstat_dump_path.empty()) {
+      dump_lockstat_data(config.lockstat_dump_path, iter, "write");
+    }
+#endif
+
     // --- REMOUNT / CACHE CLEAR ---
     if (!config.per_thread_mount) {
       if (int rc = ceph_unmount(shared_cmount); rc < 0) {
@@ -1390,6 +1494,14 @@ int do_bench(BenchConfig& config) {
 
     // --- READ PHASE ---
     cout << "Starting Read Phase..." << std::endl;
+
+#ifdef CEPH_LOCKSTAT
+    // Reset lockstat data before read phase
+    if (!config.lockstat_dump_path.empty()) {
+      ceph::lockstat_detail::LockStatEntry::reset_data();
+    }
+#endif
+
     threads.clear();
     std::vector<ThreadStats> read_stats(config.num_threads);
     thread_outputs = std::vector<std::stringstream>(config.num_threads);
@@ -1472,6 +1584,13 @@ int do_bench(BenchConfig& config) {
       json_formatter->close_section(); // iteration
     }
 
+#ifdef CEPH_LOCKSTAT
+    // Dump lockstat data after read phase
+    if (!config.lockstat_dump_path.empty()) {
+      dump_lockstat_data(config.lockstat_dump_path, iter, "read");
+    }
+#endif
+
     // Cleanup for next iteration
     if (iter < config.iterations) {
       cout << "Cleaning up for next iteration..." << std::endl;
@@ -1504,11 +1623,14 @@ int do_bench(BenchConfig& config) {
 
   // Statistics Output
   if (config.file_size > 0) {
-    print_statistics("Write Throughput", write_mbps, "MiB/s", json_formatter.get());
-    print_statistics("Read Throughput", read_mbps, "MiB/s", json_formatter.get());
+    print_statistics(
+        "Write Throughput", write_mbps, "MiB/s", json_formatter.get());
+    print_statistics(
+        "Read Throughput", read_mbps, "MiB/s", json_formatter.get());
   }
   print_statistics("File Creates", write_fps, "files/s", json_formatter.get());
-  print_statistics("File Reads (Opens)", read_fps, "files/s", json_formatter.get());
+  print_statistics(
+      "File Reads (Opens)", read_fps, "files/s", json_formatter.get());
 
   if (json_formatter) {
     json_formatter->close_section(); // summary
@@ -1518,7 +1640,8 @@ int do_bench(BenchConfig& config) {
       json_formatter->flush(ofs);
       cout << "\nResults saved to " << config.json_path << std::endl;
     } else {
-      cerr << "\nError: Could not open " << config.json_path << " for writing." << std::endl;
+      cerr << "\nError: Could not open " << config.json_path << " for writing."
+           << std::endl;
     }
   }
 
