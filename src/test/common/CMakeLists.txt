@@ -87,6 +87,11 @@ add_executable(unittest_mutex_lockstat
         test_mutex_lockstat.cc)
 add_ceph_unittest(unittest_mutex_lockstat)
 target_link_libraries(unittest_mutex_lockstat ceph-common)
+
+add_executable(unittest_reentrant_lock
+  test_reentrant_lock.cc)
+add_ceph_unittest(unittest_reentrant_lock)
+target_link_libraries(unittest_reentrant_lock ceph-common)
 endif()
 
 # unittest_prioritized_queue
