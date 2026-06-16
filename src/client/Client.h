@@ -1522,7 +1522,12 @@ private:
       : CRF(nullptr) {}
 
     void finish(int r) override {
-      CRF->finish_io(r);
+      if (!CRF) {
+        return;
+      }
+      auto *crf = CRF;
+      CRF = nullptr;
+      crf->finish_io(r);
     }
 
     // For _read_async, we may not finish in one go, so be prepared for multiple
@@ -1600,6 +1605,8 @@ private:
     Inode *in;
     uint64_t off;
     uint64_t len;
+
+    bool finished = false;
 
     void finish(int r) override;
   };

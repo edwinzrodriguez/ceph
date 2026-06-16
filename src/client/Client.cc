@@ -10083,9 +10083,13 @@ int Client::preadv(int fd, const struct iovec *iov, int iovcnt, loff_t offset)
 
 void Client::C_Read_Finisher::finish_io(int r)
 {
-  utime_t lat;
+  ClientLockIfNeeded lock(clnt);
+  if (iofinished) {
+    return;
+  }
+  iofinished = true;
 
-  // Caller holds client_lock so we don't need to take it.
+  utime_t lat;
 
   if (r >= 0) {
     if (is_read_async) {
@@ -10105,9 +10109,8 @@ void Client::C_Read_Finisher::finish_io(int r)
     clnt->update_io_stat_read(lat);
   }
 
-  iofinished = true;
-
-  if (have_caps) {
+  if ((have_caps & CEPH_CAP_FILE_RD) &&
+      in->cap_refs[CEPH_CAP_FILE_RD] > 0) {
     clnt->put_cap_ref(in, CEPH_CAP_FILE_RD);
   }
 
@@ -10428,10 +10431,17 @@ Client::C_Readahead::~C_Readahead() {
 }
 
 void Client::C_Readahead::finish(int r) {
-  lgeneric_subdout(client->cct, client, 20) << "client." << client->get_nodeid() << " " << "C_Readahead on " << f->inode << dendl;
+  ClientLockIfNeeded lock(client);
   // Keep inode alive until after destructor runs, since put_cap_ref may free it
   InodeRef inode_holder = f->inode;
-  client->put_cap_ref(inode_holder.get(), CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
+  lgeneric_subdout(client->cct, client, 20) << "client." << client->get_nodeid() << " " << "C_Readahead on " << inode_holder << dendl;
+
+  if (inode_holder->cap_refs[CEPH_CAP_FILE_RD] > 0) {
+    client->put_cap_ref(inode_holder.get(), CEPH_CAP_FILE_RD);
+  }
+  if (inode_holder->cap_refs[CEPH_CAP_FILE_CACHE] > 0) {
+    client->put_cap_ref(inode_holder.get(), CEPH_CAP_FILE_CACHE);
+  }
   if (r > 0) {
     client->update_read_io_size(r);
   }
@@ -10467,6 +10477,11 @@ void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
 
 void Client::C_Read_Async_Finisher::finish(int r)
 {
+  if (finished) {
+    return;
+  }
+  finished = true;
+  
   // Do read ahead as long as we aren't completing with 0 bytes
   if (r != 0)
     clnt->do_readahead(f, in, off, len);
