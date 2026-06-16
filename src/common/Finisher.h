@@ -113,6 +113,11 @@ class Finisher {
 
   bool is_empty();
 
+  /// True when called from this finisher's worker thread.
+  bool am_self() const {
+    return finisher_thread.am_self();
+  }
+
   std::string_view get_thread_name() const noexcept {
     return thread_name;
   }
