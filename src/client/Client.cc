@@ -6423,17 +6423,37 @@ void Client::_unmount(bool abort)
   // empty lru cache
   trim_cache();
 
-  auto dispose_map_only_inodes = [this]() {
-    for (auto it = inode_map.begin(); it != inode_map.end(); ) {
-      Inode *in = it->second;
-      ++it;
-      if (in->get_nref() == 1)
-	put_inode(in);
+  auto dispose_stale_inodes = [this]() {
+    std::vector<Inode*> inodes;
+    inodes.reserve(inode_map.size());
+    for (auto &p : inode_map)
+      inodes.push_back(p.second);
+
+    for (Inode *in : inodes) {
+      if (!inode_map.count(in->vino()))
+	continue;
+
+      if (in->snapid == CEPH_SNAPDIR) {
+	if (in->snapdir_parent) {
+	  in->snapdir_parent->flags &= ~I_SNAPDIR_OPEN;
+	  in->snapdir_parent.reset();
+	}
+	remove_all_caps(in);
+      } else if (in->flags & I_SNAPDIR_OPEN) {
+	in->flags &= ~I_SNAPDIR_OPEN;
+      }
+
+      if (in->ll_ref)
+	_ll_put(in, in->ll_ref);
+
+      int extra = in->get_nref() - 1;
+      if (extra > 0)
+	put_inode(in, extra);
     }
     delay_put_inodes();
   };
 
-  dispose_map_only_inodes();
+  dispose_stale_inodes();
 
   while (lru.lru_get_size() > 0 ||
          !inode_map.empty()) {
@@ -6442,7 +6462,7 @@ void Client::_unmount(bool abort)
 	    << ", waiting (for caps to release?)"
             << dendl;
 
-    dispose_map_only_inodes();
+    dispose_stale_inodes();
 
     if (auto r = mount_cond.wait_for(lock, ceph::make_timespan(5));
 	r == std::cv_status::timeout) {
