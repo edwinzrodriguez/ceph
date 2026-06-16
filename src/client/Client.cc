@@ -190,8 +190,18 @@ void client_flush_set_callback(void *p, ObjectCacher::ObjectSet *oset)
 
 namespace {
 
-// Pin inode and snapshot ObjectCacher inputs while client_lock may be dropped.
-// unique_unlock<client_lock> must go out of scope before ~InodeOCState().
+// Pin inode (and oset) while client_lock may be dropped.
+// unique_unlock<client_lock> must go out of scope before the pin is released.
+struct InodeOsetPin {
+  InodeRef pin;
+  ObjectCacher::ObjectSet *oset;
+
+  explicit InodeOsetPin(Inode *in)
+    : pin(in), oset(&in->oset)
+  {}
+};
+
+// Snapshot ObjectCacher I/O inputs for read/write/flush paths.
 struct InodeOCState {
   InodeRef pin;
   ObjectCacher::ObjectSet *oset;
@@ -205,7 +215,9 @@ struct InodeOCState {
       layout(in->layout),
       snapc(in->snaprealm->get_snap_context()),
       snapid(in->snapid)
-  {}
+  {
+    ceph_assert(in->snaprealm);
+  }
 };
 
 } // namespace
@@ -213,7 +225,7 @@ struct InodeOCState {
 bool Client::objectcacher_set_is_empty(Inode *in)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
-  InodeOCState oc(in);
+  InodeOsetPin oc(in);
   {
     ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
     return objectcacher->set_is_empty(oc.oset);
@@ -223,7 +235,7 @@ bool Client::objectcacher_set_is_empty(Inode *in)
 void Client::objectcacher_purge_set(Inode *in)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
-  InodeOCState oc(in);
+  InodeOsetPin oc(in);
   {
     ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
     objectcacher->purge_set(oc.oset);
@@ -233,7 +245,7 @@ void Client::objectcacher_purge_set(Inode *in)
 void Client::objectcacher_release_set(Inode *in)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
-  InodeOCState oc(in);
+  InodeOsetPin oc(in);
   {
     ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
     objectcacher->release_set(oc.oset);
@@ -3748,7 +3760,7 @@ void Client::_put_inode(Inode *in, int n)
     remove_all_caps(in);
 
     ldout(cct, 10) << __func__ << " deleting " << *in << dendl;
-    InodeOCState oc(in);
+    InodeOsetPin oc(in);
     {
       ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
       auto oc_lock = objectcacher->acquire_cache_lock();
@@ -4316,7 +4328,7 @@ void Client::_invalidate_inode_cache(Inode *in, int64_t off, int64_t len)
   if (cct->_conf->client_oc) {
     vector<ObjectExtent> ls;
     Striper::file_to_extents(cct, in->ino, &in->layout, off, len, in->truncate_size, ls);
-    InodeOCState oc(in);
+    InodeOsetPin oc(in);
     {
       ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
       objectcacher->discard_writeback(oc.oset, ls, nullptr);
@@ -4361,7 +4373,7 @@ bool Client::_flush(Inode *in, Context *onfinish)
     return true;
   }
 
-  InodeOCState oc(in);
+  InodeOsetPin oc(in);
   bool flushed;
   {
     ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
