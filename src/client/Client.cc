@@ -10929,6 +10929,7 @@ void Client::C_Readahead::finish(int r) {
 
 void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
 {
+  ClientLockIfNeeded lock_guard(this);
   if(f->readahead.get_min_readahead_size() > 0) {
     pair<uint64_t, uint64_t> readahead_extent = f->readahead.update(off, len, in->effective_size());
     if (readahead_extent.second > 0) {
