@@ -10580,19 +10580,31 @@ void Client::C_Read_Sync_NonBlocking::start()
 #endif
   retry();
 }
+void Client::C_Read_Sync_NonBlocking::C_Step::finish(int r)
+{
+  self->finish_locked(r);
+  if (self->fini)
+    delete self;
+}
+
 void Client::C_Read_Sync_NonBlocking::retry()
 {
+  // Queue through objecter_finisher so finish_locked() does not take
+  // client_lock under Objecter's completion_lock (see C_Lock_Client_Finisher).
   filer->read_trunc(in->ino, &in->layout, in->snapid, pos, left, &tbl, 0,
-                    in->truncate_size, in->truncate_seq, this);
+                    in->truncate_size, in->truncate_seq,
+                    new C_OnFinisher(new C_Step(this), &clnt->objecter_finisher));
 }
 
 /**
  * The following method implements most of what _read_sync does, but in a
  * way that works with the non-blocking read path.
  */
-void Client::C_Read_Sync_NonBlocking::finish(int r)
+void Client::C_Read_Sync_NonBlocking::finish_locked(int r)
 {
-  clnt->client_lock.lock();
+  std::unique_lock<ceph::mutex> cl(clnt->client_lock, std::defer_lock);
+  if (!ceph_mutex_is_locked_by_me(clnt->client_lock))
+    cl.lock();
 
   auto effective_size = in->effective_size();
 
@@ -10649,8 +10661,8 @@ void Client::C_Read_Sync_NonBlocking::finish(int r)
       goto success;
 
     wanted = left;
+    cl.unlock();
     retry();
-    clnt->client_lock.unlock();
     return;
   }
 
@@ -10681,8 +10693,6 @@ error:
 
   onfinish->complete(r);
   fini = true;
-
-  clnt->client_lock.unlock();
 }
 
 int64_t Client::_read(Fh *f, int64_t offset, uint64_t size, bufferlist *bl,
@@ -10838,8 +10848,14 @@ retry:
                                   offset, size, bl, filer.get(), have);
       crf.release();
 
-      // Now make first attempt at performing _read_sync
-      crsa->start();
+      // Start filer I/O without client_lock to avoid nesting it under
+      // Objecter::rwlock (same ordering as C_Lock_Client_Finisher).
+      struct C_Start_Read_Sync_NB : Context {
+        C_Read_Sync_NonBlocking *crsa;
+        explicit C_Start_Read_Sync_NB(C_Read_Sync_NonBlocking *c) : crsa(c) {}
+        void finish(int) override { crsa->start(); }
+      };
+      objecter_finisher.queue(new C_Start_Read_Sync_NB(crsa));
 
       // Now the C_Read_Sync_NonBlocking is going to handle EVERYTHING else
       // Allow caller to wait on onfinish...
@@ -17458,17 +17474,16 @@ int Client::check_pool_perm(Inode *in, int need)
     ObjectOperation rd_op;
     rd_op.stat(nullptr, nullptr, nullptr);
 
-    objecter->mutate(oid, OSDMap::file_to_object_locator(in->layout), rd_op,
-		     nullsnapc, ceph::real_clock::now(), 0, &rd_cond);
-
     C_SaferCond wr_cond;
     ObjectOperation wr_op;
     wr_op.create(true);
 
-    objecter->mutate(oid, OSDMap::file_to_object_locator(in->layout), wr_op,
-		     nullsnapc, ceph::real_clock::now(), 0, &wr_cond);
-
+    object_locator_t ol = OSDMap::file_to_object_locator(in->layout);
     client_lock.unlock();
+    objecter->mutate(oid, ol, rd_op,
+		     nullsnapc, ceph::real_clock::now(), 0, &rd_cond);
+    objecter->mutate(oid, ol, wr_op,
+		     nullsnapc, ceph::real_clock::now(), 0, &wr_cond);
     int rd_ret = rd_cond.wait();
     int wr_ret = wr_cond.wait();
     client_lock.lock();

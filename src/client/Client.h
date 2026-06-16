@@ -1545,14 +1545,16 @@ private:
     uint64_t pos;
     bool fini;
 
-    void retry();
-    void finish(int r) override;
+    struct C_Step : public Context {
+      C_Read_Sync_NonBlocking *self;
+      explicit C_Step(C_Read_Sync_NonBlocking *s) : self(s) {}
+      void finish(int r) override;
+    };
 
-    void complete(int r) override
-    {
-      finish(r);
-      if (fini)
-        delete this;
+    void retry();
+    void finish_locked(int r);
+    void finish(int r) override {
+      ceph_abort_msg("C_Read_Sync_NonBlocking::finish called directly");
     }
   };
 
