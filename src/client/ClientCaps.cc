@@ -221,7 +221,7 @@ int ClientCaps::get_caps_used(Inode *in)
 {
   unsigned used = in->caps_used();
   if (!(used & CEPH_CAP_FILE_CACHE) &&
-      !client->objectcacher->set_is_empty(&in->oset))
+      !client->objectcacher_set_is_empty(in))
     used |= CEPH_CAP_FILE_CACHE;
   return used;
 }
@@ -932,9 +932,9 @@ void ClientCaps::remove_session_caps(MetaSession *s, int err)
 	  lderr(cct) << __func__ << " still has dirty data on " << *in << dendl;
 	  in->set_async_err(err);
 	}
-	client->objectcacher->purge_set(&in->oset);
+	client->objectcacher_purge_set(in.get());
       } else {
-	client->objectcacher->release_set(&in->oset);
+	client->objectcacher_release_set(in.get());
       }
       client->_schedule_invalidate_callback(in.get(), 0, 0);
     }

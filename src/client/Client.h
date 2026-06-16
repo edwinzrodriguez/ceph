@@ -915,6 +915,12 @@ public:
   void _flushed(Inode *in);
   void flush_set_callback(ObjectCacher::ObjectSet *oset);
 
+  bool objectcacher_set_is_empty(Inode *in);
+  void objectcacher_purge_set(Inode *in);
+  void objectcacher_release_set(Inode *in);
+  int64_t objectcacher_release_all();
+  void objectcacher_wait_for_flush_callbacks();
+
   void close_release(Inode *in);
   void close_safe(Inode *in);
 
