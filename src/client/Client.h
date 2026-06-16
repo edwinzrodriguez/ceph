@@ -1623,7 +1623,12 @@ private:
       : CRF(nullptr) {}
 
     void finish(int r) override {
-      CRF->finish_io(r);
+      if (!CRF) {
+        return;
+      }
+      auto *crf = CRF;
+      CRF = nullptr;
+      crf->finish_io(r);
     }
   };
 
@@ -1719,6 +1724,7 @@ private:
 #endif
     uint64_t read_start;
     uint64_t read_len;
+    bool finished = false;
 
     void finish(int r) override;
   };
