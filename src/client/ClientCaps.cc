@@ -236,6 +236,28 @@ void ClientCaps::cap_delay_requeue(Inode *in)
   delayed_list.push_back(&in->delay_cap_item);
 }
 
+void ClientCaps::purge_delayed_list()
+{
+  std::vector<Inode*> inodes;
+  {
+    std::scoped_lock lock(caps_lock);
+    while (!delayed_list.empty()) {
+      inodes.push_back(delayed_list.front());
+      delayed_list.pop_front();
+    }
+  }
+  for (Inode *in : inodes) {
+    in->delay_cap_item.remove_myself();
+    int extra = in->get_nref() - 1;
+    if (extra > 0) {
+      client->put_inode(in, extra);
+    } else if (in->get_nref() > 0) {
+      client->put_inode(in);
+    }
+  }
+  client->delay_put_inodes();
+}
+
 
 void ClientCaps::send_cap(Inode *in, MetaSession *session, Cap *cap,
 		      int flags, int used, int want, int retain,

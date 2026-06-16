@@ -6438,10 +6438,11 @@ void Client::_unmount(bool abort)
 	  in->snapdir_parent->flags &= ~I_SNAPDIR_OPEN;
 	  in->snapdir_parent.reset();
 	}
-	remove_all_caps(in);
       } else if (in->flags & I_SNAPDIR_OPEN) {
 	in->flags &= ~I_SNAPDIR_OPEN;
       }
+
+      in->delay_cap_item.remove_myself();
 
       if (in->ll_ref)
 	_ll_put(in, in->ll_ref);
@@ -6471,6 +6472,8 @@ void Client::_unmount(bool abort)
   }
   ceph_assert(lru.lru_get_size() == 0);
   ceph_assert(inode_map.empty());
+
+  client_caps->purge_delayed_list();
 
   // stop tracing
   if (!cct->_conf->client_trace.empty()) {
