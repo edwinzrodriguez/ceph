@@ -3752,7 +3752,17 @@ void Client::_put_inode(Inode *in, int n)
   ldout(cct, 10) << __func__ << " on " << *in << " n = " << n << dendl;
 
   int left = in->get_nref();
-  ceph_assert(left >= n + 1);
+  // Deferred puts may race with cap teardown during unmount; clamp rather than
+  // abort if we already drained refs on an earlier pass.
+  if (left < n + 1) {
+    ldout(cct, 1) << __func__ << " inode " << *in << " has only " << left
+                  << " refs but trying to put " << n
+                  << ", clamping to " << (left - 1) << dendl;
+    n = left - 1;
+  }
+  if (n <= 0) {
+    return;
+  }
   in->iput(n);
   left -= n;
   if (left == 1) { // the last one will be held by the inode_map
@@ -3760,16 +3770,15 @@ void Client::_put_inode(Inode *in, int n)
     remove_all_caps(in);
 
     ldout(cct, 10) << __func__ << " deleting " << *in << dendl;
+    // Keep client_lock: dropping it here allows tick/delay_put_inodes to
+    // re-enter _put_inode on the same inode mid-teardown.
     InodeOsetPin oc(in);
-    {
-      ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
-      auto oc_lock = objectcacher->acquire_cache_lock();
-      if (is_unmounting()) {
-	objectcacher->purge_set(oc.oset);
-      }
-      bool unclean = objectcacher->release_set(oc.oset);
-      ceph_assert(!unclean);
+    auto oc_lock = objectcacher->acquire_cache_lock();
+    if (is_unmounting()) {
+      objectcacher->purge_set(oc.oset);
     }
+    bool unclean = objectcacher->release_set(oc.oset);
+    ceph_assert(!unclean);
     inode_map.erase(in->vino());
     if (use_faked_inos())
       _release_faked_ino(in);
@@ -4430,7 +4439,8 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
   if (clean) {
     _flushed(in);
     if (is_unmounting()) {
-      delay_put_inodes(true);
+      // Wake unmount only; do not drain delay_put_inodes here on the finisher.
+      mount_cond.notify_all();
     }
   }
 }
