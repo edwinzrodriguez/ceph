@@ -3760,11 +3760,10 @@ void Client::_put_inode(Inode *in, int n)
                   << ", clamping to " << (left - 1) << dendl;
     n = left - 1;
   }
-  if (n <= 0) {
-    return;
+  if (n > 0) {
+    in->iput(n);
+    left -= n;
   }
-  in->iput(n);
-  left -= n;
   if (left == 1) { // the last one will be held by the inode_map
     // release any caps
     remove_all_caps(in);
@@ -6424,7 +6423,17 @@ void Client::_unmount(bool abort)
   // empty lru cache
   trim_cache();
 
-  delay_put_inodes();
+  auto dispose_map_only_inodes = [this]() {
+    for (auto it = inode_map.begin(); it != inode_map.end(); ) {
+      Inode *in = it->second;
+      ++it;
+      if (in->get_nref() == 1)
+	put_inode(in);
+    }
+    delay_put_inodes();
+  };
+
+  dispose_map_only_inodes();
 
   while (lru.lru_get_size() > 0 ||
          !inode_map.empty()) {
@@ -6433,13 +6442,12 @@ void Client::_unmount(bool abort)
 	    << ", waiting (for caps to release?)"
             << dendl;
 
-    delay_put_inodes();
+    dispose_map_only_inodes();
 
     if (auto r = mount_cond.wait_for(lock, ceph::make_timespan(5));
 	r == std::cv_status::timeout) {
       dump_cache(NULL);
     }
-    delay_put_inodes();
   }
   ceph_assert(lru.lru_get_size() == 0);
   ceph_assert(inode_map.empty());
