@@ -4439,8 +4439,9 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
   if (clean) {
     _flushed(in);
     if (is_unmounting()) {
-      // Wake unmount only; do not drain delay_put_inodes here on the finisher.
-      mount_cond.notify_all();
+      // Safe to drain here: _put_inode keeps client_lock across OC teardown so
+      // the tick thread cannot re-enter on the same inode mid-delete.
+      delay_put_inodes(true);
     }
   }
 }
@@ -6432,10 +6433,13 @@ void Client::_unmount(bool abort)
 	    << ", waiting (for caps to release?)"
             << dendl;
 
+    delay_put_inodes();
+
     if (auto r = mount_cond.wait_for(lock, ceph::make_timespan(5));
 	r == std::cv_status::timeout) {
       dump_cache(NULL);
     }
+    delay_put_inodes();
   }
   ceph_assert(lru.lru_get_size() == 0);
   ceph_assert(inode_map.empty());
