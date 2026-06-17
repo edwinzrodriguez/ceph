@@ -12702,6 +12702,9 @@ int Client::_statfs(Inode *in, struct statvfs *stbuf,
 		   const UserPerm& perms)
 {
   ceph_assert(client_lock.is_locked_by_me());
+  RWRef_t mref_reader(mount_state, CLIENT_MOUNTING);
+  if (!mref_reader.is_state_satisfied())
+    return -ENOTCONN;
 
   ldout(cct, 10) << __func__ << dendl;
   tout(cct) << __func__ << std::endl;
