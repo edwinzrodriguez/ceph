@@ -3915,9 +3915,13 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 Client::ClientLockIfNeeded::ClientLockIfNeeded(Client *clnt)
   : lock(clnt->client_lock, std::defer_lock)
 {
+#if defined(CEPH_DEBUG_MUTEX)
   if (!ceph_mutex_is_locked_by_me(clnt->client_lock)) {
     lock.lock();
   }
+#else
+  lock.lock();
+#endif
 }
 
 /**
@@ -4368,7 +4372,10 @@ bool Client::_flush(Inode *in, Context *onfinish)
     if (in->cap_refs[CEPH_CAP_FILE_BUFFER] || in->cap_refs[CEPH_CAP_FILE_CACHE]) {
       _flushed(in);
     }
-    onfinish->complete(0);
+    if (onfinish) {
+      ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+      onfinish->complete(0);
+    }
     return true;
   }
 
@@ -4376,6 +4383,7 @@ bool Client::_flush(Inode *in, Context *onfinish)
     ldout(cct, 8) << __func__ << ": FULL, purging for ENOSPC" << dendl;
     objectcacher_purge_set(in);
     if (onfinish) {
+      ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
       onfinish->complete(-ENOSPC);
     }
     return true;
