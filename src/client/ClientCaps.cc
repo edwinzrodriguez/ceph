@@ -1264,7 +1264,7 @@ void ClientCaps::flush_cap_releases()
 
 void ClientCaps::renew_and_flush_cap_releases()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(client->client_lock.is_locked_by_me());
 
   if (!client->mount_aborted && client->mdsmap->get_epoch()) {
     // renew caps?

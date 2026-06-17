@@ -224,45 +224,45 @@ struct InodeOCState {
 
 bool Client::objectcacher_set_is_empty(Inode *in)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
   InodeOsetPin oc(in);
   {
-    ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
     return objectcacher->set_is_empty(oc.oset);
   }
 }
 
 void Client::objectcacher_purge_set(Inode *in)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
   InodeOsetPin oc(in);
   {
-    ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
     objectcacher->purge_set(oc.oset);
   }
 }
 
 void Client::objectcacher_release_set(Inode *in)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
   InodeOsetPin oc(in);
   {
-    ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
     objectcacher->release_set(oc.oset);
   }
 }
 
 int64_t Client::objectcacher_release_all()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
-  ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+  ceph_assert(client_lock.is_locked_by_me());
+  ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
   return objectcacher->release_all();
 }
 
 void Client::objectcacher_wait_for_flush_callbacks()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
-  ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+  ceph_assert(client_lock.is_locked_by_me());
+  ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
   objectcacher->wait_for_flush_callbacks();
 }
 
@@ -551,7 +551,7 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
 
 Client::~Client()
 {
-  ceph_assert(ceph_mutex_is_not_locked(client_lock));
+  ceph_assert(!client_lock.is_locked());
 
   // If the task is crashed or aborted and doesn't
   // get any chance to run the umount and shutdow.
@@ -687,7 +687,7 @@ void Client::dump_cache(Formatter *f)
 
 void Client::dump_status(Formatter *f)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   ldout(cct, 1) << __func__ << dendl;
 
@@ -2340,7 +2340,7 @@ int Client::make_request(MetaRequest *request,
     }
 
     // set up wait cond
-    ceph::condition_variable caller_cond;
+    ceph::tracked_condition_variable caller_cond;
     request->caller_cond = &caller_cond;
 
     // choose mds
@@ -2855,7 +2855,7 @@ void Client::handle_client_session(const MConstRef<MClientSession>& m)
 
 bool Client::_any_stale_sessions() const
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   for (const auto &p : mds_sessions) {
     if (p.second->state == MetaSession::STATE_STALE) {
@@ -3125,7 +3125,7 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
   // Only signal the caller once (on the first reply):
   // Either its an unsafe reply, or its a safe reply and no unsafe reply was sent.
   if (!is_safe || !request->got_unsafe) {
-    ceph::condition_variable cond;
+    ceph::tracked_condition_variable cond;
     request->dispatch_cond = &cond;
 
     // wake up waiter
@@ -3794,7 +3794,7 @@ void Client::_put_inode(Inode *in, int n)
 
 void Client::delay_put_inodes(bool wakeup)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   std::map<Inode*,int> release;
   {
@@ -3915,13 +3915,9 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 Client::ClientLockIfNeeded::ClientLockIfNeeded(Client *clnt)
   : lock(clnt->client_lock, std::defer_lock)
 {
-#if defined(CEPH_DEBUG_MUTEX)
-  if (!ceph_mutex_is_locked_by_me(clnt->client_lock)) {
+  if (!clnt->client_lock.is_locked_by_me()) {
     lock.lock();
   }
-#else
-  lock.lock();
-#endif
 }
 
 /**
@@ -4224,9 +4220,9 @@ void Client::early_kick_flushing_caps(MetaSession *session)
 }
 
 
-void Client::wait_on_list(list<ceph::condition_variable*>& ls)
+void Client::wait_on_list(list<ceph::tracked_condition_variable*>& ls)
 {
-  ceph::condition_variable cond;
+  ceph::tracked_condition_variable cond;
   ls.push_back(&cond);
   std::unique_lock l{client_lock, std::adopt_lock};
   cond.wait(l);
@@ -4234,7 +4230,7 @@ void Client::wait_on_list(list<ceph::condition_variable*>& ls)
   ls.remove(&cond);
 }
 
-void Client::signal_cond_list(list<ceph::condition_variable*>& ls)
+void Client::signal_cond_list(list<ceph::tracked_condition_variable*>& ls)
 {
   for (auto cond : ls) {
     cond->notify_all();
@@ -4243,10 +4239,10 @@ void Client::signal_cond_list(list<ceph::condition_variable*>& ls)
 
 void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
-  ceph::condition_variable cond;
+  ceph::tracked_condition_variable cond;
   bool done = false;
   int r;
-  ls.push_back(new C_Cond(cond, &done, &r));
+  ls.push_back(new ceph::C_TrackedCond(cond, &done, &r));
   std::unique_lock l{client_lock, std::adopt_lock};
   cond.wait(l, [&done] { return done;});
   l.release();
@@ -4342,7 +4338,7 @@ void Client::_invalidate_inode_cache(Inode *in, int64_t off, int64_t len)
     Striper::file_to_extents(cct, in->ino, &in->layout, off, len, in->truncate_size, ls);
     InodeOsetPin oc(in);
     {
-      ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
       objectcacher->discard_writeback(oc.oset, ls, nullptr);
     }
   }
@@ -4373,7 +4369,7 @@ bool Client::_flush(Inode *in, Context *onfinish)
       _flushed(in);
     }
     if (onfinish) {
-      ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
       onfinish->complete(0);
     }
     return true;
@@ -4383,7 +4379,7 @@ bool Client::_flush(Inode *in, Context *onfinish)
     ldout(cct, 8) << __func__ << ": FULL, purging for ENOSPC" << dendl;
     objectcacher_purge_set(in);
     if (onfinish) {
-      ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
       onfinish->complete(-ENOSPC);
     }
     return true;
@@ -4392,7 +4388,7 @@ bool Client::_flush(Inode *in, Context *onfinish)
   InodeOsetPin oc(in);
   bool flushed;
   {
-    ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
     flushed = objectcacher->flush_set(oc.oset, onfinish);
   }
   return flushed;
@@ -4400,7 +4396,7 @@ bool Client::_flush(Inode *in, Context *onfinish)
 
 void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
   if (!in->oset.dirty_or_tx) {
     ldout(cct, 10) << " nothing to flush" << dendl;
     return;
@@ -4415,7 +4411,7 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
   C_SaferCond onflush("Client::_flush_range flock");
   bool ret;
   {
-    ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
     ret = objectcacher->file_flush(oc.oset, &oc.layout, oc.snapc,
 				   offset, size, &onflush);
     if (!ret) {
@@ -5815,7 +5811,7 @@ int Client::resolve_mds(
  */
 int Client::authenticate()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   if (monclient->is_authenticated()) {
     return 0;
@@ -5836,7 +5832,7 @@ int Client::authenticate()
 
 int Client::fetch_fsmap(bool user)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   // Retrieve FSMap to enable looking up daemon addresses.  We need FSMap
   // rather than MDSMap because no one MDSMap contains all the daemons, and
@@ -6666,7 +6662,7 @@ void Client::start_tick_thread()
 void Client::collect_and_send_metrics() {
   ldout(cct, 20) << __func__ << dendl;
 
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   // right now, we only track and send global metrics. its sufficient
   // to send these metrics to MDS rank0.
@@ -6675,7 +6671,7 @@ void Client::collect_and_send_metrics() {
 
 void Client::collect_and_send_global_metrics() {
   ldout(cct, 20) << __func__ << dendl;
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   /* Do not send the metrics until the MDS rank is ready */
   if (!mdsmap->is_active((mds_rank_t)0)) {
@@ -6840,7 +6836,7 @@ int Client::_do_lookup(const InodeRef& dir, const string& name, int mask,
 
 bool Client::_dentry_valid(const Dentry *dn)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   // is dn lease valid?
   utime_t now = ceph_clock_now();
@@ -7783,7 +7779,7 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
       auto target_len = std::min(read_len, stx->stx_size - offset);
       InodeOCState oc(in);
       {
-        ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+        ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
         r = objectcacher->file_read_ex(oc.oset, &oc.layout, oc.snapid,
                                        read_start, target_len, &bl, 0, &holes,
                                        io_finish.get());
@@ -9021,7 +9017,7 @@ struct dentry_off_lt {
 int Client::_readdir_cache_cb(dir_result_t *dirp, add_dirent_cb_t cb, void *p,
 			      int caps, bool getref)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
   ldout(cct, 10) << __func__ << " " << dirp << " on " << dirp->inode->ino
 	   << " last_name " << dirp->last_name
 	   << " offset " << hex << dirp->offset << dec
@@ -9780,7 +9776,7 @@ int Client::create_and_open(int dirfd, const char *relpath, int flags,
                             const UserPerm& perms, mode_t mode, int stripe_unit,
                             int stripe_count, int object_size, const char *data_pool,
                             std::string alternate_name, FSCrypt_Options fscrypt_options) {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
   int cflags = ceph_flags_sys2wire(flags);
   tout(cct) << cflags << std::endl;
 
@@ -10404,7 +10400,7 @@ void Client::lock_fh_pos(Fh *f)
   ldout(cct, 10) << __func__ << " " << f << dendl;
 
   if (f->pos_locked || !f->pos_waiters.empty()) {
-    ceph::condition_variable cond;
+    ceph::tracked_condition_variable cond;
     f->pos_waiters.push_back(&cond);
     ldout(cct, 10) << __func__ << " BLOCKING on " << f << dendl;
     std::unique_lock l{client_lock, std::adopt_lock};
@@ -10422,7 +10418,7 @@ void Client::lock_fh_pos(Fh *f)
 
 void Client::unlock_fh_pos(Fh *f)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   ldout(cct, 10) << __func__ << " " << f << dendl;
   f->pos_locked = false;
@@ -10610,9 +10606,7 @@ void Client::C_Read_Sync_NonBlocking::retry()
  */
 void Client::C_Read_Sync_NonBlocking::finish_locked(int r)
 {
-  std::unique_lock<ceph::mutex> cl(clnt->client_lock, std::defer_lock);
-  if (!ceph_mutex_is_locked_by_me(clnt->client_lock))
-    cl.lock();
+  std::unique_lock<ceph::TrackedLock> cl(clnt->client_lock);
 
   auto effective_size = in->effective_size();
 
@@ -10706,7 +10700,7 @@ error:
 int64_t Client::_read(Fh *f, int64_t offset, uint64_t size, bufferlist *bl,
                       Context *onfinish, bool read_for_write)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   ldout(cct, 10) << __func__ << " " << f->inode.get() << " " << offset << "~"
                  << size << dendl;
@@ -10963,7 +10957,7 @@ void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
       InodeOCState oc(in);
       int r2 = 0;
       {
-        ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+        ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
         r2 = objectcacher->file_read(oc.oset, &oc.layout, oc.snapid,
 				     readahead_extent.first, readahead_extent.second,
 				     NULL, 0, onfinish2);
@@ -11007,7 +11001,7 @@ void Client::C_Read_Async_Finisher::finish(int r)
 int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 			Context *onfinish)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   const auto& conf = cct->_conf;
   Inode *in = f->inode.get();
@@ -11089,7 +11083,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
   std::vector<ObjectCacher::ObjHole> holes;
   InodeOCState oc(in);
   {
-    ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
     r = objectcacher->file_read_ex(oc.oset, &oc.layout, oc.snapid,
                                    read_start, read_len, bl, 0, &holes,
                                    io_finish.get());
@@ -11112,7 +11106,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
   // Wait for the blocking read to complete and then do readahead
   if (r == 0) {
     {
-      ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
       r = io_finish_cond->wait();
     }
     put_cap_ref(in, CEPH_CAP_FILE_CACHE);
@@ -11146,7 +11140,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 int Client::_read_sync(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 		       bool *checkeof)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
   if (len == 0) {
     // zero byte read is not supported by OSD
     return 0;
@@ -11313,7 +11307,7 @@ int64_t Client::_preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
                                        Context *onfinish, bufferlist *blp,
                                        bool do_fsync, bool syncdataonly)
 {
-    ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+    ceph_assert(client_lock.is_locked_by_me());
 
 #if defined(__linux__) && defined(O_PATH)
     if (fh->flags & O_PATH)
@@ -11508,7 +11502,7 @@ void Client::C_Write_Finisher::finish_fsync(int r)
   bool fini;
   client_t const whoami = clnt->whoami;  // For the benefit of ldout prefix
 
-  ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+  ceph_assert(clnt->client_lock.is_locked_by_me());
 
   ldout(clnt->cct, 3) << "finish_fsync r = " << r << dendl;
 
@@ -11641,7 +11635,7 @@ int Client::WriteEncMgr::read_modify_write(Context *_iofinish)
 #endif
 
 #if defined(__linux__)
-  ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+  ceph_assert(clnt->client_lock.is_locked_by_me());
 
   int r = 0;
 
@@ -11722,7 +11716,7 @@ done:
 #if defined(__linux__)
 void Client::WriteEncMgr::finish_read_start(int r)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+  ceph_assert(clnt->client_lock.is_locked_by_me());
   ldout(cct, 10) << __func__ << dendl;
 
   if (r >= 0) {
@@ -11760,7 +11754,7 @@ void Client::WriteEncMgr::finish_read_start(int r)
 
 void Client::WriteEncMgr::finish_read_end(int r)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+  ceph_assert(clnt->client_lock.is_locked_by_me());
   ldout(cct, 10) << __func__ << dendl;
 
   if (r >= 0) {
@@ -11778,7 +11772,7 @@ void Client::WriteEncMgr::finish_read_end(int r)
 
 bool Client::WriteEncMgr::do_try_finish(int r)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+  ceph_assert(clnt->client_lock.is_locked_by_me());
   ldout(cct, 10) << __func__ << dendl;
 
   if (!aioc.is_complete()) {
@@ -11827,7 +11821,7 @@ int Client::WriteEncMgr_Buffered::do_write()
   // async, caching, non-blocking.
   InodeOCState oc(in);
   {
-    ceph::unique_unlock<ceph::mutex> cl_drop(clnt->client_lock);
+    ceph::unique_unlock<ceph::TrackedLock> cl_drop(clnt->client_lock);
     r = clnt->objectcacher->file_write(oc.oset, &oc.layout, oc.snapc,
                                        offset, size, *pbl, ceph::real_clock::now(),
                                        0, iofinish,
@@ -11855,7 +11849,7 @@ int Client::WriteEncMgr_NotBuffered::do_write()
 int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
 	               Context *onfinish, bool do_fsync, bool syncdataonly)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   uint64_t fpos = 0;
   Inode *in = f->inode.get();
@@ -12263,7 +12257,7 @@ void Client::C_nonblocking_fsync_state::advance()
                        << " onfinish " << onfinish
                        << dendl;
 
-  ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+  ceph_assert(clnt->client_lock.is_locked_by_me());
 
   switch (progress) {
   case 0:
@@ -12444,7 +12438,7 @@ void Client::C_nonblocking_fsync_state_advancer::finish(int r)
                        << " r " << r
                        << dendl;
 
-  ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+  ceph_assert(clnt->client_lock.is_locked_by_me());
   state->advance();
 }
 
@@ -12462,7 +12456,7 @@ int64_t Client::nonblocking_fsync(Inode *in, bool syncdataonly, Context *onfinis
 
 int Client::_fsync(Inode *in, bool syncdataonly)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   int r = 0;
   std::unique_ptr<C_SaferCond> object_cacher_completion = nullptr;
@@ -12707,7 +12701,7 @@ int Client::getcwd(string& dir, const UserPerm& perms)
 int Client::_statfs(Inode *in, struct statvfs *stbuf,
 		   const UserPerm& perms)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   ldout(cct, 10) << __func__ << dendl;
   tout(cct) << __func__ << std::endl;
@@ -13259,7 +13253,7 @@ std::pair<int, bool> Client::test_dentry_handling(bool can_invalidate)
 
 int Client::_sync_fs()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   ldout(cct, 10) << __func__ << dendl;
 
@@ -13268,7 +13262,7 @@ int Client::_sync_fs()
   if (cct->_conf->client_oc) {
     cond.reset(new C_SaferCond("Client::_sync_fs:lock"));
     {
-      ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
       objectcacher->flush_all(cond.get());
       ldout(cct, 15) << __func__ << " waiting on data to flush" << dendl;
       cond->wait();
@@ -16672,7 +16666,7 @@ int Client::clear_suid_sgid(Inode *in, const UserPerm& perms, bool defer)
 
 int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   if (offset < 0 || length <= 0)
     return -EINVAL;
@@ -17435,7 +17429,7 @@ enum {
 
 int Client::check_pool_perm(Inode *in, int need)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   if (!cct->_conf->client_check_pool_perm)
     return 0;
@@ -18102,7 +18096,7 @@ void Client::handle_conf_change(const ConfigProxy& conf,
       changed.count("client_oc_max_dirty") ||
       changed.count("client_oc_target_dirty") ||
       changed.count("client_oc_max_dirty_age")) {
-    ceph::unique_unlock<ceph::mutex> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
     if (changed.count("client_oc_size")) {
       objectcacher->set_max_size(cct->_conf->client_oc_size);
     }
@@ -18157,7 +18151,7 @@ void intrusive_ptr_release(Inode *in)
 
 mds_rank_t Client::_get_random_up_mds() const
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  ceph_assert(client_lock.is_locked_by_me());
 
   std::set<mds_rank_t> up;
   mdsmap->get_up_mds_set(up);
