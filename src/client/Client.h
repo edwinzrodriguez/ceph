@@ -314,6 +314,7 @@ public:
   friend class C_Client_CacheRelease; // Asserts on client_lock
   friend class ClientCaps;
   friend class SyntheticClient;
+  friend class Inode;
   friend void intrusive_ptr_release(Inode *in);
   template <typename T> friend struct RWRefState;
   template <typename T> friend class RWRef;

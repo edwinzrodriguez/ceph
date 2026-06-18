@@ -4258,6 +4258,8 @@ void Client::_invalidate_inode_cache(Inode *in, int64_t off, int64_t len)
 
 bool Client::_release(Inode *in)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+
   ldout(cct, 20) << "_release " << *in << dendl;
   if (in->cap_refs[CEPH_CAP_FILE_CACHE] == 0) {
     _invalidate_inode_cache(in);
@@ -4268,6 +4270,7 @@ bool Client::_release(Inode *in)
 
 bool Client::_flush(Inode *in, Context *onfinish)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
   ldout(cct, 10) << "_flush " << *in << dendl;
 
   if (!in->oset.dirty_or_tx) {
@@ -4344,6 +4347,7 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
 
 void Client::_flushed(Inode *in)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
   ldout(cct, 10) << "_flushed " << *in << dendl;
 
   // finish_io may already have dropped FILE_BUFFER before this runs on the
@@ -12327,6 +12331,8 @@ int Client::_fsync(Inode *in, bool syncdataonly)
   } else {
     // FIXME: this can starve
     while (!in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
+     ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+
       ldout(cct, 10) << "ino " << in->ino << " has " << in->cap_refs[CEPH_CAP_FILE_BUFFER]
 		     << " uncommitted, waiting" << dendl;
       wait_on_context_list(in->waitfor_commit);

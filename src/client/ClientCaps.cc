@@ -36,6 +36,7 @@ ceph_tid_t ClientCaps::allocate_flush_tid(){ std::scoped_lock l(caps_lock); retu
 
 void ClientCaps::get_cap_ref(Inode *in, int cap)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   if ((cap & CEPH_CAP_FILE_BUFFER) &&
       in->cap_refs[CEPH_CAP_FILE_BUFFER] == 0) {
     ldout(cct, 5) << __func__ << " got first FILE_BUFFER ref on " << *in << dendl;
