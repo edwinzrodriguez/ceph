@@ -12109,7 +12109,11 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
       return 0;
     }
 
-    put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
+    // _flushed may already have dropped FILE_BUFFER on the ObjectCacher
+    // finisher when the write fully committed before we re-take client_lock.
+    if (in->cap_refs[CEPH_CAP_FILE_BUFFER] > 0) {
+      put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
+    }
 
     if (r < 0)
       goto done;
