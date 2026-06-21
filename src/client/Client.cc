@@ -4432,6 +4432,14 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
 
 void Client::C_Write_Finisher::queue_finish_io(int r)
 {
+  client_t const whoami = clnt->whoami;
+  ldout(clnt->cct, 10) << "io_correl CWF queue_finish_io"
+                       << " CWF=" << this
+                       << " onfinish=" << onfinish
+                       << " ino=" << in->ino
+                       << " offset=" << offset
+                       << " r=" << r
+                       << dendl;
   // Run off ObjectCacher/objecter finishers: finish_io may flush, and
   // ObjecterWriteback commit callbacks are queued on objecter_finisher.
   clnt->client_finisher.queue(
@@ -11515,6 +11523,7 @@ void Client::C_Write_Finisher::finish_io(int r)
 void Client::C_Write_Finisher::finish_io_complete(int r)
 {
   bool fini;
+  client_t const whoami = clnt->whoami;
 
   ClientLockIfNeeded lock(clnt);
 
@@ -11524,6 +11533,13 @@ void Client::C_Write_Finisher::finish_io_complete(int r)
 
   iofinished = true;
   iofinished_r = r;
+  ldout(clnt->cct, 10) << "io_correl CWF finish_io_complete"
+                       << " CWF=" << this
+                       << " onfinish=" << onfinish
+                       << " ino=" << in->ino
+                       << " offset=" << offset
+                       << " r=" << r
+                       << dendl;
   fini = try_complete();
 
   if (fini)
@@ -11548,6 +11564,13 @@ void Client::C_Write_Finisher::finish_fsync(int r)
   ceph_assert(clnt->client_lock.is_locked_by_me());
 
   ldout(clnt->cct, 3) << "finish_fsync r = " << r << dendl;
+  ldout(clnt->cct, 10) << "io_correl CWF finish_fsync"
+                       << " CWF=" << this
+                       << " onfinish=" << onfinish
+                       << " ino=" << in->ino
+                       << " offset=" << offset
+                       << " r=" << r
+                       << dendl;
 
   fsync_finished = true;
   fsync_r = r;
@@ -11574,6 +11597,13 @@ bool Client::C_Write_Finisher::try_complete()
     C_nonblocking_fsync_state *state = new C_nonblocking_fsync_state(clnt, in, syncdataonly, fsync_f);
 
     // Kick fsync off... and all will magically complete eventually...
+    ldout(clnt->cct, 10) << "io_correl CWF kickoff fsync"
+                          << " CWF=" << this
+                          << " onfinish=" << onfinish
+                          << " fsync_state=" << state
+                          << " ino=" << in->ino
+                          << " offset=" << offset
+                          << dendl;
     ldout(clnt->cct, 19) << "kickoff fsync onfinish " << onfinish << dendl;
     state->advance();
   } else if (onuninlinefinished && iofinished) {
@@ -11581,12 +11611,30 @@ bool Client::C_Write_Finisher::try_complete()
     clnt->put_cap_ref(in, CEPH_CAP_FILE_WR);
 
     if (fsync_r < 0) {
+      ldout(clnt->cct, 10) << "io_correl CWF complete"
+                           << " CWF=" << this
+                           << " onfinish=" << onfinish
+                           << " r=" << fsync_r
+                           << " via=fsync_r"
+                           << dendl;
       ldout(clnt->cct, 19) << " complete with fsync_r " << fsync_r << dendl;
       onfinish->complete(fsync_r);
     } else if (onuninlinefinished_r < 0 && onuninlinefinished_r != -ECANCELED) {
+      ldout(clnt->cct, 10) << "io_correl CWF complete"
+                           << " CWF=" << this
+                           << " onfinish=" << onfinish
+                           << " r=" << onuninlinefinished_r
+                           << " via=onuninlinefinished_r"
+                           << dendl;
       ldout(clnt->cct, 19) << " complete with onuninlinefinished_r " << onuninlinefinished_r << dendl;
       onfinish->complete(onuninlinefinished_r);
     } else {
+      ldout(clnt->cct, 10) << "io_correl CWF complete"
+                           << " CWF=" << this
+                           << " onfinish=" << onfinish
+                           << " r=" << iofinished_r
+                           << " via=iofinished_r"
+                           << dendl;
       ldout(clnt->cct, 19) << " complete with iofinished_r " << iofinished_r << dendl;
       onfinish->complete(iofinished_r);
     }
@@ -12055,6 +12103,15 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
                         offset, size,
                         do_fsync, syncdataonly, enc_mgr->encrypted()));
 
+    ldout(cct, 10) << "io_correl CWF created"
+                   << " CWF=" << cwf.get()
+                   << " onfinish=" << onfinish
+                   << " ino=" << in->ino
+                   << " offset=" << offset
+                   << " size=" << size
+                   << " do_fsync=" << do_fsync
+                   << dendl;
+
     cwf_iofinish->CWF = cwf.get();
   }
 
@@ -12357,6 +12414,11 @@ void Client::C_nonblocking_fsync_state::advance()
     if (flush_wait && !flush_completed) {
       // wait on a real reply instead of guessing
       ldout(clnt->cct, 15) << "waiting on data to flush" << dendl;
+      ldout(clnt->cct, 10) << "io_correl fsync wait flush"
+                           << " fsync_state=" << this
+                           << " onfinish=" << onfinish
+                           << " ino=" << in->ino
+                           << dendl;
       // ------------  here is a state machine break point
       return;
     } else {
@@ -12422,6 +12484,13 @@ void Client::C_nonblocking_fsync_state::advance()
                              << ccap_string(it->second) << " flush_tid " << flush_tid
                              << " last " << it->first << dendl;
         advancer = new C_nonblocking_fsync_state_advancer(clnt, this);
+        ldout(clnt->cct, 10) << "io_correl fsync wait caps"
+                             << " fsync_state=" << this
+                             << " onfinish=" << onfinish
+                             << " ino=" << in->ino
+                             << " flush_tid=" << flush_tid
+                             << " oldest_flushing=" << it->first
+                             << dendl;
         ldout(clnt->cct, 10) << "Adding onfinish " << onfinish
                              << " for C_nonblocking_fsync_state " << this
                              << dendl;
@@ -12452,6 +12521,13 @@ void Client::C_nonblocking_fsync_state::advance()
   lat = mono_clock_now();
   lat -= start;
   clnt->logger->tinc(l_c_fsync, lat);
+
+  ldout(clnt->cct, 10) << "io_correl fsync state complete"
+                       << " fsync_state=" << this
+                       << " onfinish=" << onfinish
+                       << " ino=" << in->ino
+                       << " r=" << result
+                       << dendl;
 
   onfinish->complete(result);
 
@@ -12486,9 +12562,10 @@ void Client::C_nonblocking_fsync_state_advancer::finish(int r)
 
   ldout(clnt->cct, 15) << "C_nonblocking_fsync_state_advancer::finish"
                        << " r " << r
+                       << " fsync_state=" << state
                        << dendl;
 
-  ceph_assert(clnt->client_lock.is_locked_by_me());
+  ClientLockIfNeeded lock(clnt);
   state->advance();
 }
 
