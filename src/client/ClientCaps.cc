@@ -700,18 +700,39 @@ void ClientCaps::send_flush_snap(Inode *in, MetaSession *session,
 }
 
 
-void ClientCaps::signal_caps_inode(Inode *in)
+static void queue_context_list(Client *client, std::vector<Context*>& ls)
 {
+  if (ls.empty())
+    return;
+
+  std::vector<Context*> batch;
+  batch.swap(ls);
+  for (Context *c : batch)
+    client->queue_client_finisher(c);
+}
+
+void ClientCaps::signal_caps_inode_sync(Inode *in)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+
   // Nonblocking fsync advancers may re-queue themselves on
   // waitfor_caps_pending while we are finishing waitfor_caps.  A single
   // signal/swap can leave those waiters in waitfor_caps without running
   // them until the next cap flush ack (which may never come).
   do {
-    signal_context_list(in->waitfor_caps);
+    queue_context_list(client, in->waitfor_caps);
     if (in->waitfor_caps_pending.empty())
       break;
     std::swap(in->waitfor_caps, in->waitfor_caps_pending);
   } while (true);
+}
+
+void ClientCaps::signal_caps_inode(Inode *in)
+{
+  // handle_cap_flush_ack runs on client_finisher with client_lock held.
+  // Waking cap waiters via finish_contexts() runs each fsync advancer inline
+  // and starves C_Write_Finisher::finish_io on the same finisher queue.
+  signal_caps_inode_sync(in);
 }
 
 void ClientCaps::flush_snaps(Inode *in)
