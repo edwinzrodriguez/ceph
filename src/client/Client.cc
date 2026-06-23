@@ -4475,6 +4475,13 @@ void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
   }
 }
 
+static void put_file_cache_cap_if_held(Client *client, Inode *in)
+{
+  if (in->cap_refs[CEPH_CAP_FILE_CACHE] > 0) {
+    client->put_cap_ref(in, CEPH_CAP_FILE_CACHE);
+  }
+}
+
 void Client::_flushed(Inode *in)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
@@ -4483,9 +4490,10 @@ void Client::_flushed(Inode *in)
   // finish_io may already have dropped FILE_BUFFER before this runs on the
   // ObjectCacher finisher (PR3 no longer nests flush_set_callback under the
   // write completion path).
-  if (in->cap_refs[CEPH_CAP_FILE_CACHE] > 0) {
-    put_cap_ref(in, CEPH_CAP_FILE_CACHE);
-  }
+  //
+  // Do not drop FILE_CACHE here: _read_async and readahead hold their own
+  // FILE_CACHE refs for the duration of an active read.  Releasing them when
+  // the object set becomes clean races with ll_read and trips put_cap_ref().
   if (in->cap_refs[CEPH_CAP_FILE_BUFFER] > 0) {
     put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
   }
@@ -7813,7 +7821,7 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
           r = io_finish_cond->wait();
         }
       }
-      put_cap_ref(in, CEPH_CAP_FILE_CACHE);
+      put_file_cache_cap_if_held(this, in);
 
       header.ver = 1;
       header.compat = 1;
@@ -10956,19 +10964,27 @@ Client::C_Readahead::~C_Readahead() {
 }
 
 void Client::C_Readahead::finish(int r) {
-  ClientLockIfNeeded lock(client);
-  Inode *in = f->inode.get();
-  lgeneric_subdout(client->cct, client, 20) << "client." << client->get_nodeid() << " " << "C_Readahead on " << f->inode << dendl;
-  if (in->cap_refs[CEPH_CAP_FILE_RD] > 0) {
-    client->put_cap_ref(in, CEPH_CAP_FILE_RD);
-  }
-  if (in->cap_refs[CEPH_CAP_FILE_CACHE] > 0) {
-    client->put_cap_ref(in, CEPH_CAP_FILE_CACHE);
-  }
-  if (r > 0) {
-    client->update_read_io_size(r);
-    client->subvolume_tracker->add_metric(f->inode->ino, SimpleIOMetric(false, mono_clock_now()-start_time, r));
-  }
+  // ObjectCacher may call this with its cache lock held (e.g. writex waking
+  // waitfor_read).  Defer client_lock work to client_finisher.
+  InodeRef in = f->inode;
+  utime_t start = start_time;
+  client->client_finisher.queue(new LambdaContext(
+    [client=client, in=std::move(in), start, r](int) {
+      ClientLockIfNeeded lock(client);
+      lgeneric_subdout(client->cct, client, 20)
+	<< "client." << client->get_nodeid() << " C_Readahead on " << in << dendl;
+      if (in->cap_refs[CEPH_CAP_FILE_RD] > 0) {
+	client->put_cap_ref(in.get(), CEPH_CAP_FILE_RD);
+      }
+      if (in->cap_refs[CEPH_CAP_FILE_CACHE] > 0) {
+	client->put_cap_ref(in.get(), CEPH_CAP_FILE_CACHE);
+      }
+      if (r > 0) {
+	client->update_read_io_size(r);
+	client->subvolume_tracker->add_metric(
+	  in->ino, SimpleIOMetric(false, mono_clock_now()-start, r));
+      }
+    }));
 }
 
 void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
@@ -11072,7 +11088,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
   if ((off >= effective_size) || (len == 0)) {
     // read is requested at the EOF or the read len is zero, therefore release
     // Fc cap first before proceeding further
-    put_cap_ref(in, CEPH_CAP_FILE_CACHE);
+    put_file_cache_cap_if_held(this, in);
 
     // If not async, immediate return of 0 bytes
     if (onfinish == nullptr) {
@@ -11116,7 +11132,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
   }
   if (onfinish != nullptr) {
     // put the cap ref since we're releasing C_Read_Async_Finisher
-    put_cap_ref(in, CEPH_CAP_FILE_CACHE);
+    put_file_cache_cap_if_held(this, in);
     // Release C_Read_Async_Finisher from managed pointer, either
     // file_read will result in non-blocking complete, or we need to complete
     // immediately. In either case, the C_Read_Async_Finisher is safely
@@ -11135,9 +11151,9 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
       ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
       r = io_finish_cond->wait();
     }
-    put_cap_ref(in, CEPH_CAP_FILE_CACHE);
+    put_file_cache_cap_if_held(this, in);
   } else {
-    put_cap_ref(in, CEPH_CAP_FILE_CACHE);
+    put_file_cache_cap_if_held(this, in);
   }
 
   if (r >= 0) {
@@ -11154,8 +11170,6 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 
     update_read_io_size(bl->length());
     subvolume_tracker->add_metric(in->ino, SimpleIOMetric{false, mono_clock_now() - start_time, bl->length()});
-  } else {
-    put_cap_ref(in, CEPH_CAP_FILE_CACHE);
   }
 
   do_readahead(f, in, off, len);
@@ -11905,7 +11919,7 @@ int Client::WriteEncMgr_Buffered::do_write()
 
   // do buffered write
   if (!in->oset.dirty_or_tx)
-    clnt->get_cap_ref(in, CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_BUFFER);
+    clnt->get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
   clnt->get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
