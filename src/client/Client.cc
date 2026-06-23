@@ -10974,24 +10974,30 @@ done:
   return rc;
 }
 
-Client::C_Readahead::C_Readahead(Client *c, Fh *f) :
-    client(c), f(f), start_time(mono_clock_now()) {
+Client::C_Readahead::C_Readahead(Client *c, Fh *f, Inode *inode) :
+    client(c), f(f), in(inode), start_time(mono_clock_now()) {
   f->get();
   f->readahead.inc_pending();
 }
 
 Client::C_Readahead::~C_Readahead() {
-  f->readahead.dec_pending();
-  client->_put_fh(f);
+  // finish() hands off fh cleanup to client_finisher; only handle the
+  // synchronous-abort path (delete without finish) here.
+  if (f) {
+    f->readahead.dec_pending();
+    client->_put_fh(f);
+  }
 }
 
 void Client::C_Readahead::finish(int r) {
   // ObjectCacher may call this with its cache lock held (e.g. writex waking
-  // waitfor_read).  Defer client_lock work to client_finisher.
-  InodeRef in = f->inode;
+  // waitfor_read).  Defer all fh/inode work to client_finisher under
+  // client_lock.  Pin the inode in the ctor; do not touch f->inode here.
+  Fh *fh = f;
+  f = nullptr;
   utime_t start = start_time;
   client->client_finisher.queue(new LambdaContext(
-    [client=client, in=std::move(in), start, r](int) {
+    [client=client, in=in, fh, start, r](int) {
       ClientLockIfNeeded lock(client);
       lgeneric_subdout(client->cct, client, 20)
 	<< "client." << client->get_nodeid() << " C_Readahead on " << in << dendl;
@@ -11006,6 +11012,8 @@ void Client::C_Readahead::finish(int r) {
 	client->subvolume_tracker->add_metric(
 	  in->ino, SimpleIOMetric(false, mono_clock_now()-start, r));
       }
+      fh->readahead.dec_pending();
+      client->_put_fh(fh);
     }));
 }
 
@@ -11017,7 +11025,7 @@ void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
     if (readahead_extent.second > 0) {
       ldout(cct, 20) << "readahead " << readahead_extent.first << "~" << readahead_extent.second
 		     << " (caller wants " << off << "~" << len << ")" << dendl;
-      Context *onfinish2 = new C_Readahead(this, f);
+      Context *onfinish2 = new C_Readahead(this, f, in);
       InodeOCState oc(in);
       int r2 = 0;
       {
