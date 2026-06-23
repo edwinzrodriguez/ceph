@@ -3155,7 +3155,9 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
       request->unsafe_item.remove_myself();
       request->unsafe_dir_item.remove_myself();
       request->unsafe_target_item.remove_myself();
-      signal_context_list(request->waitfor_safe);
+      // Defer fsync advancers to client_finisher so we do not run them inline
+      // from the messenger thread and starve other finisher work.
+      signal_deferred_context_list(request->waitfor_safe);
     }
     request->item.remove_myself();
     unregister_request(request);
@@ -3671,7 +3673,7 @@ void Client::kick_requests_closed(MetaSession *session)
 		     <<  in->ino  << " " << req->get_tid() << dendl;
 	  req->unsafe_target_item.remove_myself();
 	}
-	signal_context_list(req->waitfor_safe);
+	signal_deferred_context_list(req->waitfor_safe);
 	unregister_request(req);
       }
     }
@@ -4245,6 +4247,26 @@ void Client::wait_on_context_list(std::vector<Context*>& ls)
   std::unique_lock l{client_lock, std::adopt_lock};
   cond.wait(l, [&done] { return done;});
   l.release();
+}
+
+void Client::signal_deferred_context_list(std::vector<Context*>& ls)
+{
+  if (ls.empty())
+    return;
+
+  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+
+  std::vector<Context*> batch;
+  batch.swap(ls);
+  for (Context *c : batch) {
+    // wait_on_context_list() installs C_TrackedCond waiters that must run
+    // under client_lock so notify_all() sees the mutex held.
+    if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr) {
+      c->complete(0);
+    } else {
+      queue_client_finisher(c);
+    }
+  }
 }
 
 void Client::signal_caps_inode(Inode *in)

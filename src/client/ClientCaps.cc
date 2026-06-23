@@ -70,7 +70,9 @@ void ClientCaps::put_cap_ref(Inode *in, int cap)
       if (last & CEPH_CAP_FILE_BUFFER) {
 	for (auto &p : in->cap_snaps)
 	  p.second.dirty_data = 0;
-	signal_context_list(in->waitfor_commit);
+	// _flushed runs on client_finisher.  Defer fsync advancers so we do not
+	// run them inline and starve C_Write_Finisher::finish_io.
+	client->signal_deferred_context_list(in->waitfor_commit);
 	ldout(cct, 5) << __func__ << " dropped last FILE_BUFFER ref on " << *in << dendl;
         if (!in->is_write_delegated()) {
           ++put_nref;
@@ -700,24 +702,6 @@ void ClientCaps::send_flush_snap(Inode *in, MetaSession *session,
 }
 
 
-static void signal_caps_context_list(Client *client, std::vector<Context*>& ls)
-{
-  if (ls.empty())
-    return;
-
-  std::vector<Context*> batch;
-  batch.swap(ls);
-  for (Context *c : batch) {
-    // wait_on_context_list() installs C_TrackedCond waiters that must run
-    // under client_lock so notify_all() sees the mutex held.
-    if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr) {
-      c->complete(0);
-    } else {
-      client->queue_client_finisher(c);
-    }
-  }
-}
-
 void ClientCaps::signal_caps_inode_sync(Inode *in)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
@@ -727,7 +711,7 @@ void ClientCaps::signal_caps_inode_sync(Inode *in)
   // signal/swap can leave those waiters in waitfor_caps without running
   // them until the next cap flush ack (which may never come).
   do {
-    signal_caps_context_list(client, in->waitfor_caps);
+    client->signal_deferred_context_list(in->waitfor_caps);
     if (in->waitfor_caps_pending.empty())
       break;
     std::swap(in->waitfor_caps, in->waitfor_caps_pending);
