@@ -12361,6 +12361,19 @@ int Client::fsync(int fd, bool syncdataonly)
   return r;
 }
 
+namespace {
+// File I/O caps dirtied by buffered writes.  Unsafe MDS requests from
+// unrelated metadata (e.g. concurrent setxattr) must not block write+fsync.
+constexpr int FSYNC_FILE_DATA_DIRTY_CAPS =
+  CEPH_CAP_FILE_BUFFER | CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_WR |
+  CEPH_CAP_FILE_LAZYIO | CEPH_CAP_FILE_WREXTEND;
+
+bool fsync_needs_unsafe_wait(int dirty_caps)
+{
+  return (dirty_caps & ~FSYNC_FILE_DATA_DIRTY_CAPS) != 0;
+}
+} // namespace
+
 void Client::C_nonblocking_fsync_state::advance()
 {
   Context *advancer;
@@ -12376,6 +12389,8 @@ void Client::C_nonblocking_fsync_state::advance()
                        << dendl;
 
   ceph_assert(clnt->client_lock.is_locked_by_me());
+
+  const int dirty_caps_at_start = in->dirty_caps;
 
   switch (progress) {
   case 0:
@@ -12400,7 +12415,8 @@ void Client::C_nonblocking_fsync_state::advance()
 
     ldout(clnt->cct, 10) << __func__ <<": in->unsafe_ops=" << in->unsafe_ops.size() << dendl;
 
-    if (!syncdataonly && !in->unsafe_ops.empty()) {
+    if (!syncdataonly && !in->unsafe_ops.empty() &&
+	fsync_needs_unsafe_wait(dirty_caps_at_start)) {
       waitfor_safe = true;
       clnt->flush_mdlog_sync(in);
 
@@ -12412,6 +12428,9 @@ void Client::C_nonblocking_fsync_state::advance()
       req->waitfor_safe.push_back(advancer);
       // ------------  here is a state machine break point
       return;
+    } else if (!syncdataonly && !in->unsafe_ops.empty()) {
+      ldout(clnt->cct, 10) << __func__ << " skipping unsafe_ops wait; data-only dirty_caps "
+			   << ccap_string(dirty_caps_at_start) << dendl;
     }
 
     // skip and fall through
@@ -12607,7 +12626,9 @@ int Client::_fsync(Inode *in, bool syncdataonly)
   utime_t start = mono_clock_now();
 
   ldout(cct, 8) << "_fsync on " << *in << " " << (syncdataonly ? "(dataonly)":"(data+metadata)") << dendl;
-  
+
+  const int dirty_caps_at_start = in->dirty_caps;
+
   if (cct->_conf->client_oc) {
     object_cacher_completion.reset(new C_SaferCond("Client::_fsync::lock"));
     tmp_ref = in; // take a reference; C_SaferCond doesn't and _flush won't either
@@ -12621,7 +12642,8 @@ int Client::_fsync(Inode *in, bool syncdataonly)
       flush_tid = client_caps->get_last_flush_tid();
   } else ldout(cct, 10) << "no metadata needs to commit" << dendl;
 
-  if (!syncdataonly && !in->unsafe_ops.empty()) {
+  if (!syncdataonly && !in->unsafe_ops.empty() &&
+      fsync_needs_unsafe_wait(dirty_caps_at_start)) {
     flush_mdlog_sync(in);
 
     MetaRequest *req = in->unsafe_ops.back();
@@ -12630,6 +12652,9 @@ int Client::_fsync(Inode *in, bool syncdataonly)
     req->get();
     wait_on_context_list(req->waitfor_safe);
     put_request(req);
+  } else if (!syncdataonly && !in->unsafe_ops.empty()) {
+    ldout(cct, 10) << __func__ << " skipping unsafe_ops wait; data-only dirty_caps "
+		   << ccap_string(dirty_caps_at_start) << dendl;
   }
 
   if (nullptr != object_cacher_completion) { // wait on a real reply instead of guessing
