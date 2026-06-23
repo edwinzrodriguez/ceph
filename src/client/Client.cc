@@ -10749,6 +10749,11 @@ success:
   }
 error:
 
+  if ((have_caps & CEPH_CAP_FILE_RD) &&
+      in->cap_refs[CEPH_CAP_FILE_RD] > 0) {
+    clnt->put_cap_ref(in, CEPH_CAP_FILE_RD);
+  }
+
   onfinish->complete(r);
   fini = true;
 }
