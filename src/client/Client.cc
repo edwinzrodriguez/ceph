@@ -16482,6 +16482,12 @@ int Client::ll_read(Fh *fh, loff_t off, loff_t len, bufferlist *bl)
     return -ENOTCONN;
   }
 
+  std::scoped_lock lock(client_lock);
+  if (fh == NULL || !_ll_fh_exists(fh)) {
+    ldout(cct, 3) << "(fh)" << fh << " is invalid" << dendl;
+    return -EBADF;
+  }
+
 #if defined(__linux__)
   /* We can't return bytes written larger than INT_MAX, clamp size to
    * that or FSCRYPT_MAXIO_SIZE*/
@@ -16495,11 +16501,6 @@ int Client::ll_read(Fh *fh, loff_t off, loff_t len, bufferlist *bl)
 #else
   len = std::min(len, (loff_t)INT_MAX);
 #endif
-  std::scoped_lock lock(client_lock);
-  if (fh == NULL || !_ll_fh_exists(fh)) {
-    ldout(cct, 3) << "(fh)" << fh << " is invalid" << dendl;
-    return -EBADF;
-  }
 
   ldout(cct, 3) << "ll_read " << fh << " " << fh->inode->ino << " " << " " << off << "~" << len << dendl;
   tout(cct) << "ll_read" << std::endl;
@@ -16637,6 +16638,12 @@ int Client::ll_write(Fh *fh, loff_t off, loff_t len, const char *data)
     return -ENOTCONN;
   }
 
+  std::scoped_lock lock(client_lock);
+  if (fh == NULL || !_ll_fh_exists(fh)) {
+    ldout(cct, 3) << "(fh)" << fh << " is invalid" << dendl;
+    return -EBADF;
+  }
+
 #if defined(__linux__)
   /* We can't return bytes written larger than INT_MAX, clamp size to
    * that or FSCRYPT_MAXIO_SIZE*/
@@ -16649,11 +16656,6 @@ int Client::ll_write(Fh *fh, loff_t off, loff_t len, const char *data)
 #else
   len = std::min(len, (loff_t)INT_MAX);
 #endif
-  std::scoped_lock lock(client_lock);
-  if (fh == NULL || !_ll_fh_exists(fh)) {
-    ldout(cct, 3) << "(fh)" << fh << " is invalid" << dendl;
-    return -EBADF;
-  }
 
   ldout(cct, 3) << "ll_write " << fh << " " << fh->inode->ino << " " << off <<
     "~" << len << dendl;
