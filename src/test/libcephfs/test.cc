@@ -44,6 +44,8 @@
 #include <thread>
 #include <random>
 #include <regex>
+#include <atomic>
+#include <chrono>
 
 using namespace std;
 
@@ -4096,6 +4098,761 @@ TEST(LibCephFS, SubdirLookupAfterReaddir_ll) {
   {
     ASSERT_EQ(0, ceph_ll_lookup(cmount, root, "foo/bar", &subdir, &stx, CEPH_STATX_INO, 0, perms));
   }
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
+static bool write_done = false;
+static bool fsync_done = false;
+static bool read_done = false;
+static std::mutex mtx;
+static std::condition_variable cond;
+
+void io_callback(struct ceph_ll_io_info *io_info) {
+  std::unique_lock lock(mtx);
+  if (io_info->write) {
+    std::cout << "written=" << io_info->result << std::endl;
+    write_done = true;
+  } else {
+    std::cout << "read=" << io_info->result << std::endl;
+    read_done = true;
+  }
+  cond.notify_one();
+}
+
+TEST(LibCephFS, AsyncReadAndWriteMultiClient) {
+  pid_t mypid = getpid();
+  struct ceph_mount_info *w_cmount, *r_cmount;
+  UserPerm *w_perms, *r_perms = NULL;
+  Inode *w_parent, *w_inode, *r_parent, *r_inode = NULL;
+  struct ceph_statx stx = {0};
+  struct ceph_ll_io_info io_info;
+  struct iovec iov;
+  struct Fh *w_fh, *r_fh;
+  uint8_t buf[131072];
+  char filename[PATH_MAX];
+
+  sprintf(filename, "/nonblock_test_%d", mypid);
+
+  ASSERT_EQ(ceph_create(&w_cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(w_cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(w_cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(w_cmount, NULL));
+
+  ASSERT_EQ(ceph_create(&r_cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(r_cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(r_cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(r_cmount, NULL));
+
+  w_perms = ceph_mount_perms(w_cmount);
+  ASSERT_EQ(ceph_ll_lookup_root(w_cmount, &w_parent), 0);
+
+  r_perms = ceph_mount_perms(r_cmount);
+  ASSERT_EQ(ceph_ll_lookup_root(r_cmount, &r_parent), 0);
+
+  ASSERT_EQ(ceph_ll_create(w_cmount, w_parent, filename, 0744,
+			   O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW,
+			   &w_inode, &w_fh, &stx, CEPH_STATX_INO, 0, w_perms), 0);
+
+  ASSERT_EQ(ceph_ll_lookup(r_cmount, r_parent, filename, &r_inode,
+			   &stx, CEPH_STATX_INO, 0,r_perms), 0);
+
+  ASSERT_EQ(ceph_ll_open(r_cmount, r_inode, O_RDONLY | O_NOFOLLOW,
+			 &r_fh, r_perms), 0);
+
+  iov.iov_base = buf;
+  iov.iov_len = sizeof(buf);
+
+  io_info.callback = io_callback;
+  io_info.iov = &iov;
+  io_info.iovcnt = 1;
+  io_info.off = 0;
+  io_info.result = 0;
+
+  io_info.fh = w_fh;
+  io_info.write = true;
+
+  ASSERT_EQ(ceph_ll_nonblocking_readv_writev(w_cmount, &io_info), 0);
+
+  std::cout << ": waiting for write to finish" << std::endl;
+  {
+    std::unique_lock lock(mtx);
+    cond.wait(lock, []{
+      return write_done;
+    });
+  }
+  std::cout << ": write finished" << std::endl;
+  ASSERT_EQ(io_info.result, sizeof(buf));
+
+  io_info.fh = r_fh;
+  io_info.write = false;
+  io_info.result = 0;
+
+  ASSERT_EQ(ceph_ll_nonblocking_readv_writev(r_cmount, &io_info), 0);
+
+  std::cout << ": waiting for read to finish" << std::endl;
+  {
+    std::unique_lock lock(mtx);
+    cond.wait(lock, []{
+      return read_done;
+    });
+  }
+  std::cout << ": read finished" << std::endl;
+  ASSERT_EQ(io_info.result, sizeof(buf));
+
+  ASSERT_EQ(0, ceph_unmount(w_cmount));
+  ASSERT_EQ(0, ceph_unmount(r_cmount));
+  ceph_shutdown(w_cmount);
+  ceph_shutdown(r_cmount);
+}
+
+TEST(LibCephFS, UmountHangAfterLlLookupFilePath) {
+  struct ceph_statx stx;
+  struct ceph_mount_info *cmount;
+  UserPerm *perms;
+  Inode *root, *file, *tmp;
+  Fh *fh;
+
+  int mypid = getpid();
+  char filename[NAME_MAX];
+
+  sprintf(filename, "test_umounthangafterlookup%u", mypid);
+
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+
+  perms = ceph_userperm_new(0, 0, 0, NULL);
+
+  ASSERT_EQ(ceph_ll_lookup_root(cmount, &root), 0);
+
+  ASSERT_EQ(ceph_ll_create(cmount, root, filename, 0777,
+                 O_CREAT | O_TRUNC | O_RDWR, &file, &fh, &stx,
+                 CEPH_STATX_INO, 0, perms), 0);
+  ASSERT_EQ(ceph_ll_close(cmount, fh), 0);
+
+  ASSERT_EQ(ceph_ll_lookup(cmount, file, ".", &tmp, &stx, CEPH_STATX_INO,
+            0 , perms), -ENOTDIR);
+
+  ASSERT_EQ(ceph_ll_unlink(cmount, root, filename, perms), 0);
+
+  ceph_ll_put(cmount, file);
+  ceph_ll_put(cmount, root);
+
+  std::cout << "Before ceph_unmount()" << std::endl;
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  std::cout << "After ceph_unmount()" << std::endl;
+
+  ceph_release(cmount);
+  ceph_userperm_destroy(perms);
+}
+
+TEST(LibCephFS, UnmountHangAfterOpenatFilePath) {
+  pid_t mypid = getpid();
+  struct ceph_mount_info *cmount;
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_parse_env(cmount, NULL), 0);
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  char c_rel_dir[64];
+  char c_dir[128];
+  sprintf(c_rel_dir, "open_test_%d", mypid);
+  sprintf(c_dir, "/%s", c_rel_dir);
+  ASSERT_EQ(ceph_mkdir(cmount, c_dir, 0777), 0);
+
+  int root_fd = ceph_open(cmount, "/", O_DIRECTORY, 0777);
+  ASSERT_GT(root_fd, 0);
+
+  int dir_fd = ceph_openat(cmount, root_fd, c_rel_dir, O_DIRECTORY, 0777);
+  ASSERT_GT(dir_fd, 0);
+
+  struct ceph_statx stx;
+  ASSERT_EQ(ceph_statxat(cmount, root_fd, c_rel_dir, &stx, 0, 0), 0);
+
+  std::string c_rel_path = fmt::format("created_file_{}", mypid);
+  std::string c_path = fmt::format("{}/{}", c_dir, c_rel_path);
+  int file_fd = ceph_openat(cmount, dir_fd, c_rel_path.c_str(), O_RDONLY | O_CREAT, 0777);
+  ASSERT_GT(file_fd, 0);
+  int fd = ceph_openat(cmount, file_fd, ".", O_RDONLY, 0777);
+  ASSERT_EQ(fd, -ENOTDIR);
+
+  ASSERT_EQ(ceph_close(cmount, file_fd), 0);
+  ASSERT_EQ(ceph_close(cmount, dir_fd), 0);
+  ASSERT_EQ(ceph_close(cmount, root_fd), 0);
+
+  ASSERT_EQ(0, ceph_unlink(cmount, c_path.c_str()));
+  ASSERT_EQ(0, ceph_rmdir(cmount, c_dir));
+
+  std::cout << "Before ceph_unmount()" << std::endl;
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  std::cout << "After ceph_unmount()" << std::endl;
+
+  ASSERT_EQ(0, ceph_release(cmount));
+}
+
+void write_fsync_io_callback(struct ceph_ll_io_info *io_info) {
+  std::unique_lock lock(mtx);
+  if (io_info->write) {
+    std::cout << "written=" << io_info->result << std::endl;
+    write_done = true;
+  } else {
+    std::cout << "fsync" << std::endl;
+    fsync_done = true;
+  }
+  cond.notify_one();
+}
+
+static void writer_func(struct ceph_mount_info *cmount, Fh *fh) {
+  int iterations = 2;
+  uint8_t buf[131072];
+  struct ceph_ll_io_info io_info;
+  struct iovec iov;
+
+  io_info.callback = write_fsync_io_callback;
+  io_info.iov = &iov;
+  io_info.iovcnt = 1;
+  io_info.off = 0;
+  io_info.fh = fh;
+  io_info.write = true;
+  io_info.fsync = false;
+
+  while (--iterations > 0) {
+    iov.iov_base = buf;
+    iov.iov_len = sizeof(buf);
+    io_info.result = 0;
+    write_done = false;
+    ASSERT_EQ(ceph_ll_nonblocking_readv_writev(cmount, &io_info), 0);
+    std::cout << ": waiting for write to finish" << std::endl;
+    {
+      std::unique_lock lock(mtx);
+      cond.wait(lock, []{
+        return write_done;
+      });
+    }
+    std::cout << ": write finished" << std::endl;
+    ASSERT_EQ(io_info.result, sizeof(buf));
+  }
+}
+
+static void fsync_func(struct ceph_mount_info *cmount, Inode *in) {
+  int iterations = 1000;
+  struct ceph_ll_io_info io_info;
+
+  io_info.callback = write_fsync_io_callback;
+
+  std::cout << ": fsync thread sleeping" << std::endl;
+  sleep(3);
+  std::cout << ": fsync thread wokeup" << std::endl;
+
+  while (--iterations > 0) {
+    io_info.result = 0;
+    fsync_done = false;
+    ASSERT_EQ(ceph_ll_nonblocking_fsync(cmount, in, &io_info), 0);
+    std::cout << ": waiting for fsync to finish" << std::endl;
+    {
+      std::unique_lock lock(mtx);
+      cond.wait(lock, []{
+        return fsync_done;
+      });
+    }
+    std::cout << ": fsync finished" << std::endl;
+  }
+}
+
+static void do_unsafe_ops(struct ceph_mount_info *cmount, std::string path) {
+  int iterations = 200;
+
+  std::cout << ": setxattr thread sleeping" << std::endl;
+  sleep(2);
+  std::cout << ": setxattr thread wokeup" << std::endl;
+
+  while (--iterations > 0) {
+    ASSERT_EQ(0, ceph_setxattr(cmount, path.c_str(), "user.key1", "value1", 6, 0));
+    sleep(1);
+  }
+}
+
+TEST(LibCephFS, ConcurrentWriteAndFsync) {
+  pid_t mypid = getpid();
+  struct ceph_mount_info *cmount;
+  UserPerm *perms = NULL;
+  Inode *parent, *inode = NULL;
+  struct ceph_statx stx = {0};
+  struct Fh *fh;
+  char filename[PATH_MAX];
+
+  // for now use a single thread for performing write and fsync (each).
+  // in the future if we need to increase operation concurrency adjust
+  // @nthreads as required.
+  const int nthreads = 2;
+  std::thread unsafe_ops;
+  std::thread threads[nthreads];
+
+  sprintf(filename, "/contest_%d", mypid);
+
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_set(cmount, "client_oc", "0"));
+  ASSERT_EQ(0, ceph_conf_set(cmount, "client_inject_write_delay_secs", "10"));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+
+  perms = ceph_mount_perms(cmount);
+  ASSERT_EQ(ceph_ll_lookup_root(cmount, &parent), 0);
+
+  ASSERT_EQ(ceph_ll_create(cmount, parent, filename, 0744,
+                           O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW,
+                           &inode, &fh, &stx, CEPH_STATX_INO, 0, perms), 0);
+
+  unsafe_ops = std::thread(do_unsafe_ops, cmount, std::string(filename));
+
+  for (int i = 0; i < nthreads/2; ++i) {
+    threads[i] = std::thread(writer_func, cmount, fh);
+  }
+  for (int i = 1; i < nthreads; ++i) {
+    threads[i] = std::thread(fsync_func, cmount, inode);
+  }
+
+  for (int i = 0; i < nthreads; ++i) {
+    threads[i].join();
+  }
+  unsafe_ops.join();
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
+TEST(LibCephFS, ZeroSizeBufferAsyncReadFsync) {
+  pid_t mypid = getpid();
+  struct ceph_mount_info *cmount;
+  UserPerm *perms = NULL;
+  Inode *root, *file;
+  struct ceph_statx stx = {0};
+  struct Fh *fh;
+  char filename[PATH_MAX]; 
+  const size_t BUFSIZE = (128 * 1024 * 1024) / sizeof(uint64_t);
+  
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_parse_env(cmount, NULL), 0);
+  ASSERT_EQ(ceph_mount(cmount, "/"), 0);
+
+  sprintf(filename, "test_zerosizebufferasyncreadfsync%u", mypid);
+
+  perms = ceph_userperm_new(0, 0, 0, NULL);
+  ASSERT_EQ(ceph_ll_lookup_root(cmount, &root), 0);
+  ASSERT_EQ(ceph_ll_create(cmount, root, filename, 0777,
+                           O_RDWR | O_CREAT | O_TRUNC | O_RSYNC,
+                           &file, &fh, &stx, CEPH_STATX_INO, 0, perms), 0);
+
+  // using a 128MiB buffer and construct the write io_info struct
+  auto out_buf = std::make_unique<uint64_t[]>(BUFSIZE);
+  std::fill(out_buf.get(), out_buf.get() + BUFSIZE, 65);
+  struct ceph_ll_io_info w_io_info;
+  struct iovec w_iov;
+  w_io_info.callback = io_callback;
+  w_io_info.iov = &w_iov;
+  w_io_info.iovcnt = 1;
+  w_io_info.off = 0;
+  w_io_info.fh = fh;
+  w_io_info.result = 0;
+  w_iov.iov_base = out_buf.get();
+  w_iov.iov_len = BUFSIZE * sizeof(uint64_t);
+  w_io_info.write = true;
+  w_io_info.fsync = false;
+
+  // using a zero-sized buffer and contruct read in_info struct
+  auto in_buf = std::make_unique<uint64_t[]>(0);
+  struct ceph_ll_io_info r_io_info;
+  struct iovec r_iov;
+  r_io_info.callback = io_callback;
+  r_io_info.iov = &r_iov;
+  r_io_info.iovcnt = 1;
+  r_io_info.off = 0;
+  r_io_info.fh = fh;
+  r_io_info.result = 0;
+  r_iov.iov_base = in_buf.get();
+  r_iov.iov_len = 0;
+  r_io_info.write = false;
+  r_io_info.fsync = true;
+                           
+  // do a buffered write
+  write_done = false;
+  ASSERT_EQ(ceph_ll_nonblocking_readv_writev(cmount, &w_io_info), 0);
+
+  // async-fsync read while async write is ongoing so that client flushes the
+  // file inode which is having dirty_or_tx (a requirement to flush the inode)
+  // set in it's object set.
+  read_done = false;
+  ASSERT_EQ(ceph_ll_nonblocking_readv_writev(cmount, &r_io_info), 0);
+
+  std::cout << ": waiting for write to finish" << std::endl;
+  {
+    std::unique_lock lock(mtx);
+    cond.wait(lock, []{
+      return write_done;
+    });
+  }
+  std::cout << ": write finished" << std::endl;
+  ASSERT_EQ(w_io_info.result, BUFSIZE * sizeof(uint64_t));
+
+  std::cout << ": waiting for read to finish" << std::endl;
+  {
+    std::unique_lock lock(mtx);
+    cond.wait(lock, []{
+      return read_done;
+    });
+  }
+  std::cout << ": read finished" << std::endl;
+  ASSERT_EQ(r_io_info.result, 0);
+
+  // do a buffered write
+  w_io_info.result = 0;
+  write_done = false;
+  ASSERT_EQ(ceph_ll_nonblocking_readv_writev(cmount, &w_io_info), 0);
+
+  // async-fsync-dataonly read while async write is ongoing so that client
+  // flushes the file inode which is having dirty_or_tx (a requirement to flush
+  // the inode) set in it's object set.
+  r_io_info.result = 0;
+  read_done = false;
+  r_io_info.syncdataonly = true;
+  ASSERT_EQ(ceph_ll_nonblocking_readv_writev(cmount, &r_io_info), 0);
+
+  std::cout << ": waiting for write to finish" << std::endl;
+  {
+    std::unique_lock lock(mtx);
+    cond.wait(lock, []{
+      return write_done;
+    });
+  }
+  std::cout << ": write finished" << std::endl;
+  ASSERT_EQ(w_io_info.result, BUFSIZE * sizeof(uint64_t));
+
+  std::cout << ": waiting for read to finish" << std::endl;
+  {
+    std::unique_lock lock(mtx);
+    cond.wait(lock, []{
+      return read_done;
+    });
+  }
+  std::cout << ": read finished" << std::endl;
+  ASSERT_EQ(r_io_info.result, 0);
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_release(cmount);
+  ceph_userperm_destroy(perms);
+}
+
+struct FsyncCapStressCtx {
+  struct ceph_ll_io_info io_info;
+  struct iovec iov;
+  std::vector<uint8_t> buf;
+  std::atomic<bool> done{false};
+};
+
+static void fsync_cap_stress_cb(struct ceph_ll_io_info *io_info)
+{
+  auto *ctx = static_cast<FsyncCapStressCtx*>(io_info->priv);
+  ctx->done.store(true, std::memory_order_release);
+}
+
+static void fsync_cap_stress_writer(struct ceph_mount_info *cmount, Fh *fh,
+                                    std::atomic<int> *errors,
+                                    int writer_id, int iterations)
+{
+  static const size_t iosize = 256 * 1024;
+
+  for (int i = 0; i < iterations; ++i) {
+    FsyncCapStressCtx ctx;
+    ctx.buf.assign(iosize, static_cast<uint8_t>(writer_id));
+    ctx.iov.iov_base = ctx.buf.data();
+    ctx.iov.iov_len = iosize;
+    ctx.io_info.callback = fsync_cap_stress_cb;
+    ctx.io_info.priv = &ctx;
+    ctx.io_info.iov = &ctx.iov;
+    ctx.io_info.iovcnt = 1;
+    ctx.io_info.fh = fh;
+    ctx.io_info.write = true;
+    ctx.io_info.fsync = true;
+    ctx.io_info.syncdataonly = false;
+    ctx.io_info.off = static_cast<int64_t>(writer_id) * 1024 * 1024 +
+                      static_cast<int64_t>(i) * static_cast<int64_t>(iosize);
+    ctx.io_info.result = 0;
+    ctx.done.store(false, std::memory_order_release);
+
+    if (ceph_ll_nonblocking_readv_writev(cmount, &ctx.io_info) != 0) {
+      errors->fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(3);
+    while (!ctx.done.load(std::memory_order_acquire)) {
+      if (std::chrono::steady_clock::now() > deadline) {
+        errors->fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+      std::this_thread::yield();
+    }
+    if (ctx.io_info.result != static_cast<int64_t>(iosize)) {
+      errors->fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
+static void fsync_cap_stress_setxattr(struct ceph_mount_info *cmount,
+                                      const std::string& path,
+                                      std::atomic<bool> *stop)
+{
+  int seq = 0;
+  while (!stop->load(std::memory_order_acquire)) {
+    std::string key = "user.capstress." + std::to_string(seq++);
+    std::string val = "v" + std::to_string(seq);
+    ceph_setxattr(cmount, path.c_str(), key.c_str(), val.c_str(), val.size(), 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+}
+
+/*
+ * Regression for nonblocking write+fsync stalling in C_nonblocking_fsync_state
+ * when many concurrent fsyncs wait on cap flush (waitfor_caps_pending wakeup),
+ * for heap-aliasing between heap-allocated CWF_fsync_finish and the next
+ * C_nonblocking_fsync_state clobbering the in-flight fsync callback, and for
+ * nonblocking fsync incorrectly waiting on inode-wide FILE_BUFFER refs after
+ * client_oc flush (blocking _fsync does not).
+ */
+TEST(LibCephFS, ConcurrentAsyncWriteFsyncCapFlush) {
+  pid_t mypid = getpid();
+  struct ceph_mount_info *cmount;
+  UserPerm *perms = NULL;
+  Inode *parent, *inode = NULL;
+  struct ceph_statx stx = {0};
+  struct Fh *fh;
+  char filename[PATH_MAX];
+  std::atomic<int> errors{0};
+  std::atomic<bool> stop_xattr{false};
+
+  const int nwriters = 6;
+  const int iterations = 80;
+  std::thread writers[nwriters];
+  std::thread xattr_thread;
+
+  sprintf(filename, "/fsync_cap_%d", mypid);
+
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_set(cmount, "client_oc", "1"));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+
+  perms = ceph_mount_perms(cmount);
+  ASSERT_EQ(ceph_ll_lookup_root(cmount, &parent), 0);
+
+  ASSERT_EQ(ceph_ll_create(cmount, parent, filename, 0644,
+                           O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW,
+                           &inode, &fh, &stx, CEPH_STATX_INO, 0, perms), 0);
+
+  xattr_thread = std::thread(fsync_cap_stress_setxattr, cmount,
+                             std::string(filename), &stop_xattr);
+
+  for (int i = 0; i < nwriters; ++i) {
+    writers[i] = std::thread(fsync_cap_stress_writer, cmount, fh,
+                             &errors, i, iterations);
+  }
+  for (int i = 0; i < nwriters; ++i) {
+    writers[i].join();
+  }
+
+  stop_xattr.store(true, std::memory_order_release);
+  xattr_thread.join();
+
+  ASSERT_EQ(errors.load(), 0);
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
+/*
+ * Regression for put_cap_ref(FILE_CACHE) assert when ll_read races with
+ * flush_set_callback/_flushed during concurrent async write+fsync.
+ */
+static void concurrent_readwrite_reader(struct ceph_mount_info *cmount, Fh *fh,
+                                      std::atomic<int> *errors,
+                                      std::atomic<bool> *stop)
+{
+  static const size_t iosize = 64 * 1024;
+  std::vector<char> buf(iosize);
+  int64_t off = 0;
+
+  while (!stop->load(std::memory_order_acquire)) {
+    int r = ceph_ll_read(cmount, fh, off, iosize, buf.data());
+    if (r < 0) {
+      errors->fetch_add(1, std::memory_order_relaxed);
+    }
+    off = (off + static_cast<int64_t>(iosize)) % (4 * 1024 * 1024);
+    std::this_thread::yield();
+  }
+}
+
+TEST(LibCephFS, ConcurrentReadWriteCapRefs) {
+  pid_t mypid = getpid();
+  struct ceph_mount_info *cmount;
+  UserPerm *perms = NULL;
+  Inode *parent, *inode = NULL;
+  struct ceph_statx stx = {0};
+  struct Fh *fh;
+  char filename[PATH_MAX];
+  std::atomic<int> errors{0};
+  std::atomic<bool> stop_readers{false};
+
+  const int nwriters = 4;
+  const int nreaders = 4;
+  const int iterations = 60;
+  std::thread writers[nwriters];
+  std::thread readers[nreaders];
+
+  sprintf(filename, "/rdwr_cap_%d", mypid);
+
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_set(cmount, "client_oc", "1"));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+
+  perms = ceph_mount_perms(cmount);
+  ASSERT_EQ(ceph_ll_lookup_root(cmount, &parent), 0);
+
+  ASSERT_EQ(ceph_ll_create(cmount, parent, filename, 0644,
+                           O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW,
+                           &inode, &fh, &stx, CEPH_STATX_INO, 0, perms), 0);
+
+  for (int i = 0; i < nreaders; ++i) {
+    readers[i] = std::thread(concurrent_readwrite_reader, cmount, fh,
+                               &errors, &stop_readers);
+  }
+  for (int i = 0; i < nwriters; ++i) {
+    writers[i] = std::thread(fsync_cap_stress_writer, cmount, fh,
+                             &errors, i, iterations);
+  }
+  for (int i = 0; i < nwriters; ++i) {
+    writers[i].join();
+  }
+
+  stop_readers.store(true, std::memory_order_release);
+  for (int i = 0; i < nreaders; ++i) {
+    readers[i].join();
+  }
+
+  ASSERT_EQ(errors.load(), 0);
+
+  ASSERT_EQ(0, ceph_unmount(cmount));
+  ceph_shutdown(cmount);
+}
+
+struct ODirectAsyncReadCtx {
+  struct ceph_ll_io_info io_info;
+  struct iovec iov;
+  std::vector<uint8_t> buf;
+  std::atomic<bool> done{false};
+};
+
+static void odirect_async_read_cb(struct ceph_ll_io_info *io_info)
+{
+  auto *ctx = static_cast<ODirectAsyncReadCtx*>(io_info->priv);
+  ctx->done.store(true, std::memory_order_release);
+}
+
+static void odirect_async_read_worker(struct ceph_mount_info *cmount, Fh *fh,
+                                      std::atomic<int> *errors,
+                                      int worker_id, int iterations)
+{
+  static const size_t iosize = 4 * 1024 * 1024;
+
+  for (int i = 0; i < iterations; ++i) {
+    ODirectAsyncReadCtx ctx;
+    ctx.buf.assign(iosize, 0);
+    ctx.iov.iov_base = ctx.buf.data();
+    ctx.iov.iov_len = iosize;
+    ctx.io_info.callback = odirect_async_read_cb;
+    ctx.io_info.priv = &ctx;
+    ctx.io_info.iov = &ctx.iov;
+    ctx.io_info.iovcnt = 1;
+    ctx.io_info.fh = fh;
+    ctx.io_info.write = false;
+    ctx.io_info.fsync = false;
+    ctx.io_info.off = (static_cast<int64_t>(worker_id) * 16 * iosize) +
+                      (static_cast<int64_t>(i) * static_cast<int64_t>(iosize));
+    ctx.io_info.result = 0;
+    ctx.done.store(false, std::memory_order_release);
+
+    if (ceph_ll_nonblocking_readv_writev(cmount, &ctx.io_info) != 0) {
+      errors->fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes(2);
+    while (!ctx.done.load(std::memory_order_acquire)) {
+      if (std::chrono::steady_clock::now() > deadline) {
+        errors->fetch_add(1, std::memory_order_relaxed);
+        break;
+      }
+      std::this_thread::yield();
+    }
+    if (ctx.io_info.result < 0) {
+      errors->fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
+/*
+ * Regression for C_Read_Sync_NonBlocking leaking FILE_RD cap refs on the
+ * O_DIRECT async read path (NFS-Ganesha / fio direct randread).
+ */
+TEST(LibCephFS, ConcurrentODirectAsyncRead) {
+  pid_t mypid = getpid();
+  struct ceph_mount_info *cmount;
+  UserPerm *perms = NULL;
+  Inode *parent, *inode = NULL;
+  struct ceph_statx stx = {0};
+  struct Fh *fh;
+  char filename[PATH_MAX];
+  std::atomic<int> errors{0};
+
+  const int nreaders = 16;
+  const int iterations = 40;
+  std::thread readers[nreaders];
+
+  sprintf(filename, "/odirect_async_%d", mypid);
+
+  ASSERT_EQ(ceph_create(&cmount, NULL), 0);
+  ASSERT_EQ(ceph_conf_read_file(cmount, NULL), 0);
+  ASSERT_EQ(0, ceph_conf_parse_env(cmount, NULL));
+  ASSERT_EQ(0, ceph_conf_set(cmount, "client_oc", "1"));
+  ASSERT_EQ(0, ceph_mount(cmount, NULL));
+
+  perms = ceph_mount_perms(cmount);
+  ASSERT_EQ(ceph_ll_lookup_root(cmount, &parent), 0);
+
+  ASSERT_EQ(ceph_ll_create(cmount, parent, filename, 0644,
+                           O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW,
+                           &inode, &fh, &stx, CEPH_STATX_INO, 0, perms), 0);
+  ASSERT_EQ(ceph_ll_close(cmount, fh), 0);
+
+  ASSERT_EQ(ceph_ll_open(cmount, inode, O_RDONLY | O_DIRECT | O_NOFOLLOW,
+                         &fh, perms), 0);
+
+  for (int i = 0; i < nreaders; ++i) {
+    readers[i] = std::thread(odirect_async_read_worker, cmount, fh,
+                             &errors, i, iterations);
+  }
+  for (int i = 0; i < nreaders; ++i) {
+    readers[i].join();
+  }
+
+  ASSERT_EQ(errors.load(), 0);
 
   ASSERT_EQ(0, ceph_unmount(cmount));
   ceph_shutdown(cmount);
