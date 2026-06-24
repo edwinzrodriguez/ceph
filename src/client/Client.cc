@@ -11541,6 +11541,11 @@ void Client::C_Write_Finisher::C_FlushRangeFinish::finish(int fr)
   cwf->finish_io_complete(r);
 }
 
+void Client::C_Write_Finisher::C_FsyncFinish::finish(int r)
+{
+  cwf->finish_fsync(r);
+}
+
 void Client::C_Write_Finisher::finish_io(int r)
 {
   ClientLockIfNeeded lock(clnt);
@@ -11642,8 +11647,8 @@ bool Client::C_Write_Finisher::try_complete()
 
   if (onuninlinefinished && iofinished && !fsync_finished && iofinished_r >= 0) {
     // Done with I/O AND uninline, but we want to do fsync
-    CWF_fsync_finish *fsync_f = new CWF_fsync_finish(this);
-    C_nonblocking_fsync_state *state = new C_nonblocking_fsync_state(clnt, in, syncdataonly, fsync_f);
+    C_nonblocking_fsync_state *state = new C_nonblocking_fsync_state(
+      clnt, in, syncdataonly, &fsync_finish_ctx);
 
     // Kick fsync off... and all will magically complete eventually...
     ldout(clnt->cct, 10) << "io_correl CWF kickoff fsync"
