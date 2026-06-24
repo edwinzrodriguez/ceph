@@ -11647,10 +11647,8 @@ bool Client::C_Write_Finisher::try_complete()
 
   if (onuninlinefinished && iofinished && !fsync_finished && iofinished_r >= 0) {
     // Done with I/O AND uninline, but we want to do fsync
-    ceph_assert(pending_fsync_state == nullptr);
-    pending_fsync_state = new C_nonblocking_fsync_state(
+    auto *state = new C_nonblocking_fsync_state(
       clnt, in, syncdataonly, &fsync_finish_ctx);
-    C_nonblocking_fsync_state *state = pending_fsync_state;
 
     // Kick fsync off... and all will magically complete eventually...
     ldout(clnt->cct, 10) << "io_correl CWF kickoff fsync"
@@ -11663,10 +11661,6 @@ bool Client::C_Write_Finisher::try_complete()
                           << dendl;
     ldout(clnt->cct, 19) << "kickoff fsync onfinish " << onfinish << dendl;
     state->advance();
-    if (fsync_finished && pending_fsync_state) {
-      delete pending_fsync_state;
-      pending_fsync_state = nullptr;
-    }
   } else if (onuninlinefinished && iofinished) {
     // Now we are REALLY done...
     clnt->put_cap_ref(in, CEPH_CAP_FILE_WR);
@@ -12618,9 +12612,6 @@ void Client::C_nonblocking_fsync_state::advance()
                        << " r=" << result
                        << dendl;
 
-  if (auto *ff = dynamic_cast<Client::C_Write_Finisher::C_FsyncFinish*>(onfinish)) {
-    ff->notify_fsync_state_done();
-  }
   onfinish->complete(result);
 
   // we're done
