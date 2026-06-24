@@ -12494,7 +12494,10 @@ void Client::C_nonblocking_fsync_state::advance()
                            << dendl;
       // ------------  here is a state machine break point
       return;
-    } else {
+    } else if (!clnt->cct->_conf->client_oc) {
+      // Match Client::_fsync(): with client_oc we already waited on our flush
+      // above; only block on inode-wide FILE_BUFFER refs when objectcacher is
+      // disabled.
       // FIXME: this can starve
       if (in->cap_refs[CEPH_CAP_FILE_BUFFER] > 0) {
         ldout(clnt->cct, 10) << "ino " << in->ino << " has "
@@ -12509,6 +12512,12 @@ void Client::C_nonblocking_fsync_state::advance()
         progress = 1;
         return;
       }
+    } else {
+      ldout(clnt->cct, 10) << "ino " << in->ino
+                           << " client_oc flush done, skipping inode-wide"
+                           << " FILE_BUFFER wait ("
+                           << in->cap_refs[CEPH_CAP_FILE_BUFFER]
+                           << " refs remain)" << dendl;
     }
 
     // skip and fall through
