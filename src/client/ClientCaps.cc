@@ -702,8 +702,16 @@ void ClientCaps::send_flush_snap(Inode *in, MetaSession *session,
 
 void ClientCaps::signal_caps_inode(Inode *in)
 {
-  signal_context_list(in->waitfor_caps);
-  std::swap(in->waitfor_caps, in->waitfor_caps_pending);
+  // Nonblocking fsync advancers may re-queue themselves on
+  // waitfor_caps_pending while we are finishing waitfor_caps.  A single
+  // signal/swap can leave those waiters in waitfor_caps without running
+  // them until the next cap flush ack (which may never come).
+  do {
+    signal_context_list(in->waitfor_caps);
+    if (in->waitfor_caps_pending.empty())
+      break;
+    std::swap(in->waitfor_caps, in->waitfor_caps_pending);
+  } while (true);
 }
 
 void ClientCaps::flush_snaps(Inode *in)
