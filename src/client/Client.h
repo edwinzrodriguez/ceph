@@ -1876,6 +1876,8 @@ private:
     int do_write() override;
   };
 
+  struct C_nonblocking_fsync_state;
+
   class C_Write_Finisher : public Context {
   public:
     void finish_io(int r);
@@ -1896,6 +1898,9 @@ private:
     public:
       explicit C_FsyncFinish(C_Write_Finisher *c) : cwf(c) {}
       void finish(int r) override;
+      void notify_fsync_state_done() {
+        cwf->detach_pending_fsync_state();
+      }
     };
 
     C_Write_Finisher(Client *clnt, Context *onfinish, bool dont_need_uninline,
@@ -1926,10 +1931,15 @@ private:
       size = _size;
     }
 
+    void detach_pending_fsync_state() {
+      pending_fsync_state = nullptr;
+    }
+
   private:
     Client *clnt;
     Context *onfinish;
     C_FsyncFinish fsync_finish_ctx;
+    C_nonblocking_fsync_state *pending_fsync_state = nullptr;
     bool is_file_write;
     utime_t start;
     Fh *f;
