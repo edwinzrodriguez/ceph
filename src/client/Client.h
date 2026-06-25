@@ -1221,6 +1221,8 @@ protected:
   // decrease inode ref.  delete if dangling.
   void _put_inode(Inode *in, int n);
   void delay_put_inodes(bool wakeup=false);
+  void dispose_stale_inodes();
+  void dispose_orphan_inodes();
   void put_inode(Inode *in, int n=1);
   void close_dir(Dir *dir);
 
