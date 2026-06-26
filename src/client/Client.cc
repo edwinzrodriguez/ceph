@@ -3836,6 +3836,18 @@ void Client::_put_inode(Inode *in, int n)
   }
 }
 
+void Client::queue_client_finisher(Context *ctx)
+{
+  client_finisher.queue(ctx);
+  size_t depth = client_finisher.queue_size();
+  if (depth >= 16) {
+    ldout(cct, 10) << "io_correl client_finisher queue"
+		   << " depth=" << depth
+		   << " ctx=" << ctx
+		   << dendl;
+  }
+}
+
 void Client::delay_put_inodes(bool wakeup)
 {
   ceph_assert(client_lock.is_locked_by_me());
@@ -3849,6 +3861,14 @@ void Client::delay_put_inodes(bool wakeup)
   if (release.empty())
     return;
 
+  if (release.size() >= 8 || is_unmounting()) {
+    ldout(cct, 10) << "io_correl delay_put_inodes"
+		   << " count=" << release.size()
+		   << " inode_map=" << inode_map.size()
+		   << " wakeup=" << wakeup
+		   << dendl;
+  }
+
   for (auto &[in, cnt] : release)
     _put_inode(in, cnt);
 
@@ -3861,6 +3881,7 @@ void Client::dispose_stale_inodes()
   ceph_assert(client_lock.is_locked_by_me());
 
   while (!inode_map.empty()) {
+    size_t before = inode_map.size();
     std::vector<Inode*> inodes;
     inodes.reserve(inode_map.size());
     for (auto &p : inode_map)
@@ -3903,6 +3924,20 @@ void Client::dispose_stale_inodes()
       _put_inode(in, 0);
     }
     delay_put_inodes();
+
+    size_t after = inode_map.size();
+    if (after >= before) {
+      size_t delayed = 0;
+      {
+	std::scoped_lock dl(delay_i_lock);
+	delayed = delay_i_release.size();
+      }
+      ldout(cct, 1) << "io_correl dispose_stale_inodes stalled"
+		    << " inode_map=" << after
+		    << " delay_i_release=" << delayed
+		    << dendl;
+      break;
+    }
   }
 }
 
