@@ -11570,48 +11570,61 @@ int64_t Client::_preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
         totallen += iov[i].iov_len;
     }
 
-    /*
-     * Some of the API functions take 64-bit size values, but only return
-     * 32-bit signed integers. Clamp the I/O sizes in those functions so that
-     * we don't do I/Os larger than the values we can return.
-     */
-    bufferlist data;
-    if (clamp_to_int) {
+    if (write) {
+        /*
+         * Some of the API functions take 64-bit size values, but only return
+         * 32-bit signed integers. Clamp the I/O sizes in those functions so
+         * that we don't do I/Os larger than the values we can return.
+         */
+        bufferlist data;
+        if (clamp_to_int) {
 #if defined(__linux__)
-  /* We can't return bytes written larger than INT_MAX, clamp size to
-   * that or FSCRYPT_MAXIO_SIZE*/
-      Inode *in = fh->inode.get();
-      if (in->is_fscrypt_enabled()) {
-        totallen = std::min(totallen, (size_t)FSCRYPT_MAXIO_SIZE);
-      } else {
-        totallen = std::min(totallen, (size_t)INT_MAX);
-      }
-#else
-      totallen = std::min(totallen, (size_t)INT_MAX);
-#endif
-      size_t total_appended = 0;
-      for (int i = 0; i < iovcnt; i++) {
-        if (iov[i].iov_len > 0) {
-          if (total_appended + iov[i].iov_len >= totallen) {
-            data.append((const char *)iov[i].iov_base, totallen - total_appended);
-            break;
+          /* We can't return bytes written larger than INT_MAX, clamp size to
+           * that or FSCRYPT_MAXIO_SIZE*/
+          Inode *in = fh->inode.get();
+          if (in->is_fscrypt_enabled()) {
+            totallen = std::min(totallen, (size_t)FSCRYPT_MAXIO_SIZE);
           } else {
+            totallen = std::min(totallen, (size_t)INT_MAX);
+          }
+#else
+          totallen = std::min(totallen, (size_t)INT_MAX);
+#endif
+          size_t total_appended = 0;
+          for (int i = 0; i < iovcnt; i++) {
+            if (iov[i].iov_len > 0) {
+              if (total_appended + iov[i].iov_len >= totallen) {
+                data.append((const char *)iov[i].iov_base, totallen - total_appended);
+                break;
+              } else {
+                data.append((const char *)iov[i].iov_base, iov[i].iov_len);
+                total_appended += iov[i].iov_len;
+              }
+            }
+          }
+        } else {
+          for (int i = 0; i < iovcnt; i++) {
             data.append((const char *)iov[i].iov_base, iov[i].iov_len);
-            total_appended += iov[i].iov_len;
           }
         }
-      }
-    } else {
-      for (int i = 0; i < iovcnt; i++) {
-        data.append((const char *)iov[i].iov_base, iov[i].iov_len);
-      }
-    }
 
-    if (write) {
         int64_t w = _write(fh, offset, totallen, std::move(data), onfinish, do_fsync, syncdataonly);
         ldout(cct, 3) << "pwritev(" << fh << ", \"...\", " << totallen << ", " << offset << ") = " << w << dendl;
         return w;
     } else {
+        if (clamp_to_int) {
+#if defined(__linux__)
+          Inode *in = fh->inode.get();
+          if (in->is_fscrypt_enabled()) {
+            totallen = std::min(totallen, (size_t)FSCRYPT_MAXIO_SIZE);
+          } else {
+            totallen = std::min(totallen, (size_t)INT_MAX);
+          }
+#else
+          totallen = std::min(totallen, (size_t)INT_MAX);
+#endif
+        }
+
         bufferlist bl;
         int64_t r = _read(fh, offset, totallen, blp ? blp : &bl,
                           onfinish);
