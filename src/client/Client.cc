@@ -12276,8 +12276,14 @@ int Client::WriteEncMgr_NotBuffered::do_write()
   ldout(cct, 10) << __func__ << dendl;
   clnt->get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
-  {
+  if (async) {
     ceph::unique_unlock<ceph::TrackedLock> cl_drop(clnt->client_lock);
+    ensure_bl();
+    clnt->filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
+                             offset, size, *pbl, ceph::real_clock::now(), 0,
+                             in->truncate_size, in->truncate_seq,
+                             iofinish);
+  } else {
     ensure_bl();
     clnt->filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
                              offset, size, *pbl, ceph::real_clock::now(), 0,
