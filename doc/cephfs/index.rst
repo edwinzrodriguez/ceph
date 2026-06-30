@@ -149,6 +149,7 @@ CephFS Concepts
     Distributed Metadata Cache <mdcache>
     Dynamic Metadata Management in CephFS <dynamic-metadata-management>
     CephFS I/O Path <cephfs-io-path>
+    Client Lock and I/O Concurrency <client-lock-contention>
     Case Sensitivity and Normalization <charmap>
     LazyIO <lazyio>
     Directory fragmentation <dirfrags>
