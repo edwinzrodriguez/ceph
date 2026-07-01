@@ -1657,11 +1657,18 @@ private:
       void finish(int fr) override;
     };
 
+    class C_FsyncFinish : public Context {
+      C_Write_Finisher *cwf;
+    public:
+      explicit C_FsyncFinish(C_Write_Finisher *c) : cwf(c) {}
+      void finish(int r) override;
+    };
+
     C_Write_Finisher(Client *clnt, Context *onfinish, bool dont_need_uninline,
                      bool is_file_write, utime_t start, Fh *f, Inode *in,
                      uint64_t fpos, int64_t offset, uint64_t size,
                      bool do_fsync, bool syncdataonly)
-      : clnt(clnt), onfinish(onfinish),
+      : clnt(clnt), onfinish(onfinish), fsync_finish_ctx(this),
         is_file_write(is_file_write), start(start), f(f), in(in), fpos(fpos),
         offset(offset), size(size), syncdataonly(syncdataonly) {
       iofinished_r = 0;
@@ -1679,6 +1686,7 @@ private:
   private:
     Client *clnt;
     Context *onfinish;
+    C_FsyncFinish fsync_finish_ctx;
     bool is_file_write;
     utime_t start;
     Fh *f;
@@ -1705,17 +1713,6 @@ private:
 
     void finish(int r) override {
       CWF->queue_finish_io(r);
-    }
-  };
-
-  struct CWF_fsync_finish : public Context {
-    C_Write_Finisher *CWF;
-
-    CWF_fsync_finish(C_Write_Finisher *CWF)
-      : CWF(CWF) {}
-
-    void finish(int r) override {
-      CWF->finish_fsync(r);
     }
   };
 
