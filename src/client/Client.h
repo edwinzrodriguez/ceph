@@ -1907,6 +1907,9 @@ private:
     bufferlist encbl;
     bufferlist *pbl;
 
+    const struct iovec *defer_iov = nullptr;
+    int defer_iovcnt = 0;
+
     bool async;
 
 #if defined(__linux__)
@@ -1997,6 +2000,9 @@ private:
     int64_t get_ofs() { return offset; }
     uint64_t get_size() { return size; }
     utime_t start;
+
+    void set_deferred_iov(const struct iovec *iov, int iovcnt);
+    void ensure_bl();
   };
 
   class WriteEncMgr_Buffered : public WriteEncMgr {
@@ -2325,6 +2331,7 @@ private:
                          int64_t offset, uint64_t size, Inode *in,
                          bool encrypted);
   int64_t _write(Fh *fh, int64_t offset, uint64_t size, bufferlist bl,
+          const struct iovec *iov = nullptr, int iovcnt = 0,
           Context *onfinish = nullptr, bool do_fsync = false,
           bool syncdataonly = false);
   int64_t _preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
