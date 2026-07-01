@@ -1269,6 +1269,8 @@ protected:
   // decrease inode ref.  delete if dangling.
   void _put_inode(Inode *in, int n);
   void delay_put_inodes(bool wakeup=false);
+  void dispose_stale_inodes();
+  void dispose_orphan_inodes();
   void put_inode(Inode *in, int n=1);
   void close_dir(Dir *dir);
 
@@ -1693,7 +1695,7 @@ private:
     bool iofinished;
     bool onuninlinefinished;
     bool fsync_finished;
-    bool inode_pin_held = false;
+    InodeRef inode_pin;
     void release_inode_pin();
     void finish_io_complete(int r);
     bool try_complete();
@@ -2156,6 +2158,7 @@ private:
 
   ceph::spinlock delay_i_lock;
   std::map<Inode*,int> delay_i_release;
+  std::unordered_set<Inode*> deleting_inodes;
 
   uint64_t nr_metadata_request = 0;
   uint64_t nr_read_request = 0;
