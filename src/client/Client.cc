@@ -4454,11 +4454,17 @@ void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
   ceph::reentrant_condition_variable cond;
   std::atomic<bool> done{false};
+  std::atomic<bool> wake_complete{false};
   int r;
-  ls.push_back(new ceph::C_ReentrantCond(cond, &done, &r));
+  ls.push_back(new ceph::C_ReentrantCond(cond, &done, &r, &wake_complete));
   std::unique_lock l{client_lock, std::adopt_lock};
-  cond.wait(l, [&done] { return done.load(std::memory_order_acquire); });
+  cond.wait(l, [&done] {
+    return done.load(std::memory_order_acquire);
+  });
   l.release();
+  // finish() may run on client_finisher; wait until notify_all_sloppy()
+  // completes before destroying the stack cond (TSan).
+  ceph::wait_for_reentrant_cond_broadcast(wake_complete);
 }
 
 void Client::signal_deferred_context_list(std::vector<Context*>& ls)
