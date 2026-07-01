@@ -10,7 +10,7 @@
 
 class ObjecterWriteback : public WritebackHandler {
  public:
-  ObjecterWriteback(Objecter *o, Finisher *fin, ceph::TrackedLock *lock)
+  ObjecterWriteback(Objecter *o, Finisher *fin, ceph::ReentrantLock *lock)
     : m_objecter(o),
       m_finisher(fin),
       m_lock(lock) { }
@@ -24,7 +24,7 @@ class ObjecterWriteback : public WritebackHandler {
                     Context *onfinish) override {
     m_objecter->read_trunc(oid, oloc, off, len, snapid, pbl, 0,
 			   trunc_size, trunc_seq,
-			   new C_OnFinisher(new C_TrackedLock(m_lock, onfinish),
+			   new C_OnFinisher(new C_ReentrantLock(m_lock, onfinish),
 					    m_finisher));
   }
 
@@ -65,7 +65,7 @@ class ObjecterWriteback : public WritebackHandler {
  private:
   Objecter *m_objecter;
   Finisher *m_finisher;
-  ceph::TrackedLock *m_lock;
+  ceph::ReentrantLock *m_lock;
 };
 
 #endif
