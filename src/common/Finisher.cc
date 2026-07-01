@@ -89,6 +89,7 @@ void *Finisher::finisher_thread_entry()
 #ifdef CEPH_LOCKSTAT
   ceph::lockstat_detail::LockStat::set_thread_iopath(true);
 #endif
+  finisher_tid.store(ceph_gettid());
   std::unique_lock ul(finisher_lock);
   ldout(cct, 10) << "finisher_thread start" << dendl;
 
