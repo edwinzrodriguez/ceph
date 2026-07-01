@@ -217,6 +217,23 @@ struct InodeOCState {
   }
 };
 
+static void append_iovec_to_bufferlist(bufferlist& bl, const struct iovec *iov,
+				       int iovcnt, size_t max_len)
+{
+  size_t total_appended = 0;
+  for (int i = 0; i < iovcnt; i++) {
+    if (iov[i].iov_len == 0)
+      continue;
+    size_t len = iov[i].iov_len;
+    if (max_len > 0 && total_appended + len > max_len)
+      len = max_len - total_appended;
+    bl.append((const char *)iov[i].iov_base, len);
+    total_appended += len;
+    if (max_len > 0 && total_appended >= max_len)
+      break;
+  }
+}
+
 } // namespace
 
 bool Client::objectcacher_set_is_empty(Inode *in)
@@ -11567,11 +11584,9 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
   if (buf) {
     if (size > 0)
       bl.append(buf, size);
-  } else if (iov){
-    for (int i = 0; i < iovcnt; i++) {
-      if (iov[i].iov_len > 0) {
-        bl.append((const char *)iov[i].iov_base, iov[i].iov_len);
-      }
+  } else if (iov) {
+    if (!onfinish || in->inline_version < CEPH_INLINE_NONE) {
+      append_iovec_to_bufferlist(bl, iov, iovcnt, size);
     }
   }
 
@@ -11665,13 +11680,18 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
     get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
     // async, caching, non-blocking.
-    r = objectcacher->file_write(&in->oset, &in->layout,
-				 in->snaprealm->get_snap_context(),
-				 offset, size, bl, ceph::real_clock::now(),
-				 0, iofinish.get(),
-				 onfinish == nullptr
-				   ? objectcacher->CFG_block_writes_upfront()
-				   : false);
+    InodeOCState oc(in);
+    {
+      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+      if (bl.length() == 0 && iov)
+	append_iovec_to_bufferlist(bl, iov, iovcnt, size);
+      r = objectcacher->file_write(oc.oset, &oc.layout, oc.snapc,
+				   offset, size, bl, ceph::real_clock::now(),
+				   0, iofinish.get(),
+				   onfinish == nullptr
+				     ? objectcacher->CFG_block_writes_upfront()
+				     : false);
+    }
 
     if (onfinish) {
       // handle non-blocking caller (onfinish != nullptr), we can now safely
@@ -11739,10 +11759,22 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
 
     get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
-    filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
-		       offset, size, bl, ceph::real_clock::now(), 0,
-		       in->truncate_size, in->truncate_seq,
-		       filer_iofinish.get());
+    if (onfinish) {
+      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+      if (bl.length() == 0 && iov)
+	append_iovec_to_bufferlist(bl, iov, iovcnt, size);
+      filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
+			 offset, size, bl, ceph::real_clock::now(), 0,
+			 in->truncate_size, in->truncate_seq,
+			 filer_iofinish.get());
+    } else {
+      if (bl.length() == 0 && iov)
+	append_iovec_to_bufferlist(bl, iov, iovcnt, size);
+      filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
+			 offset, size, bl, ceph::real_clock::now(), 0,
+			 in->truncate_size, in->truncate_seq,
+			 filer_iofinish.get());
+    }
 
     if (onfinish) {
       // handle non-blocking caller (onfinish != nullptr), we can now safely
