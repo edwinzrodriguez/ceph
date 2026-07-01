@@ -11194,11 +11194,46 @@ void Client::C_Write_Finisher::finish_fsync(int r)
     delete this;
 }
 
+Client::C_Write_Finisher::C_Write_Finisher(
+    Client *clnt_, Context *onfinish_, bool dont_need_uninline,
+    bool is_file_write_, utime_t start_, Fh *f_, Inode *in_,
+    uint64_t fpos_, int64_t offset_, uint64_t size_,
+    bool do_fsync, bool syncdataonly_)
+  : clnt(clnt_), onfinish(onfinish_), fsync_finish_ctx(this),
+    is_file_write(is_file_write_), start(start_), f(f_), in(in_),
+    fpos(fpos_), offset(offset_), size(size_), syncdataonly(syncdataonly_)
+{
+  iofinished_r = 0;
+  onuninlinefinished_r = 0;
+  fsync_r = 0;
+  iofinished = false;
+  onuninlinefinished = dont_need_uninline;
+  fsync_finished = !do_fsync;
+  // Pin until try_complete(); finish_io runs on client_finisher after _write
+  // returns and must not touch an inode that trim/dispose already deleted.
+  in->iget();
+  inode_pin_held = true;
+}
+
+Client::C_Write_Finisher::~C_Write_Finisher()
+{
+  if (inode_pin_held)
+    in->iput();
+}
+
+void Client::C_Write_Finisher::release_inode_pin()
+{
+  if (!inode_pin_held)
+    return;
+  in->iput();
+  inode_pin_held = false;
+}
+
 bool Client::C_Write_Finisher::try_complete()
 {
   client_t const whoami = clnt->whoami;  // For the benefit of ldout prefix
 
-  ldout(clnt->cct, 19) << "C_Write_Finisher::try_complete this " << this 
+  ldout(clnt->cct, 19) << "C_Write_Finisher::try_complete this " << this
                        << " onuninlinefinished " << onuninlinefinished
                        << " iofinished " << iofinished
                        << " iofinished_r " << iofinished_r
@@ -11255,6 +11290,7 @@ bool Client::C_Write_Finisher::try_complete()
     clnt->logger->inc(l_c_aio_completions);
     clnt->dec_aio_in_flight();
     onfinish = nullptr;
+    release_inode_pin();
     return true;
   }
 

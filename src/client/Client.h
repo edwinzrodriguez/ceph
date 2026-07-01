@@ -1667,17 +1667,9 @@ private:
     C_Write_Finisher(Client *clnt, Context *onfinish, bool dont_need_uninline,
                      bool is_file_write, utime_t start, Fh *f, Inode *in,
                      uint64_t fpos, int64_t offset, uint64_t size,
-                     bool do_fsync, bool syncdataonly)
-      : clnt(clnt), onfinish(onfinish), fsync_finish_ctx(this),
-        is_file_write(is_file_write), start(start), f(f), in(in), fpos(fpos),
-        offset(offset), size(size), syncdataonly(syncdataonly) {
-      iofinished_r = 0;
-      onuninlinefinished_r = 0;
-      fsync_r = 0;
-      iofinished = false;
-      onuninlinefinished = dont_need_uninline;
-      fsync_finished = !do_fsync;
-    }
+                     bool do_fsync, bool syncdataonly);
+
+    ~C_Write_Finisher() override;
 
     void finish(int r) override {
       // We need to override finish, but have nothing to do.
@@ -1701,6 +1693,8 @@ private:
     bool iofinished;
     bool onuninlinefinished;
     bool fsync_finished;
+    bool inode_pin_held = false;
+    void release_inode_pin();
     void finish_io_complete(int r);
     bool try_complete();
   };
