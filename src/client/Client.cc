@@ -477,6 +477,7 @@ Client::Client(Messenger *m, MonClient *mc, Objecter *objecter_)
     interrupt_finisher(m->cct),
     remount_finisher(m->cct),
     async_ino_releasor(m->cct),
+    client_finisher(m->cct, "client_finisher", "fn_client"),
     objecter_finisher(m->cct),
     m_command_hook(this),
     fscid(0)
@@ -706,6 +707,7 @@ void Client::_pre_init()
 {
   timer.init();
 
+  client_finisher.start();
   objecter_finisher.start();
   filer.reset(new Filer(objecter, &objecter_finisher));
 
@@ -926,6 +928,8 @@ void Client::shutdown()
     timer.shutdown();
   }
 
+  client_finisher.wait_for_empty();
+  client_finisher.stop();
   objecter_finisher.wait_for_empty();
   objecter_finisher.stop();
 
@@ -4446,9 +4450,28 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
     ret = objectcacher->file_flush(oc.oset, &oc.layout, oc.snapc,
 				   offset, size, &onflush);
     if (!ret) {
-      onflush.wait();
+      ceph_assert(!objectcacher->finisher_am_self());
+      if (objecter_finisher.am_self()) {
+	// ObjecterWriteback delivers write commit callbacks on objecter_finisher.
+	C_SaferCond bridge("Client::_flush_range bridge");
+	client_finisher.queue(new LambdaContext([&onflush, &bridge](int) {
+	  onflush.wait();
+	  bridge.complete(0);
+	}));
+	bridge.wait();
+      } else {
+	onflush.wait();
+      }
     }
   }
+}
+
+void Client::C_Write_Finisher::queue_finish_io(int r)
+{
+  // Run off ObjectCacher/objecter finishers: finish_io may flush, and
+  // ObjecterWriteback commit callbacks are queued on objecter_finisher.
+  clnt->client_finisher.queue(
+    new LambdaContext([this, r](int) { finish_io(r); }));
 }
 
 void Client::flush_set_callback(ObjectCacher::ObjectSet *oset)
@@ -11017,10 +11040,16 @@ void Client::C_Lock_Client_Finisher::finish(int r)
   onfinish->complete(r);
 }
 
+void Client::C_Write_Finisher::C_FlushRangeFinish::finish(int fr)
+{
+  if (fr < 0) {
+    r = fr;
+  }
+  cwf->finish_io_complete(r);
+}
+
 void Client::C_Write_Finisher::finish_io(int r)
 {
-  bool fini;
-
   ClientLockIfNeeded lock(clnt);
 
   if (auto it = in->cap_refs.find(CEPH_CAP_FILE_BUFFER);
@@ -11028,13 +11057,32 @@ void Client::C_Write_Finisher::finish_io(int r)
     clnt->put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
   }
 
-  if (r >= 0) {
-    if (is_file_write) {
-      if ((f->flags & O_SYNC) || (f->flags & O_DSYNC)) {
-        clnt->_flush_range(in, offset, size);
-      }
+  if (r >= 0 && is_file_write &&
+      ((f->flags & O_SYNC) || (f->flags & O_DSYNC)) &&
+      size > 0 && in->oset.dirty_or_tx) {
+    InodeOCState oc(in);
+    bool flushed;
+    {
+      ceph::unique_unlock<ceph::TrackedLock> cl_drop(clnt->client_lock);
+      flushed = clnt->objectcacher->file_flush(
+	oc.oset, &oc.layout, oc.snapc, offset, size,
+	new C_FlushRangeFinish(this, r));
     }
+    if (!flushed) {
+      return;
+    }
+  }
 
+  finish_io_complete(r);
+}
+
+void Client::C_Write_Finisher::finish_io_complete(int r)
+{
+  bool fini;
+
+  ClientLockIfNeeded lock(clnt);
+
+  if (r >= 0) {
     r = clnt->_write_success(f, start, fpos, offset, size, in);
   }
 
@@ -11320,7 +11368,11 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
       return 0;
     }
 
-    put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
+    // _flushed may already have dropped FILE_BUFFER on the ObjectCacher
+    // finisher when the write fully committed before we re-take client_lock.
+    if (in->cap_refs[CEPH_CAP_FILE_BUFFER] > 0) {
+      put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
+    }
 
     if (r < 0)
       goto done;
