@@ -75,6 +75,11 @@ function(distutils_add_cython_module target name src)
   set(PY_LDSHARED ${link_launcher} ${CMAKE_C_COMPILER} ${c_compiler_arg1} "-shared")
   string(REPLACE " " ";" PY_LDFLAGS "${CMAKE_SHARED_LINKER_FLAGS}")
   list(APPEND PY_LDFLAGS -L${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
+  # libcephfs/librados depend on symbols in libceph-common.so when built with
+  # ENABLE_SHARED; python extension links must pull that library in explicitly.
+  if(ENABLE_SHARED)
+    list(APPEND PY_LDFLAGS -lceph-common)
+  endif()
 
   execute_process(COMMAND "${Python3_EXECUTABLE}" -c
     "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
