@@ -228,7 +228,7 @@ bool Client::objectcacher_set_is_empty(Inode *in)
   ceph_assert(client_lock.is_locked_by_me());
   InodeOsetPin oc(in);
   {
-    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
     return objectcacher->set_is_empty(oc.oset);
   }
 }
@@ -238,7 +238,7 @@ void Client::objectcacher_purge_set(Inode *in)
   ceph_assert(client_lock.is_locked_by_me());
   InodeOsetPin oc(in);
   {
-    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
     objectcacher->purge_set(oc.oset);
   }
 }
@@ -248,7 +248,7 @@ void Client::objectcacher_release_set(Inode *in)
   ceph_assert(client_lock.is_locked_by_me());
   InodeOsetPin oc(in);
   {
-    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
     objectcacher->release_set(oc.oset);
   }
 }
@@ -256,14 +256,14 @@ void Client::objectcacher_release_set(Inode *in)
 int64_t Client::objectcacher_release_all()
 {
   ceph_assert(client_lock.is_locked_by_me());
-  ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+  ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
   return objectcacher->release_all();
 }
 
 void Client::objectcacher_wait_for_flush_callbacks()
 {
   ceph_assert(client_lock.is_locked_by_me());
-  ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+  ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
   objectcacher->wait_for_flush_callbacks();
 }
 
@@ -2355,7 +2355,7 @@ int Client::make_request(MetaRequest *request,
     }
 
     // set up wait cond
-    ceph::tracked_condition_variable caller_cond;
+    ceph::reentrant_condition_variable caller_cond;
     request->caller_cond = &caller_cond;
 
     // choose mds
@@ -3140,7 +3140,7 @@ void Client::handle_client_reply(const MConstRef<MClientReply>& reply)
   // Only signal the caller once (on the first reply):
   // Either its an unsafe reply, or its a safe reply and no unsafe reply was sent.
   if (!is_safe || !request->got_unsafe) {
-    ceph::tracked_condition_variable cond;
+    ceph::reentrant_condition_variable cond;
     request->dispatch_cond = &cond;
 
     // wake up waiter
@@ -4433,9 +4433,9 @@ void Client::early_kick_flushing_caps(MetaSession *session)
 }
 
 
-void Client::wait_on_list(list<ceph::tracked_condition_variable*>& ls)
+void Client::wait_on_list(list<ceph::reentrant_condition_variable*>& ls)
 {
-  ceph::tracked_condition_variable cond;
+  ceph::reentrant_condition_variable cond;
   ls.push_back(&cond);
   std::unique_lock l{client_lock, std::adopt_lock};
   cond.wait(l);
@@ -4443,7 +4443,7 @@ void Client::wait_on_list(list<ceph::tracked_condition_variable*>& ls)
   ls.remove(&cond);
 }
 
-void Client::signal_cond_list(list<ceph::tracked_condition_variable*>& ls)
+void Client::signal_cond_list(list<ceph::reentrant_condition_variable*>& ls)
 {
   for (auto cond : ls) {
     cond->notify_all();
@@ -4452,12 +4452,12 @@ void Client::signal_cond_list(list<ceph::tracked_condition_variable*>& ls)
 
 void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
-  ceph::tracked_condition_variable cond;
-  bool done = false;
+  ceph::reentrant_condition_variable cond;
+  std::atomic<bool> done{false};
   int r;
-  ls.push_back(new ceph::C_TrackedCond(cond, &done, &r));
+  ls.push_back(new ceph::C_ReentrantCond(cond, &done, &r));
   std::unique_lock l{client_lock, std::adopt_lock};
-  cond.wait(l, [&done] { return done;});
+  cond.wait(l, [&done] { return done.load(std::memory_order_acquire); });
   l.release();
 }
 
@@ -4571,7 +4571,7 @@ void Client::_invalidate_inode_cache(Inode *in, int64_t off, int64_t len)
     Striper::file_to_extents(cct, in->ino, &in->layout, off, len, in->truncate_size, ls);
     InodeOsetPin oc(in);
     {
-      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+      ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
       objectcacher->discard_writeback(oc.oset, ls, nullptr);
     }
   }
@@ -4602,7 +4602,7 @@ bool Client::_flush(Inode *in, Context *onfinish)
       _flushed(in);
     }
     if (onfinish) {
-      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+      ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
       onfinish->complete(0);
     }
     return true;
@@ -4612,7 +4612,7 @@ bool Client::_flush(Inode *in, Context *onfinish)
     ldout(cct, 8) << __func__ << ": FULL, purging for ENOSPC" << dendl;
     objectcacher_purge_set(in);
     if (onfinish) {
-      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+      ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
       onfinish->complete(-ENOSPC);
     }
     return true;
@@ -4621,7 +4621,7 @@ bool Client::_flush(Inode *in, Context *onfinish)
   InodeOsetPin oc(in);
   bool flushed;
   {
-    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
     flushed = objectcacher->flush_set(oc.oset, onfinish);
   }
   return flushed;
@@ -4644,7 +4644,7 @@ void Client::_flush_range(Inode *in, int64_t offset, uint64_t size)
   C_SaferCond onflush("Client::_flush_range flock");
   bool ret;
   {
-    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
     ret = objectcacher->file_flush(oc.oset, &oc.layout, oc.snapc,
 				   offset, size, &onflush);
     if (!ret) {
@@ -8049,7 +8049,7 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
       auto target_len = std::min(read_len, stx->stx_size - offset);
       InodeOCState oc(in);
       {
-        ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+        ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
         r = objectcacher->file_read_ex(oc.oset, &oc.layout, oc.snapid,
                                        read_start, target_len, &bl, 0, &holes,
                                        io_finish.get());
@@ -10670,7 +10670,7 @@ void Client::lock_fh_pos(Fh *f)
   ldout(cct, 10) << __func__ << " " << f << dendl;
 
   if (f->pos_locked || !f->pos_waiters.empty()) {
-    ceph::tracked_condition_variable cond;
+    ceph::reentrant_condition_variable cond;
     f->pos_waiters.push_back(&cond);
     ldout(cct, 10) << __func__ << " BLOCKING on " << f << dendl;
     std::unique_lock l{client_lock, std::adopt_lock};
@@ -10876,7 +10876,7 @@ void Client::C_Read_Sync_NonBlocking::retry()
  */
 void Client::C_Read_Sync_NonBlocking::finish_locked(int r)
 {
-  std::unique_lock<ceph::TrackedLock> cl(clnt->client_lock);
+  std::unique_lock<ceph::ReentrantLock> cl(clnt->client_lock);
 
   auto effective_size = in->effective_size();
 
@@ -11144,7 +11144,7 @@ retry:
       };
       auto *starter = new C_Start_Read_Sync_NB(crsa);
       {
-        ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+        ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
         objecter_finisher.queue(starter);
       }
 
@@ -11262,7 +11262,7 @@ void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
       InodeOCState oc(in);
       int r2 = 0;
       {
-        ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+        ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
         r2 = objectcacher->file_read(oc.oset, &oc.layout, oc.snapid,
 				     readahead_extent.first, readahead_extent.second,
 				     NULL, 0, onfinish2);
@@ -11388,7 +11388,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
   std::vector<ObjectCacher::ObjHole> holes;
   InodeOCState oc(in);
   {
-    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
     r = objectcacher->file_read_ex(oc.oset, &oc.layout, oc.snapid,
                                    read_start, read_len, bl, 0, &holes,
                                    io_finish.get());
@@ -11411,7 +11411,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
   // Wait for the blocking read to complete and then do readahead
   if (r == 0) {
     {
-      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+      ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
       r = io_finish_cond->wait();
     }
     put_file_cache_cap_if_held(this, in);
@@ -11807,7 +11807,7 @@ void Client::C_Write_Finisher::finish_io(int r)
     InodeOCState oc(in);
     bool flushed;
     {
-      ceph::unique_unlock<ceph::TrackedLock> cl_drop(clnt->client_lock);
+      ceph::unique_unlock<ceph::ReentrantLock> cl_drop(clnt->client_lock);
       flushed = clnt->objectcacher->file_flush(
 	oc.oset, &oc.layout, oc.snapc, offset, size,
 	new C_FlushRangeFinish(this, r));
@@ -12268,7 +12268,7 @@ int Client::WriteEncMgr_Buffered::do_write()
   // async, caching, non-blocking.
   InodeOCState oc(in);
   {
-    ceph::unique_unlock<ceph::TrackedLock> cl_drop(clnt->client_lock);
+    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(clnt->client_lock);
     ensure_bl();
     r = clnt->objectcacher->file_write(oc.oset, &oc.layout, oc.snapc,
                                        offset, size, *pbl, ceph::real_clock::now(),
@@ -12287,7 +12287,7 @@ int Client::WriteEncMgr_NotBuffered::do_write()
   clnt->get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
   if (async) {
-    ceph::unique_unlock<ceph::TrackedLock> cl_drop(clnt->client_lock);
+    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(clnt->client_lock);
     ensure_bl();
     clnt->filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
                              offset, size, *pbl, ceph::real_clock::now(), 0,
@@ -13811,7 +13811,7 @@ int Client::_sync_fs()
   if (cct->_conf->client_oc) {
     cond.reset(new C_SaferCond("Client::_sync_fs:lock"));
     {
-      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+      ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
       objectcacher->flush_all(cond.get());
       ldout(cct, 15) << __func__ << " waiting on data to flush" << dendl;
       cond->wait();
@@ -18697,7 +18697,7 @@ void Client::handle_conf_change(const ConfigProxy& conf,
       changed.count("client_oc_max_dirty") ||
       changed.count("client_oc_target_dirty") ||
       changed.count("client_oc_max_dirty_age")) {
-    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
     if (changed.count("client_oc_size")) {
       objectcacher->set_max_size(cct->_conf->client_oc_size);
     }

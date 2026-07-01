@@ -124,9 +124,32 @@ struct CapSnap {
 #define I_CAP_DROPPED		(1 << 4)
 #define I_ERROR_FILELOCK	(1 << 5)
 
+struct Inode;
+
+namespace std {
+template <> class unique_lock<Inode>;
+template <> class scoped_lock<Inode>;
+}
+
 struct Inode : RefCountedObject {
+  friend class std::unique_lock<Inode>;
+  friend class std::scoped_lock<Inode>;
+
   ceph::coarse_mono_time hold_caps_until;
   Client *client;
+
+  ceph::ReentrantLock& get_client_lock() const;
+
+  mutable ceph::ReentrantLock m_inode_lock =
+    ceph::make_reentrant("Inode::inode_lock", false);
+
+  bool is_locked() const;
+  bool is_locked_by_me() const;
+
+  int release_for_wait() noexcept;
+  void restore_after_wait(int saved) noexcept;
+
+  ceph::mutex& native_mutex() const { return m_inode_lock.native_mutex(); }
 
   // -- the actual inode --
   inodeno_t ino; // ORDER DEPENDENCY: oset
@@ -275,7 +298,7 @@ struct Inode : RefCountedObject {
   std::vector<Context*> waitfor_caps;
   std::vector<Context*> waitfor_caps_pending;
   std::vector<Context*> waitfor_commit;
-  std::list<ceph::tracked_condition_variable*> waitfor_deleg;
+  std::list<ceph::reentrant_condition_variable*> waitfor_deleg;
 
   Dentry *get_first_parent() {
     ceph_assert(!dentries.empty());
@@ -405,4 +428,5 @@ private:
 
 };
 
+#include "inode_lock.h"
 #endif

@@ -303,7 +303,18 @@ protected:
 
 class ClientCaps;
 
+namespace ceph::client_lock {
+struct detail;
+class scoped_drop;
+}
+
 class Client : public Dispatcher, public md_config_obs_t {
+  friend class std::unique_lock<Client>;
+  friend class std::scoped_lock<Client>;
+  friend class ceph::unique_unlock<Client>;
+  friend class ceph::client_lock::scoped_drop;
+  friend struct ceph::client_lock::detail;
+
 public:
   friend class C_Block_Sync; // Calls block map and protected helpers
   friend class C_Client_CacheInvalidate;  // calls ino_invalidate_cb
@@ -791,8 +802,8 @@ public:
   int ll_delegation(Fh *fh, unsigned cmd, ceph_deleg_cb_t cb, void *priv);
 
   entity_name_t get_myname() { return messenger->get_myname(); }
-  void wait_on_list(std::list<ceph::tracked_condition_variable*>& ls);
-  void signal_cond_list(std::list<ceph::tracked_condition_variable*>& ls);
+  void wait_on_list(std::list<ceph::reentrant_condition_variable*>& ls);
+  void signal_cond_list(std::list<ceph::reentrant_condition_variable*>& ls);
 
   void set_filer_flags(int flags);
   void clear_filer_flags(int flags);
@@ -1044,13 +1055,18 @@ public:
     return fscrypt_as;
   }
 
+  ceph::ReentrantLock& get_client_lock() { return client_lock; }
+  bool is_locked_by_me() const { return client_lock.is_locked_by_me(); }
+  ceph::reentrant_condition_variable& get_mount_cond() { return mount_cond; }
+  ceph::reentrant_condition_variable& get_sync_cond() { return sync_cond; }
+
   /* timer_lock for 'timer' */
   ceph::mutex timer_lock = ceph::make_mutex("Client::timer_lock");
   SafeTimer timer;
 
   /* tick thread */
   std::thread upkeeper;
-  ceph::tracked_condition_variable upkeep_cond;
+  ceph::reentrant_condition_variable upkeep_cond;
   bool tick_thread_stopped = false;
 
   std::unique_ptr<PerfCounters> logger;
@@ -1078,7 +1094,7 @@ protected:
     void print(std::ostream& os) const;
   };
 
-  std::list<ceph::tracked_condition_variable*> waiting_for_reclaim;
+  std::list<ceph::reentrant_condition_variable*> waiting_for_reclaim;
   /* Flags for check_caps() */
   static const unsigned CHECK_CAPS_NODELAY = 0x1;
   static const unsigned CHECK_CAPS_SYNCHRONOUS = 0x2;
@@ -1316,12 +1332,14 @@ protected:
 
   // global client lock
   //  - protects Client and buffer cache both!
-  ceph::TrackedLock client_lock = ceph::make_tracked("Client::client_lock");
+  // Acquire via std::unique_lock<Client> / std::scoped_lock<Client> (client_lock.h).
+  mutable ceph::ReentrantLock client_lock =
+    ceph::make_reentrant("Client::client_lock", true);
 
   // Acquire client_lock when a callback may run without it (finisher thread).
   // No-op when the caller already holds client_lock (e.g. synchronous _flush).
   struct ClientLockIfNeeded {
-    std::unique_lock<ceph::TrackedLock> lock;
+    std::unique_lock<ceph::ReentrantLock> lock;
     explicit ClientLockIfNeeded(Client *clnt);
   };
 
@@ -2341,10 +2359,10 @@ private:
   // mds sessions
   map<mds_rank_t, MetaSessionRef> mds_sessions;  // mds -> push seq
   std::set<mds_rank_t> mds_ranks_closing;  // mds ranks currently tearing down sessions
-  std::list<ceph::tracked_condition_variable*> waiting_for_mdsmap;
+  std::list<ceph::reentrant_condition_variable*> waiting_for_mdsmap;
 
   // FSMap, for when using mds_command
-  std::list<ceph::tracked_condition_variable*> waiting_for_fsmap;
+  std::list<ceph::reentrant_condition_variable*> waiting_for_fsmap;
   std::unique_ptr<FSMap> fsmap;
   std::unique_ptr<FSMapUser> fsmap_user;
 
@@ -2398,12 +2416,12 @@ private:
 
   bool fscrypt_as;
 
-  ceph::tracked_condition_variable mount_cond, sync_cond;
+  ceph::reentrant_condition_variable mount_cond, sync_cond;
 
   std::map<std::pair<int64_t,std::string>, int> pool_perms;
-  std::list<ceph::tracked_condition_variable*> waiting_for_pool_perm;
+  std::list<ceph::reentrant_condition_variable*> waiting_for_pool_perm;
 
-  std::list<ceph::tracked_condition_variable*> waiting_for_rename;
+  std::list<ceph::reentrant_condition_variable*> waiting_for_rename;
 
   uint64_t retries_on_invalidate = 0;
 
@@ -2465,4 +2483,5 @@ public:
   void shutdown() override;
 };
 
+#include "client_lock.h"
 #endif
