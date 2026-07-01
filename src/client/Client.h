@@ -820,9 +820,7 @@ public:
                             bufferlist *blp = nullptr,
                             bool do_fsync = false, bool syncdataonly = false);
   int64_t nonblocking_fsync(Inode *in, bool syncdataonly, Context *onfinish);
-  void queue_client_finisher(Context *ctx) {
-    client_finisher.queue(ctx);
-  }
+  void queue_client_finisher(Context *ctx);
   loff_t ll_lseek(Fh *fh, loff_t offset, int whence);
   int ll_flush(Fh *fh);
   int ll_fsync(Fh *fh, bool syncdataonly);
@@ -1347,6 +1345,8 @@ protected:
   // decrease inode ref.  delete if dangling.
   void _put_inode(Inode *in, int n);
   void delay_put_inodes(bool wakeup=false);
+  void dispose_stale_inodes();
+  void dispose_orphan_inodes();
   void put_inode(Inode *in, int n=1);
   void close_dir(Dir *dir);
 
@@ -2020,6 +2020,8 @@ private:
     int do_write() override;
   };
 
+  struct C_nonblocking_fsync_state;
+
   class C_Write_Finisher : public Context {
   public:
     void finish_io(int r);
@@ -2040,6 +2042,9 @@ private:
     public:
       explicit C_FsyncFinish(C_Write_Finisher *c) : cwf(c) {}
       void finish(int r) override;
+      void complete(int r) override {
+        finish(r);
+      }
     };
 
     C_Write_Finisher(Client *clnt, Context *onfinish, bool dont_need_uninline,
