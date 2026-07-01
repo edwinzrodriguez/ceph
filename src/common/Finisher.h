@@ -42,6 +42,7 @@ class Finisher {
   bool         finisher_stop = false; ///< Set when the finisher should stop.
   bool         finisher_running = false; ///< True when the finisher is currently executing contexts.
   bool	       finisher_empty_wait = false; ///< True mean someone wait finisher empty.
+  std::atomic<pid_t> finisher_tid{0}; ///< TID of the finisher worker thread, set on startup
 
   /// Queue for contexts for which complete(0) will be called.
   std::vector<std::pair<Context*,int>> finisher_queue;

@@ -221,7 +221,7 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
     if (in->flags & I_CAP_DROPPED) {
       int mds_wanted = in->caps_mds_wanted();
       if ((mds_wanted & need) != need) {
-	int ret = client->_renew_caps(in);
+        int ret = client->_renew_caps(in);
 	if (ret < 0)
 	  return ret;
 	continue;

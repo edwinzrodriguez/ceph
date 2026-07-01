@@ -82,6 +82,7 @@ bool Finisher::is_empty()
 
 void *Finisher::finisher_thread_entry()
 {
+  finisher_tid.store(ceph_gettid());
   std::unique_lock ul(finisher_lock);
   ldout(cct, 10) << "finisher_thread start" << dendl;
 

@@ -3837,11 +3837,6 @@ void Client::_put_inode(Inode *in, int n)
       if (use_faked_inos())
 	_release_faked_ino(in);
     }
-    bool unclean = objectcacher->release_set(oc.oset);
-    ceph_assert(!unclean);
-    inode_map.erase(in->vino());
-    if (use_faked_inos())
-      _release_faked_ino(in);
 
     if (root == nullptr) {
       root_ancestor = 0;
@@ -11201,7 +11196,7 @@ int64_t Client::_preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
         return w;
     } else {
         if (clamp_to_int) {
-          totallen = std::min(totallen, (size_t)INT_MAX);
+          totallen = std::min(totallen, (loff_t)INT_MAX);
         }
 
         bufferlist bl;
