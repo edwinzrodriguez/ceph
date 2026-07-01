@@ -1258,6 +1258,7 @@ protected:
   void wake_up_session_caps(MetaSession *s, bool reconnect);
 
   void wait_on_context_list(std::vector<Context*>& ls);
+  void signal_deferred_context_list(std::vector<Context*>& ls);
   void signal_context_list(std::vector<Context*>& ls) {
     finish_contexts(cct, ls, 0);
   }
@@ -1784,6 +1785,7 @@ private:
 
     Client *client;
     Fh *f;
+    utime_t start_time = 0;
   };
 
   /*
@@ -1943,7 +1945,6 @@ private:
                       int64_t offset, bool write, Context *onfinish = nullptr,
                       bufferlist *blp = nullptr);
   int _flush(Fh *fh);
-  void nonblocking_fsync(Inode *in, bool syncdataonly, Context *onfinish);
   int _fsync(Fh *fh, bool syncdataonly);
   int _fsync(Inode *in, bool syncdataonly);
   int _sync_fs();
