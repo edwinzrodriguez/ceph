@@ -186,6 +186,7 @@ bool Inode::put_open_ref(int mode)
 
 void Inode::get_cap_ref(int cap)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   int n = 0;
   while (cap) {
     if (cap & 1) {
@@ -200,6 +201,7 @@ void Inode::get_cap_ref(int cap)
 
 bool Inode::is_last_cap_ref(int c)
 {
+  ceph_assert(client->client_lock.is_locked_by_me());
   auto it = cap_refs.find(c);
   if (it == cap_refs.end()) {
     return true; // No references means it's the last (or never existed)
@@ -219,6 +221,7 @@ bool Inode::is_last_cap_ref(int c)
 
 int Inode::put_cap_ref(int cap)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   int last = 0;
   int n = 0;
   while (cap) {
@@ -351,6 +354,7 @@ bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
 
 int Inode::caps_used()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
   int w = 0;
   for (const auto &[cap, cnt] : cap_refs)
     if (cnt)
