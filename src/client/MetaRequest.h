@@ -7,6 +7,7 @@
 
 #include <variant>
 
+#include "common/reentrant_lock.h"
 #include "include/types.h"
 #include "include/xlist.h"
 #include "common/filepath.h"
@@ -74,8 +75,8 @@ public:
   xlist<MetaRequest*>::item unsafe_dir_item;
   xlist<MetaRequest*>::item unsafe_target_item;
 
-  ceph::condition_variable *caller_cond = NULL;   // who to take up
-  ceph::condition_variable *dispatch_cond = NULL; // who to kick back
+  ceph::tracked_condition_variable *caller_cond = NULL;   // who to take up
+  ceph::tracked_condition_variable *dispatch_cond = NULL; // who to kick back
   std::vector<Context*> waitfor_safe;
 
   InodeRef target;
