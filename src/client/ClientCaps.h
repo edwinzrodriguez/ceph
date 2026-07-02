@@ -147,6 +147,11 @@ private:
   xlist<Inode*> delayed_list;
   int num_flushing_caps = 0;
   std::chrono::seconds caps_release_delay;
+
+  SnapRealm *_get_snap_realm_unlocked(Inode *in, inodeno_t realm);
+  void _put_snap_realm_unlocked(Inode *in, SnapRealm *realm);
+  void _snaprealm_link_inode(Inode *in, SnapRealm *realm);
+  void _snaprealm_unlink_inode(Inode *in);
 };
 
 #endif // CEPH_CLIENT_CAPS_H
