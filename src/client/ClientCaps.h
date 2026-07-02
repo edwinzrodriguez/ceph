@@ -23,6 +23,7 @@
 #include "mds/mdstypes.h"
 #include "InodeRef.h"
 #include "include/Context.h"
+#include "common/reentrant_lock.h"
 #include <chrono>
 
 class Client;
@@ -117,10 +118,15 @@ public:
   void dec_pinned_icaps(uint64_t nr = 1);
 
   void purge_delayed_list();
+  void unlink_delay_cap_item(Inode *in);
 
   static bool is_max_size_approaching(Inode *in);
   static int adjust_caps_used_for_lazyio(int used, int issued, int implemented);
 
+  void wait_on_context_list(std::vector<Context*>& ls);
+  void wait_on_context_cond(ceph::reentrant_condition_variable& cond,
+			    std::atomic<bool>& done,
+			    std::atomic<bool>& wake_complete);
   void signal_context_list(std::vector<Context*>& ls) {
     finish_contexts(cct, ls, 0);
   }
@@ -131,8 +137,8 @@ private:
   Client *client;
   CephContext *cct;
 
-  mutable ceph::mutex caps_lock =
-    ceph::make_mutex("ClientCaps::caps_lock");
+  mutable ReentrantLock caps_lock =
+    make_reentrant("ClientCaps::caps_lock", false);
 
   ceph::coarse_mono_time last_cap_renew;
   epoch_t cap_epoch_barrier = 0;

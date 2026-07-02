@@ -38,7 +38,7 @@ ceph_tid_t ClientCaps::allocate_flush_tid(){ std::scoped_lock l(caps_lock); retu
 
 void ClientCaps::get_cap_ref(Inode *in, int cap)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
   if ((cap & CEPH_CAP_FILE_BUFFER) &&
       in->cap_refs[CEPH_CAP_FILE_BUFFER] == 0) {
     ldout(cct, 5) << __func__ << " got first FILE_BUFFER ref on " << *in << dendl;
@@ -107,10 +107,20 @@ void ClientCaps::put_cap_ref(Inode *in, int cap)
 int ClientCaps::try_get_caps(Fh *fh, int need, int want, int *phave)
 {
   Inode *in = fh->inode.get();
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
 
-  int r = client->check_pool_perm(in, need);
-  if (r < 0)
-    return r;
+  Client::PoolPermInodeInfo pool_info;
+  pool_info.is_file = in->is_file();
+  pool_info.snapid = in->snapid;
+  pool_info.ino = in->ino;
+  pool_info.layout = in->layout;
+  {
+    ceph::unique_unlock<Inode> in_drop(*in);
+    std::unique_lock<Client> lock(*client);
+    int r = client->check_pool_perm(pool_info, need);
+    if (r < 0)
+      return r;
+  }
 
   int file_wanted = in->caps_file_wanted();
   if ((file_wanted & need) != need)
@@ -140,10 +150,20 @@ int ClientCaps::try_get_caps(Fh *fh, int need, int want, int *phave)
 int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 {
   Inode *in = fh->inode.get();
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
 
-  int r = client->check_pool_perm(in, need);
-  if (r < 0)
-    return r;
+  Client::PoolPermInodeInfo pool_info;
+  pool_info.is_file = in->is_file();
+  pool_info.snapid = in->snapid;
+  pool_info.ino = in->ino;
+  pool_info.layout = in->layout;
+  {
+    ceph::unique_unlock<Inode> in_drop(*in);
+    std::unique_lock<Client> lock(*client);
+    int r = client->check_pool_perm(pool_info, need);
+    if (r < 0)
+      return r;
+  }
 
   while (1) {
     int file_wanted = in->caps_file_wanted();
@@ -182,7 +202,7 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	 }
 	 if (in->wanted_max_size > in->max_size &&
 	     in->wanted_max_size > in->requested_max_size)
-	   check_caps(in, 0);
+	   check_caps(in, CHECK_CAPS_NODELAY);
       }
 
       if (endoff >= 0 && endoff > (loff_t)in->max_size) {
@@ -246,10 +266,65 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	in->flags &= ~I_CAP_DROPPED;
     }
 
-    if (waitfor_caps)
-      client->wait_on_context_list(in->waitfor_caps);
-    else if (waitfor_commit)
-      client->wait_on_context_list(in->waitfor_commit);
+    if (waitfor_caps || waitfor_commit) {
+      std::unique_lock<Inode> in_relock(*in, std::defer_lock);
+      auto& wait_list = waitfor_caps ? in->waitfor_caps : in->waitfor_commit;
+      ceph::reentrant_condition_variable cond;
+      std::atomic<bool> done{false};
+      std::atomic<bool> wake_complete{false};
+      int wr = 0;
+      // Register before check_caps / ms_dispatch: a grant can arrive as soon as
+      // the MDS sees our cap update; signaling an empty waitfor_caps leaves the
+      // waiter stuck with done=false even after max_size is granted.
+      wait_list.push_back(new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete));
+      if (waitfor_caps) {
+	// We may have already sent a max_size request (requested_max_size ==
+	// wanted_max_size) but the MDS grant was still too small.  Allow
+	// check_caps to re-send instead of sleeping with no in-flight request.
+	if (in->wanted_max_size > in->max_size &&
+	    in->wanted_max_size <= in->requested_max_size) {
+	  in->requested_max_size = 0;
+	}
+	check_caps(in, CHECK_CAPS_NODELAY);
+	// Grant may have been applied before we registered; don't sleep if so.
+	if (endoff >= 0 && endoff <= (loff_t)in->max_size) {
+	  bool snap_writing = false;
+	  if (!in->cap_snaps.empty()) {
+	    snap_writing = in->cap_snaps.rbegin()->second.writing;
+	  }
+	  if (!snap_writing) {
+	    waitfor_caps = false;
+	  }
+	}
+      }
+      if (!waitfor_caps && !waitfor_commit) {
+	// ms_dispatch may have already finish()ed our context after push_back.
+	if (!wait_list.empty()) {
+	  signal_context_list(wait_list);
+	}
+	continue;
+      }
+      // Drop client_lock when held so ms_dispatch can take scoped_lock<Client>
+      // in handle_caps.  ll_write/ll_read usually hold only inode_lock.
+      const bool had_client = client->is_locked_by_me();
+      ceph::unique_unlock<Client> cl_drop(*client, std::defer_lock);
+      if (had_client) {
+	cl_drop.release();
+      }
+      const bool had_inode = in->is_locked_by_me();
+      if (had_inode) {
+	{
+	  ceph::unique_unlock<Inode> in_unlock(*in, std::defer_lock);
+	  in_unlock.release();
+	  wait_on_context_cond(cond, done, wake_complete);
+	}
+	if (!in->is_locked_by_me()) {
+	  in_relock.lock();
+	}
+      } else {
+	wait_on_context_cond(cond, done, wake_complete);
+      }
+    }
   }
 }
 
@@ -271,6 +346,12 @@ void ClientCaps::cap_delay_requeue(Inode *in)
 
   in->hold_caps_until = ceph::coarse_mono_clock::now() + caps_release_delay;
   delayed_list.push_back(&in->delay_cap_item);
+}
+
+void ClientCaps::unlink_delay_cap_item(Inode *in)
+{
+  std::scoped_lock lock(caps_lock);
+  in->delay_cap_item.remove_myself();
 }
 
 void ClientCaps::purge_delayed_list()
@@ -419,8 +500,10 @@ void ClientCaps::send_cap(Inode *in, MetaSession *session, Cap *cap,
     }
   }
 
-  if (!session->flushing_caps_tids.empty())
-    m->set_oldest_flush_tid(*session->flushing_caps_tids.begin());
+  session->with_flushing_caps_tids([&](auto& tids) {
+    if (!tids.empty())
+      m->set_oldest_flush_tid(*tids.begin());
+  });
 
   session->con->send_message2(std::move(m));
 }
@@ -480,6 +563,7 @@ int ClientCaps::adjust_caps_used_for_lazyio(int used, int issued, int implemente
  */
 void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
 {
+  std::unique_lock<Inode> in_lock(*in);
   unsigned wanted = in->caps_wanted();
   unsigned used = get_caps_used(in.get());
   unsigned cap_used;
@@ -608,7 +692,10 @@ void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
       flush_tid = 0;
     }
 
-    in->delay_cap_item.remove_myself();
+    {
+      std::scoped_lock lock(caps_lock);
+      in->delay_cap_item.remove_myself();
+    }
     send_cap(in.get(), session.get(), &cap, msg_flags, cap_used, wanted, retain,
 	     flushing, flush_tid);
   }
@@ -730,27 +817,69 @@ void ClientCaps::send_flush_snap(Inode *in, MetaSession *session,
     m->inline_data = in->inline_data;
   }
 
-  ceph_assert(!session->flushing_caps_tids.empty());
-  m->set_oldest_flush_tid(*session->flushing_caps_tids.begin());
+  session->with_flushing_caps_tids([&](auto& tids) {
+    ceph_assert(!tids.empty());
+    m->set_oldest_flush_tid(*tids.begin());
+  });
 
   session->con->send_message2(std::move(m));
 }
 
 
+void ClientCaps::wait_on_context_list(std::vector<Context*>& ls)
+{
+  ceph::reentrant_condition_variable cond;
+  std::atomic<bool> done{false};
+  std::atomic<bool> wake_complete{false};
+  int r;
+  {
+    std::scoped_lock l{caps_lock};
+    ls.push_back(new ceph::C_ReentrantCond(cond, &done, &r, &wake_complete));
+  }
+  wait_on_context_cond(cond, done, wake_complete);
+}
+
+void ClientCaps::wait_on_context_cond(
+  ceph::reentrant_condition_variable& cond,
+  std::atomic<bool>& done,
+  std::atomic<bool>& wake_complete)
+{
+  std::unique_lock l{caps_lock};
+  cond.wait(l, [&done] {
+    return done.load(std::memory_order_acquire);
+  });
+  ceph::wait_for_reentrant_cond_broadcast(wake_complete);
+}
+
 void ClientCaps::signal_caps_inode_sync(Inode *in)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  // insert_trace (no client_lock) and put_cap_ref (inode_lock only) both call
+  // here.  Defer to client_finisher when client_lock is already held; take
+  // client_lock when neither tier is held; finish inline when inode_lock is
+  // held and client_lock cannot be taken (lock-order rule).
+  auto wake_waiters = [this](Inode *inode, auto&& signal_list) {
+    do {
+      signal_list(inode->waitfor_caps);
+      if (inode->waitfor_caps_pending.empty())
+	break;
+      std::swap(inode->waitfor_caps, inode->waitfor_caps_pending);
+    } while (true);
+  };
 
-  // Nonblocking fsync advancers may re-queue themselves on
-  // waitfor_caps_pending while we are finishing waitfor_caps.  A single
-  // signal/swap can leave those waiters in waitfor_caps without running
-  // them until the next cap flush ack (which may never come).
-  do {
-    client->signal_deferred_context_list(in->waitfor_caps);
-    if (in->waitfor_caps_pending.empty())
-      break;
-    std::swap(in->waitfor_caps, in->waitfor_caps_pending);
-  } while (true);
+  if (client->is_locked_by_me()) {
+    wake_waiters(in, [this](std::vector<Context*>& ls) {
+      client->signal_deferred_context_list(ls);
+    });
+  } else if (in->is_locked_by_me()) {
+    wake_waiters(in, [this](std::vector<Context*>& ls) {
+      signal_context_list(ls);
+    });
+  } else {
+    std::unique_lock<Client> cl(*client);
+    wake_waiters(in, [this](std::vector<Context*>& ls) {
+      client->signal_deferred_context_list(ls);
+    });
+  }
 }
 
 void ClientCaps::signal_caps_inode(Inode *in)
@@ -763,6 +892,7 @@ void ClientCaps::signal_caps_inode(Inode *in)
 
 void ClientCaps::flush_snaps(Inode *in)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
   ldout(cct, 10) << "flush_snaps on " << *in << dendl;
   ceph_assert(in->cap_snaps.size());
 
@@ -787,10 +917,15 @@ void ClientCaps::flush_snaps(Inode *in)
       break;
 
     capsnap.flush_tid = allocate_flush_tid();
-    session->flushing_caps_tids.insert(capsnap.flush_tid);
+    session->with_flushing_caps_tids([&capsnap](auto& tids) {
+      tids.insert(capsnap.flush_tid);
+    });
     in->flushing_cap_tids[capsnap.flush_tid] = 0;
-    if (!in->flushing_cap_item.is_on_list())
-      session->flushing_caps.push_back(&in->flushing_cap_item);
+    if (!in->flushing_cap_item.is_on_list()) {
+      session->with_flushing_caps([in](auto& flushing_caps) {
+        flushing_caps.push_back(&in->flushing_cap_item);
+      });
+    }
 
     send_flush_snap(in, session, p.first, capsnap);
   }
@@ -819,6 +954,8 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session, uint64_t ca
 			    unsigned issued, unsigned wanted, unsigned seq, unsigned mseq,
 			    inodeno_t realm, int flags, const UserPerm& cap_perms)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+
   if (!in->is_any_caps()) {
     ceph_assert(in->snaprealm == 0);
     in->snaprealm = client->get_snap_realm(realm);
@@ -839,9 +976,14 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session, uint64_t ca
   mds_rank_t mds = mds_session->mds_num;
   const auto &capem = in->caps.emplace(std::piecewise_construct, std::forward_as_tuple(mds), std::forward_as_tuple(*in, mds_session));
   Cap &cap = capem.first->second;
-  if (!capem.second) {
-    if (cap.gen < mds_session->cap_gen)
+  uint64_t session_cap_gen;
+  {
+    std::scoped_lock s_lock(mds_session->session_lock);
+    session_cap_gen = mds_session->cap_gen;
+    if (!capem.second && cap.gen < session_cap_gen)
       cap.issued = cap.implemented = CEPH_CAP_PIN;
+  }
+  if (!capem.second) {
 
     /*
      * auth mds of the inode changed. we received the cap export
@@ -880,7 +1022,12 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session, uint64_t ca
         if (in->dirty_cap_item.is_on_list()) {
           ldout(cct, 10) << __func__ << " changing auth cap: "
                          << "add myself to new auth MDS' dirty caps list" << dendl;
-          mds_session->get_dirty_list().push_back(&in->dirty_cap_item);
+          in->auth_cap->session->with_dirty_list([in](auto& old_dirty_list) {
+            in->dirty_cap_item.remove_myself();
+          });
+          mds_session->with_dirty_list([in](auto& dirty_list) {
+            dirty_list.push_back(&in->dirty_cap_item);
+          });
         }
       }
 
@@ -899,7 +1046,7 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session, uint64_t ca
   cap.seq = seq;
   cap.issue_seq = seq;
   cap.mseq = mseq;
-  cap.gen = mds_session->cap_gen;
+  cap.gen = session_cap_gen;
   cap.latest_perms = cap_perms;
   ldout(cct, 10) << __func__ << " issued " << ccap_string(old_caps) << " -> " << ccap_string(cap.issued)
 	   << " from mds." << mds
@@ -928,6 +1075,7 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session, uint64_t ca
 void ClientCaps::remove_cap(Cap *cap, bool queue_release)
 {
   auto &in = cap->inode;
+  ceph_assert(ceph_mutex_is_locked_by_me(in));
   MetaSession *session = cap->session;
   mds_rank_t mds = cap->session->mds_num;
 
@@ -948,7 +1096,9 @@ void ClientCaps::remove_cap(Cap *cap, bool queue_release)
   if (in.auth_cap == cap) {
     if (in.flushing_cap_item.is_on_list()) {
       ldout(cct, 10) << " removing myself from flushing_cap list" << dendl;
-      in.flushing_cap_item.remove_myself();
+      session->with_flushing_caps([&in](auto& flushing_caps) {
+        in.flushing_cap_item.remove_myself();
+      });
     }
     in.auth_cap = NULL;
   }
@@ -976,9 +1126,10 @@ void ClientCaps::remove_session_caps(MetaSession *s, int err)
 {
   ldout(cct, 10) << __func__ << " mds." << s->mds_num << dendl;
 
-  while (s->caps.size()) {
-    Cap *cap = *s->caps.begin();
+  while (s->with_caps_list([](auto& caps) { return caps.size(); })) {
+    Cap *cap = s->with_caps_list([](auto& caps) { return *caps.begin(); });
     InodeRef in(&cap->inode);
+    std::unique_lock in_lock(*in);
     bool dirty_caps = false;
     if (in->auth_cap == cap) {
       dirty_caps = in->dirty_caps | in->flushing_caps;
@@ -1019,24 +1170,27 @@ void ClientCaps::remove_session_caps(MetaSession *s, int err)
     ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
     signal_caps_inode(in.get());
   }
-  s->flushing_caps_tids.clear();
+  s->with_flushing_caps_tids([](auto& tids) {
+    tids.clear();
+  });
   client->sync_cond.notify_all();
 }
 
 void ClientCaps::trim_caps(MetaSession *s, uint64_t max)
 {
   mds_rank_t mds = s->mds_num;
-  size_t caps_size = s->caps.size();
+  size_t caps_size = s->with_caps_list([](auto& caps) { return caps.size(); });
   ldout(cct, 10) << __func__ << " mds." << mds << " max " << max 
     << " caps " << caps_size << dendl;
 
   uint64_t trimmed = 0;
-  auto p = s->caps.begin();
+  auto p = s->with_caps_list([](auto& caps) { return caps.begin(); });
   std::set<Dentry *> to_trim; /* this avoids caps other than the one we're
                                * looking at from getting deleted during traversal. */
   while ((caps_size - trimmed) > max && !p.end()) {
     Cap *cap = *p;
     InodeRef in(&cap->inode);
+    std::unique_lock in_lock(*in);
 
     // Increment p early because it will be invalidated if cap
     // is deleted inside remove_cap
@@ -1093,7 +1247,7 @@ void ClientCaps::trim_caps(MetaSession *s, uint64_t max)
   }
   to_trim.clear();
 
-  caps_size = s->caps.size();
+  caps_size = s->with_caps_list([](auto& caps) { return caps.size(); });
   if (caps_size > (size_t)max)
     client->_invalidate_kernel_dcache();
 }
@@ -1101,6 +1255,8 @@ void ClientCaps::trim_caps(MetaSession *s, uint64_t max)
 
 int ClientCaps::mark_caps_flushing(Inode *in, ceph_tid_t* ptid)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+
   MetaSession *session = in->auth_cap->session;
 
   int flushing = in->dirty_caps;
@@ -1118,10 +1274,15 @@ int ClientCaps::mark_caps_flushing(Inode *in, ceph_tid_t* ptid)
 
   in->flushing_caps |= flushing;
   in->mark_caps_clean();
- 
-  if (!in->flushing_cap_item.is_on_list())
-    session->flushing_caps.push_back(&in->flushing_cap_item);
-  session->flushing_caps_tids.insert(flush_tid);
+
+  if (!in->flushing_cap_item.is_on_list()) {
+    session->with_flushing_caps([in](auto& flushing_caps) {
+      flushing_caps.push_back(&in->flushing_cap_item);
+    });
+  }
+  session->with_flushing_caps_tids([flush_tid](auto& tids) {
+    tids.insert(flush_tid);
+  });
 
   *ptid = flush_tid;
   return flushing;
@@ -1130,20 +1291,30 @@ int ClientCaps::mark_caps_flushing(Inode *in, ceph_tid_t* ptid)
 
 void ClientCaps::adjust_session_flushing_caps(Inode *in, MetaSession *old_s,  MetaSession *new_s)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+
   for (auto &p : in->cap_snaps) {
     CapSnap &capsnap = p.second;
     if (capsnap.flush_tid > 0) {
-      old_s->flushing_caps_tids.erase(capsnap.flush_tid);
-      new_s->flushing_caps_tids.insert(capsnap.flush_tid);
+      old_s->with_flushing_caps_tids([&capsnap](auto& tids) {
+        tids.erase(capsnap.flush_tid);
+      });
+      new_s->with_flushing_caps_tids([&capsnap](auto& tids) {
+        tids.insert(capsnap.flush_tid);
+      });
     }
   }
-  for (map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
-       it != in->flushing_cap_tids.end();
-       ++it) {
-    old_s->flushing_caps_tids.erase(it->first);
-    new_s->flushing_caps_tids.insert(it->first);
+  for (auto &p : in->flushing_cap_tids) {
+    old_s->with_flushing_caps_tids([&p](auto& tids) {
+      tids.erase(p.first);
+    });
+    new_s->with_flushing_caps_tids([&p](auto& tids) {
+      tids.insert(p.first);
+    });
   }
-  new_s->flushing_caps.push_back(&in->flushing_cap_item);
+  new_s->with_flushing_caps([in](auto& flushing_caps) {
+    flushing_caps.push_back(&in->flushing_cap_item);
+  });
 }
 
 /*
@@ -1177,38 +1348,12 @@ void ClientCaps::flush_caps_sync()
 
 void ClientCaps::wait_sync_caps(Inode *in, ceph_tid_t want)
 {
-  while (in->flushing_caps) {
-    map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
-    ceph_assert(it != in->flushing_cap_tids.end());
-    if (it->first > want)
-      break;
-    ldout(cct, 10) << __func__ << " on " << *in << " flushing "
-		   << ccap_string(it->second) << " want " << want
-		   << " last " << it->first << dendl;
-    client->wait_on_context_list(in->waitfor_caps);
-  }
+  client->wait_sync_caps(in, want);
 }
-
 
 void ClientCaps::wait_sync_caps(ceph_tid_t want)
 {
- retry:
-  ldout(cct, 10) << __func__ << " want " << want  << " (last is " << get_last_flush_tid() << ", "
-	   << get_num_flushing_caps() << " total flushing)" << dendl;
-  for (auto &p : client->mds_sessions) {
-    auto s = p.second;
-    if (s->flushing_caps_tids.empty())
-	continue;
-    ceph_tid_t oldest_tid = *s->flushing_caps_tids.begin();
-    if (oldest_tid <= want) {
-      ldout(cct, 10) << " waiting on mds." << p.first << " tid " << oldest_tid
-		     << " (want " << want << ")" << dendl;
-      std::unique_lock l{client->client_lock, std::adopt_lock};
-      client->sync_cond.wait(l);
-      l.release();
-      goto retry;
-    }
-  }
+  client->wait_sync_caps(want);
 }
 
 
@@ -1252,42 +1397,48 @@ void ClientCaps::kick_flushing_caps(MetaSession *session)
   mds_rank_t mds = session->mds_num;
   ldout(cct, 10) << __func__ << " mds." << mds << dendl;
 
-  for (xlist<Inode*>::iterator p = session->flushing_caps.begin(); !p.end(); ++p) {
-    Inode *in = *p;
-    if (in->flags & I_KICK_FLUSH) {
-      ldout(cct, 20) << " reflushing caps on " << *in << " to mds." << mds << dendl;
-      kick_flushing_caps(in, session);
+  session->with_flushing_caps([&](auto& flushing_caps) {
+    for (xlist<Inode*>::iterator p = flushing_caps.begin(); !p.end(); ++p) {
+      Inode *in = *p;
+      std::scoped_lock in_lock(*in);
+      if (in->flags & I_KICK_FLUSH) {
+        ldout(cct, 20) << " reflushing caps on " << *in << " to mds." << mds << dendl;
+        kick_flushing_caps(in, session);
+      }
     }
-  }
+  });
 }
 
 
 void ClientCaps::early_kick_flushing_caps(MetaSession *session)
 {
-  for (xlist<Inode*>::iterator p = session->flushing_caps.begin(); !p.end(); ++p) {
-    Inode *in = *p;
-    Cap *cap = in->auth_cap;
-    ceph_assert(cap);
+  session->with_flushing_caps([&](auto& flushing_caps) {
+    for (xlist<Inode*>::iterator p = flushing_caps.begin(); !p.end(); ++p) {
+      Inode *in = *p;
+      std::scoped_lock in_lock(*in);
+      Cap *cap = in->auth_cap;
+      ceph_assert(cap);
 
-    // if flushing caps were revoked, we re-send the cap flush in client reconnect
-    // stage. This guarantees that MDS processes the cap flush message before issuing
-    // the flushing caps to other client.
-    if ((in->flushing_caps & in->auth_cap->issued) == in->flushing_caps) {
-      in->flags |= I_KICK_FLUSH;
-      continue;
-    }
+      // if flushing caps were revoked, we re-send the cap flush in client reconnect
+      // stage. This guarantees that MDS processes the cap flush message before issuing
+      // the flushing caps to other client.
+      if ((in->flushing_caps & in->auth_cap->issued) == in->flushing_caps) {
+        in->flags |= I_KICK_FLUSH;
+        continue;
+      }
 
-    ldout(cct, 20) << " reflushing caps (early_kick) on " << *in
+      ldout(cct, 20) << " reflushing caps (early_kick) on " << *in
 		   << " to mds." << session->mds_num << dendl;
-    // send_reconnect() also will reset these sequence numbers. make sure
-    // sequence numbers in cap flush message match later reconnect message.
-    cap->seq = 0;
-    cap->issue_seq = 0;
-    cap->mseq = 0;
-    cap->issued = cap->implemented;
+      // send_reconnect() also will reset these sequence numbers. make sure
+      // sequence numbers in cap flush message match later reconnect message.
+      cap->seq = 0;
+      cap->issue_seq = 0;
+      cap->mseq = 0;
+      cap->issued = cap->implemented;
 
-    kick_flushing_caps(in, session);
-  }
+      kick_flushing_caps(in, session);
+    }
+  });
 }
 
 

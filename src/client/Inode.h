@@ -49,15 +49,17 @@ public:
                                   gen(s->cap_gen),
                                   cap_item(this)
   {
-    s->caps.push_back(&cap_item);
+    s->with_caps_list([this](auto& caps) {
+      caps.push_back(&cap_item);
+    });
   }
-  ~Cap() {
-    cap_item.remove_myself();
-  }
+  ~Cap();
 
   void touch(void) {
     // move to back of LRU
-    session->caps.push_back(&cap_item);
+    session->with_caps_list([this](auto& caps) {
+      caps.push_back(&cap_item);
+    });
   }
 
   void dump(Formatter *f) const;
@@ -427,6 +429,13 @@ private:
   bool delegations_broken(bool skip_read);
 
 };
+
+inline Cap::~Cap() {
+  ceph_assert(ceph_mutex_is_locked_by_me(inode));
+  session->with_caps_list([this](auto& caps) {
+    cap_item.remove_myself();
+  });
+}
 
 #include "inode_lock.h"
 #endif

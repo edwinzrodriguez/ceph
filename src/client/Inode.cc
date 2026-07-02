@@ -186,7 +186,7 @@ bool Inode::put_open_ref(int mode)
 
 void Inode::get_cap_ref(int cap)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(is_locked_by_me());
   int n = 0;
   while (cap) {
     if (cap & 1) {
@@ -201,7 +201,7 @@ void Inode::get_cap_ref(int cap)
 
 bool Inode::is_last_cap_ref(int c)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(is_locked_by_me());
   if (c != CEPH_CAP_FILE_BUFFER) {
     return cap_refs[c] == 0;
   }
@@ -216,7 +216,7 @@ bool Inode::is_last_cap_ref(int c)
 
 int Inode::put_cap_ref(int cap)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(is_locked_by_me());
   int last = 0;
   int n = 0;
   while (cap) {
@@ -366,7 +366,7 @@ bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
 
 int Inode::caps_used()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client->client_lock));
+  ceph_assert(is_locked_by_me());
   int w = 0;
   for (const auto &[cap, cnt] : cap_refs)
     if (cnt)
@@ -857,6 +857,8 @@ void Inode::unset_deleg(Fh *fh)
 */
 void Inode::mark_caps_dirty(int caps)
 {
+  std::unique_lock<Inode> in_lock(*this);
+
   /*
    * If auth_cap is nullptr means the reonnecting is not finished or
    * already rejected.
@@ -876,7 +878,9 @@ void Inode::mark_caps_dirty(int caps)
     iget();
 
   dirty_caps |= caps;
-  auth_cap->session->get_dirty_list().push_back(&dirty_cap_item);
+  auth_cap->session->with_dirty_list([this](auto& dirty_list) {
+    dirty_list.push_back(&dirty_cap_item);
+  });
   client->cap_delay_requeue(this);
 }
 
@@ -885,9 +889,17 @@ void Inode::mark_caps_dirty(int caps)
 */
 void Inode::mark_caps_clean()
 {
+  std::unique_lock<Inode> in_lock(*this);
+
   lsubdout(client->cct, client, 10) << __func__ << " " << *this << dendl;
   dirty_caps = 0;
-  dirty_cap_item.remove_myself();
+  if (auth_cap) {
+    auth_cap->session->with_dirty_list([this](auto& dirty_list) {
+      dirty_cap_item.remove_myself();
+    });
+  } else {
+    dirty_cap_item.remove_myself();
+  }
 }
 
 #if defined(__linux__)

@@ -17,6 +17,7 @@
 #ifndef CEPH_CLIENT_H
 #define CEPH_CLIENT_H
 
+#include <array>
 #include <dirent.h>
 
 #include "common/admin_socket.h"
@@ -949,8 +950,10 @@ public:
 
   void clear_dir_complete_and_ordered(Inode *diri, bool complete);
   void insert_readdir_results(MetaRequest *request, MetaSession *session,
-                              Inode *diri, Inode *diri_other);
-  Inode* insert_trace(MetaRequest *request, MetaSession *session);
+                              Inode *diri, Inode *diri_other,
+			      const ceph::cref_t<MClientReply>& reply);
+  Inode* insert_trace(MetaRequest *request, MetaSession *session,
+		      const ceph::cref_t<MClientReply>& reply);
   void update_inode_file_size(Inode *in, int issued, uint64_t size,
 			      uint64_t truncate_seq, uint64_t truncate_size);
   void update_inode_file_time(Inode *in, int issued, uint64_t time_warp_seq,
@@ -1066,7 +1069,8 @@ public:
 
   /* tick thread */
   std::thread upkeeper;
-  ceph::reentrant_condition_variable upkeep_cond;
+  ceph::mutex upkeep_lock = ceph::make_mutex("Client::upkeep_lock");
+  ceph::condition_variable upkeep_cond;
   bool tick_thread_stopped = false;
 
   std::unique_ptr<PerfCounters> logger;
@@ -1116,8 +1120,11 @@ protected:
   bool have_open_session(mds_rank_t mds);
   void got_mds_push(MetaSession *s);
   MetaSessionRef _get_mds_session(mds_rank_t mds, Connection *con);  ///< return session for mds *and* con; null otherwise
-  MetaSessionRef _get_or_open_mds_session(mds_rank_t mds);
+  MetaSessionRef _get_or_open_mds_session(mds_rank_t mds, bool send_open=true);
   MetaSessionRef _open_mds_session(mds_rank_t mds);
+  void _send_session_open(MetaSession *session);
+  void wait_for_mds_session_open(MetaSessionRef& session,
+				 std::unique_lock<Client>& l);
   void _close_mds_session(MetaSession *s);
   void _closed_mds_session(MetaSession *s, int err=0, bool rejected=false);
   bool _any_stale_sessions() const;
@@ -1307,7 +1314,13 @@ protected:
 			       const UserPerm& perms);
   bool is_quota_bytes_approaching(Inode *in, const UserPerm& perms);
 
-  int check_pool_perm(Inode *in, int need);
+  struct PoolPermInodeInfo {
+    bool is_file = false;
+    snapid_t snapid = CEPH_NOSNAP;
+    ino_t ino = 0;
+    file_layout_t layout;
+  };
+  int check_pool_perm(const PoolPermInodeInfo& in, int need);
 
   void handle_client_reclaim_reply(const MConstRef<MClientReclaimReply>& reply);
 
@@ -2128,7 +2141,7 @@ private:
   void _ll_drop_pins();
 
   Fh *_create_fh(Inode *in, int flags, int cmode, const UserPerm& perms);
-  int _release_fh(Fh *fh);
+  int _release_fh(Fh *fh, bool drop_ref=true);
   void _put_fh(Fh *fh);
 
   std::pair<int, bool> _do_remount(bool retry_on_error);
@@ -2448,9 +2461,14 @@ private:
   uint64_t total_write_ops = 0;
   uint64_t total_write_size = 0;
 
-  ceph::spinlock delay_i_lock;
-  std::map<Inode*,int> delay_i_release;
-  std::unordered_set<Inode*> deleting_inodes;
+  static constexpr unsigned delay_i_shards = 256;
+  struct DelayInodeShard {
+    ceph::mutex lock = ceph::make_mutex("Client::delay_i_lock");
+    std::map<Inode*,int> release;
+    std::unordered_set<Inode*> deleting;
+  };
+  std::array<DelayInodeShard, delay_i_shards> delay_i;
+  unsigned delay_i_shard(Inode *in) const;
 
   uint64_t nr_metadata_request = 0;
   uint64_t nr_read_request = 0;
