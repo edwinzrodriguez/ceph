@@ -153,8 +153,8 @@ void Readahead::wait_for_pending() {
 void Readahead::wait_for_pending(Context *ctx) {
   m_pending_lock.lock();
   if (m_pending > 0) {
-    m_pending_lock.unlock();
     m_pending_waiting.push_back(ctx);
+    m_pending_lock.unlock();
     return;
   }
   m_pending_lock.unlock();
