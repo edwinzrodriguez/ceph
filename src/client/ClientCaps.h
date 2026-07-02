@@ -119,6 +119,7 @@ public:
 
   void purge_delayed_list();
   void unlink_delay_cap_item(Inode *in);
+  void prepare_inode_unmount(Inode *in);
 
   static bool is_max_size_approaching(Inode *in);
   static int adjust_caps_used_for_lazyio(int used, int issued, int implemented);

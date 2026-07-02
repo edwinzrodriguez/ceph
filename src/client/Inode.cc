@@ -20,7 +20,10 @@ using std::string;
 
 Inode::~Inode()
 {
-  delay_cap_item.remove_myself();
+  if (client)
+    client->unlink_delay_cap_item(this);
+  else
+    delay_cap_item.remove_myself();
   dirty_cap_item.remove_myself(); 
   snaprealm_item.remove_myself();
 
