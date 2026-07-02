@@ -890,6 +890,8 @@ public:
   inodeno_t _get_root_ino(bool fake=true);
   inodeno_t get_root_ino();
   Inode *get_root();
+  InodeRef get_root_ref();
+  InodeRef get_cwd_ref();
 
   virtual int init();
   virtual void shutdown();
@@ -1389,6 +1391,7 @@ protected:
    * a new inode to a pre-created Dentry
    */
   Dentry* link(Dir *dir, const std::string& name, Inode *in, Dentry *dn);
+  void unlink_locked(Dentry *dn, bool keepdir, bool keepdentry);
   void unlink(Dentry *dn, bool keepdir, bool keepdentry);
 
   int fill_stat(Inode *in, struct stat *st, frag_info_t *dirstat=0, nest_info_t *rstat=0);
@@ -2291,7 +2294,9 @@ private:
   int _read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
                   Context *onfinish);
 
-  bool _dentry_valid(const Dentry *dn);
+  bool _dentry_lease_valid(mds_rank_t lease_mds, utime_t lease_ttl,
+			   uint64_t lease_gen);
+  void ensure_dentry_lru(Dentry *dn);
 
   // internal interface
   //   call these with client_lock held!
