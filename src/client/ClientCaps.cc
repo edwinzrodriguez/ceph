@@ -25,6 +25,46 @@ ClientCaps::ClientCaps(Client *client, CephContext *cct)
 
 ClientCaps::~ClientCaps() = default;
 
+SnapRealm *ClientCaps::_get_snap_realm_unlocked(Inode *in, inodeno_t realm)
+{
+  ceph::unique_unlock<Inode> in_drop(*in);
+  return client->get_snap_realm(realm);
+}
+
+void ClientCaps::_put_snap_realm_unlocked(Inode *in, SnapRealm *realm)
+{
+  ceph::unique_unlock<Inode> in_drop(*in);
+  client->put_snap_realm(realm);
+}
+
+void ClientCaps::_snaprealm_link_inode(Inode *in, SnapRealm *realm)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  ceph_assert(realm);
+  {
+    ceph::unique_unlock<Inode> in_drop(*in);
+    std::scoped_lock<Client> cl(*client);
+    realm->inodes_with_caps.push_back(&in->snaprealm_item);
+  }
+  in->snaprealm = realm;
+}
+
+void ClientCaps::_snaprealm_unlink_inode(Inode *in)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  SnapRealm *realm = in->snaprealm;
+  if (!realm) {
+    return;
+  }
+  {
+    ceph::unique_unlock<Inode> in_drop(*in);
+    std::scoped_lock<Client> cl(*client);
+    in->snaprealm_item.remove_myself();
+    client->put_snap_realm(realm);
+  }
+  in->snaprealm = 0;
+}
+
 void ClientCaps::inc_pinned_icaps(){ std::scoped_lock l(caps_lock); client->inc_pinned_icaps(); }
 void ClientCaps::dec_pinned_icaps(uint64_t nr){ std::scoped_lock l(caps_lock); client->dec_pinned_icaps(nr); }
 void ClientCaps::set_cap_epoch_barrier(epoch_t e){ std::scoped_lock l(caps_lock); cap_epoch_barrier=e; }
@@ -1004,18 +1044,22 @@ void ClientCaps::add_update_cap(Inode *in, MetaSession *mds_session, uint64_t ca
 
   if (!in->is_any_caps()) {
     ceph_assert(in->snaprealm == 0);
-    in->snaprealm = client->get_snap_realm(realm);
-    in->snaprealm->inodes_with_caps.push_back(&in->snaprealm_item);
+    SnapRealm *sr = _get_snap_realm_unlocked(in, realm);
+    _snaprealm_link_inode(in, sr);
     ldout(cct, 15) << __func__ << " first one, opened snaprealm " << in->snaprealm << dendl;
   } else {
     ceph_assert(in->snaprealm);
     if ((flags & CEPH_CAP_FLAG_AUTH) &&
 	realm != inodeno_t(-1) && in->snaprealm->ino != realm) {
-      in->snaprealm_item.remove_myself();
-      auto oldrealm = in->snaprealm;
-      in->snaprealm = client->get_snap_realm(realm);
-      in->snaprealm->inodes_with_caps.push_back(&in->snaprealm_item);
-      client->put_snap_realm(oldrealm);
+      SnapRealm *oldrealm = in->snaprealm;
+      {
+	ceph::unique_unlock<Inode> in_drop(*in);
+	std::scoped_lock<Client> cl(*client);
+	in->snaprealm_item.remove_myself();
+      }
+      SnapRealm *sr = _get_snap_realm_unlocked(in, realm);
+      _snaprealm_link_inode(in, sr);
+      _put_snap_realm_unlocked(in, oldrealm);
     }
   }
 
@@ -1154,15 +1198,15 @@ void ClientCaps::remove_cap(Cap *cap, bool queue_release)
 
   if (!in.is_any_caps()) {
     ldout(cct, 15) << __func__ << " last one, closing snaprealm " << in.snaprealm << dendl;
-    in.snaprealm_item.remove_myself();
-    client->put_snap_realm(in.snaprealm);
-    in.snaprealm = 0;
+    _snaprealm_unlink_inode(&in);
   }
 }
 
 
 void ClientCaps::remove_all_caps(Inode *in, bool queue_release)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+
   while (!in->caps.empty())
     remove_cap(&in->caps.begin()->second, queue_release);
 }

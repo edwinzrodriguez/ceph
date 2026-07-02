@@ -4948,10 +4948,18 @@ void Client::wait_sync_caps(ceph_tid_t want)
 		 << dendl;
   for (auto &p : mds_sessions) {
     auto s = p.second;
-    if (s->flushing_caps_tids.empty())
-      continue;
-    ceph_tid_t oldest_tid = *s->flushing_caps_tids.begin();
-    if (oldest_tid <= want) {
+    bool need_wait = false;
+    ceph_tid_t oldest_tid = 0;
+    s->with_flushing_caps_tids([&](const auto& tids) {
+      if (tids.empty()) {
+        return;
+      }
+      oldest_tid = *tids.begin();
+      if (oldest_tid <= want) {
+        need_wait = true;
+      }
+    });
+    if (need_wait) {
       ldout(cct, 10) << " waiting on mds." << p.first << " tid " << oldest_tid
 		     << " (want " << want << ")" << dendl;
       ceph::client_lock::wait_on(*this, sync_cond, l);
@@ -5414,6 +5422,7 @@ void Client::invalidate_snaprealm_and_children(SnapRealm *realm)
 
 SnapRealm *Client::get_snap_realm(inodeno_t r)
 {
+  std::scoped_lock<Client> lock(*this);
   SnapRealm *realm = snap_realms[r];
 
   ldout(cct, 20) << __func__ << " " << r << " " << realm << ", nref was "
@@ -5434,6 +5443,7 @@ SnapRealm *Client::get_snap_realm(inodeno_t r)
 
 SnapRealm *Client::get_snap_realm_maybe(inodeno_t r)
 {
+  std::scoped_lock<Client> lock(*this);
   auto it = snap_realms.find(r);
   if ( it == snap_realms.end()) {
     ldout(cct, 20) << __func__ << " " << r << " fail" << dendl;
@@ -5447,6 +5457,7 @@ SnapRealm *Client::get_snap_realm_maybe(inodeno_t r)
 
 void Client::put_snap_realm(SnapRealm *realm)
 {
+  std::scoped_lock<Client> lock(*this);
   ldout(cct, 20) << __func__ << " " << realm->ino << " " << realm
 		 << " " << realm->nref << " -> " << (realm->nref - 1) << dendl;
   if (--realm->nref == 0) {
@@ -6108,12 +6119,12 @@ void Client::_try_to_trim_inode(Inode *in, bool sched_inval)
 {
   int ref = in->get_nref();
   {
-    unique_unlock cl_unlock(*this, std::defer_lock);
-
-    if (this->is_locked_by_me()) {
-      cl_unlock.release();
+    ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+    if (is_locked_by_me()) {
+      cl_drop.release();
     }
-    ldout(cct, 5) << __func__ << " in " << *in <<dendl;
+    std::unique_lock in_lock(*in);
+    ldout(cct, 5) << __func__ << " in " << *in << dendl;
   }
 
   Dir *dir = in->dir;
@@ -6650,35 +6661,32 @@ int Client::may_delete(const walk_dentry_result& wdr, const UserPerm& perms, boo
   ldout(cct, 20) << __func__ << " " << wdr << "; " << perms << dendl;
   auto* diri = wdr.diri.get();
   auto* in = wdr.target.get();
-  auto check = [&]() -> int {
-    int r = _getattr_for_perm(diri, perms);
-    if (r < 0)
-      return r;
 
-    r = inode_permission(diri, perms, CLIENT_MAY_EXEC | CLIENT_MAY_WRITE);
-    if (r < 0)
-      return r;
+  // Hold only the parent lock across _getattr_for_perm: that path drops and
+  // re-acquires the inode lock via caps_issued_mask, which would invert lock
+  // order if a child inode lock were held at the same time.
+  std::unique_lock diri_lock(*diri);
 
-    if (in && check_perms && perms.uid() != 0 && (diri->mode & S_ISVTX)) {
+  int r = _getattr_for_perm(diri, perms);
+  if (r < 0)
+    goto out;
+
+  r = inode_permission(diri, perms, CLIENT_MAY_EXEC | CLIENT_MAY_WRITE);
+  if (r < 0)
+    goto out;
+
+  if (in && check_perms && perms.uid() != 0 && (diri->mode & S_ISVTX)) {
+    if (in != diri) {
+      std::unique_lock in_lock(*in);
       if (diri->uid != perms.uid() && in->uid != perms.uid())
-        return -EPERM;
+        r = -EPERM;
+    } else if (diri->uid != perms.uid()) {
+      r = -EPERM;
     }
-    return 0;
-  };
-
-  int r;
-  if (in && in != diri) {
-    // Always lock the parent directory inode before the child, matching
-    // path_walk/_lookup so we do not invert lock order on the same thread.
-    std::unique_lock diri_lock(*diri);
-    std::unique_lock in_lock(*in);
-    r = check();
-    ldout(cct, 3) << __func__ << " " << *diri << " = " << r <<  dendl;
-  } else {
-    std::unique_lock diri_lock(*diri);
-    r = check();
-    ldout(cct, 3) << __func__ << " " << *diri << " = " << r <<  dendl;
   }
+
+out:
+  ldout(cct, 3) << __func__ << " " << *diri << " = " << r <<  dendl;
   return r;
 }
 
@@ -8751,7 +8759,12 @@ int Client::_getattr(const InodeRef& in, int mask, const UserPerm& perms, bool f
     return _getattr(in, mask, perms, force);
   }
 
-  bool yes = in->caps_issued_mask(mask, true);
+  // caps_issued_mask takes inode_lock, which must not overlap client_lock
+  // (e.g. verify_reply_trace calling _getattr from inside make_request).
+  bool yes = false;
+  if (!is_locked_by_me()) {
+    yes = in->caps_issued_mask(mask, true);
+  }
 
   ldout(cct, 10) << __func__ << " mask " << ccap_string(mask) << " issued=" << yes << dendl;
   if (yes && !force)
