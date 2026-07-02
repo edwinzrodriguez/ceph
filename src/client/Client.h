@@ -888,6 +888,7 @@ public:
   void handle_cap_flushsnap_ack(MetaSession *session, Inode *in, const MConstRef<MClientCaps>& m);
   void handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const MConstRef<MClientCaps>& m);
   void cap_delay_requeue(Inode *in);
+  void unlink_delay_cap_item(Inode *in);
 
   void send_cap(Inode *in, MetaSession *session, Cap *cap, int flags,
 		int used, int want, int retain, int flush,
@@ -1229,9 +1230,7 @@ protected:
     return it->second;
   }
   int get_fd_inode(int fd, InodeRef *in);
-  bool _ll_fh_exists(Fh *f) {
-    return ll_unclosed_fh_set.count(f);
-  }
+  bool _ll_fh_exists(Fh *f);
 
   // helpers
   void wake_up_session_caps(MetaSession *s, bool reconnect);
@@ -1249,6 +1248,7 @@ protected:
   void _put_inode(Inode *in, int n);
   void delay_put_inodes(bool wakeup=false);
   void dispose_stale_inodes();
+  void _force_evict_unmount_cache();
   void dispose_orphan_inodes();
   void put_inode(Inode *in, int n=1);
   void close_dir(Dir *dir);
@@ -2474,6 +2474,8 @@ private:
   };
   std::array<DelayInodeShard, delay_i_shards> delay_i;
   unsigned delay_i_shard(Inode *in) const;
+  // Inodes pinned by the unmount oset anchor; defer _put_inode map removal.
+  std::unordered_set<Inode*> unmount_anchor_pins;
 
   uint64_t nr_metadata_request = 0;
   uint64_t nr_read_request = 0;

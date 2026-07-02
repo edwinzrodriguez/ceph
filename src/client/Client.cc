@@ -207,6 +207,9 @@ struct InodeOsetPin {
 };
 
 // Snapshot ObjectCacher I/O inputs for read/write/flush paths.
+// Pin the inode so it cannot be torn down while inode_lock is dropped for
+// cache I/O.  Call release_pin() inside a unique_unlock<Inode> scope before
+// the guard reacquires inode_lock.
 struct InodeOCState {
   InodeRef pin;
   ObjectCacher::ObjectSet *oset;
@@ -222,6 +225,16 @@ struct InodeOCState {
       snapid(in->snapid)
   {
     ceph_assert(in->snaprealm);
+    ceph_assert(in->is_locked_by_me());
+  }
+
+  void release_pin()
+  {
+    if (!pin) {
+      return;
+    }
+    ceph_assert(!pin->is_locked_by_me());
+    pin = InodeRef();
   }
 };
 
@@ -257,35 +270,35 @@ bool Client::objectcacher_set_is_empty(Inode *in)
 
 void Client::objectcacher_purge_set(Inode *in)
 {
-  ceph_assert(client_lock.is_locked_by_me());
   InodeOsetPin oc(in);
-  {
-    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
-    objectcacher->purge_set(oc.oset);
-  }
+  ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+  if (is_locked_by_me())
+    cl_drop.release();
+  objectcacher->purge_set(oc.oset);
 }
 
 void Client::objectcacher_release_set(Inode *in)
 {
-  ceph_assert(client_lock.is_locked_by_me());
   InodeOsetPin oc(in);
-  {
-    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
-    objectcacher->release_set(oc.oset);
-  }
+  ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+  if (is_locked_by_me())
+    cl_drop.release();
+  objectcacher->release_set(oc.oset);
 }
 
 int64_t Client::objectcacher_release_all()
 {
-  ceph_assert(client_lock.is_locked_by_me());
-  ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
+  ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+  if (is_locked_by_me())
+    cl_drop.release();
   return objectcacher->release_all();
 }
 
 void Client::objectcacher_wait_for_flush_callbacks()
 {
-  ceph_assert(client_lock.is_locked_by_me());
-  ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
+  ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+  if (is_locked_by_me())
+    cl_drop.release();
   objectcacher->wait_for_flush_callbacks();
 }
 
@@ -589,7 +602,7 @@ Client::~Client()
     upkeeper.join();
 
   // Hold client_lock for tear_down_cache; ObjectCacher entry points drop it.
-  std::scoped_lock l{client_lock};
+  std::scoped_lock<Client> l{*this};
   tear_down_cache();
 }
 
@@ -868,7 +881,7 @@ void Client::shutdown()
   // If we were not mounted, but were being used for sending
   // MDS commands, we may have sessions that need closing.
   {
-    std::scoped_lock l{client_lock};
+    std::scoped_lock<Client> l{*this};
 
     // To make sure the tick thread will be stoppped before
     // destructing the Client, just in case like the _mount()
@@ -2868,6 +2881,13 @@ void Client::_close_mds_session(MetaSession *s)
 void Client::_closed_mds_session(MetaSession *s, int err, bool rejected)
 {
   ldout(cct, 5) << __func__ << " mds." << s->mds_num << " seq " << s->seq << dendl;
+
+  const bool had_client = is_locked_by_me();
+  ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+  std::unique_lock<Client> c_lock(*this, std::defer_lock);
+  if (!had_client)
+    c_lock.lock();
+
   if (rejected && s->state != MetaSession::STATE_CLOSING)
     s->state = MetaSession::STATE_REJECTED;
   else
@@ -2875,7 +2895,19 @@ void Client::_closed_mds_session(MetaSession *s, int err, bool rejected)
   s->con->mark_down();
   signal_context_list(s->waiting_for_open);
   mount_cond.notify_all();
+
+  if (had_client)
+    cl_drop.release();
+  else
+    c_lock.unlock();
+
   remove_session_caps(s, err);
+
+  if (had_client)
+    cl_drop.reacquire();
+  else
+    c_lock.lock();
+
   kick_requests_closed(s);
   mds_ranks_closing.erase(s->mds_num);
   if (s->state == MetaSession::STATE_CLOSED)
@@ -3866,6 +3898,10 @@ void Client::kick_requests_closed(MetaSession *session)
 	  dir->set_async_err(-EIO);
 	  lderr(cct) << "kick_requests_closed drop req of inode(dir) : "
 		     <<  dir->ino  << " " << req->get_tid() << dendl;
+	  const bool had_client = client_lock.is_locked_by_me();
+	  ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+	  if (had_client)
+	    cl_drop.release();
 	  std::unique_lock dir_lock(*dir);
 	  req->unsafe_dir_item.remove_myself();
 	}
@@ -3874,6 +3910,10 @@ void Client::kick_requests_closed(MetaSession *session)
 	  in->set_async_err(-EIO);
 	  lderr(cct) << "kick_requests_closed drop req of inode : "
 		     <<  in->ino  << " " << req->get_tid() << dendl;
+	  const bool had_client = client_lock.is_locked_by_me();
+	  ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+	  if (had_client)
+	    cl_drop.release();
 	  std::unique_lock target_lock(*in);
 	  req->unsafe_target_item.remove_myself();
 	}
@@ -4006,6 +4046,16 @@ void Client::_put_inode(Inode *in, int n)
   }
 
   if (left == 1) {
+    {
+      in_lock.unlock();
+      std::unique_lock<Client> c_lock(*this);
+      if (unmount_anchor_pins.count(in)) {
+	ldout(cct, 15) << __func__ << " defer delete (unmount anchor) " << *in
+			 << dendl;
+	return;
+      }
+    }
+    in_lock.lock();
     remove_all_caps(in);
 
     if (in->dir && !in->dir->dentries.empty()) {
@@ -4139,6 +4189,59 @@ void Client::delay_put_inodes(bool wakeup)
     mount_cond.notify_all();
 }
 
+void Client::_force_evict_unmount_cache()
+{
+  ldout(cct, 1) << __func__ << " lru=" << lru.lru_get_size()
+		<< " inodes=" << inode_map.size() << dendl;
+
+  // Raw pointers only: InodeRef would call put_inode from ~intrusive_ptr
+  // after delay_put_inodes may already have deleted the inode.
+  std::vector<Inode*> inodes;
+  inodes.reserve(inode_map.size());
+  for (auto& [vino, in] : inode_map)
+    inodes.push_back(in);
+
+  for (Inode *in : inodes) {
+    if (in->dirty_caps) {
+      ceph::unique_unlock<Client> unlock(*this);
+      std::unique_lock in_lock(*in);
+      in->mark_caps_clean();
+    }
+    {
+      ceph::unique_unlock<Client> unlock(*this);
+      client_caps->prepare_inode_unmount(in);
+    }
+    {
+      ceph::unique_unlock<Client> unlock(*this);
+      std::unique_lock in_lock(*in);
+      if (!in->caps.empty()) {
+	remove_all_caps(in);
+      }
+      in->cap_snaps.clear();
+    }
+    {
+      ceph::unique_unlock<Client> unlock(*this);
+      check_caps(InodeRef(in), CHECK_CAPS_NODELAY);
+    }
+    {
+      ceph::unique_unlock<Client> unlock(*this);
+      _try_to_trim_inode(in, false);
+    }
+    int extra = 0;
+    {
+      ceph::unique_unlock<Client> unlock(*this);
+      std::unique_lock in_lock(*in);
+      extra = in->get_nref() - 1;
+    }
+    if (extra > 0)
+      put_inode(in, extra);
+  }
+
+  trim_cache();
+  delay_put_inodes(true);
+  mount_cond.notify_all();
+}
+
 void Client::dispose_stale_inodes()
 {
   ceph_assert(client_lock.is_locked_by_me());
@@ -4163,28 +4266,41 @@ void Client::dispose_stale_inodes()
 	in->flags &= ~I_SNAPDIR_OPEN;
       }
 
-      remove_all_caps(in);
+      if (in->dirty_caps) {
+	ceph::unique_unlock<Client> unlock(*this);
+	in->mark_caps_clean();
+      }
+      {
+	ceph::unique_unlock<Client> unlock(*this);
+	client_caps->prepare_inode_unmount(in);
+      }
+      {
+	ceph::unique_unlock<Client> unlock(*this);
+	std::unique_lock in_lock(*in);
+	if (!in->caps.empty())
+	  client_caps->remove_all_caps(in, !is_unmounting());
+      }
 
       if (in->dir) {
 	while (!in->dir->dentries.empty()) {
 	  Dentry *dn = in->dir->dentries.begin()->second;
-	  unlink(dn, true, false);
+	  unlink_locked(dn, true, false);
 	}
 	if (in->dir->is_empty())
 	  close_dir(in->dir);
       }
       while (!in->dentries.empty())
-	unlink(*in->dentries.begin(), true, true);
+	unlink_locked(*in->dentries.begin(), true, true);
 
-      client_caps->unlink_delay_cap_item(in);
-      in->dirty_cap_item.remove_myself();
-      in->flushing_cap_item.remove_myself();
-      in->mark_caps_clean();
-
-      if (in->ll_ref)
+      if (in->ll_ref) {
+	ceph::unique_unlock<Client> unlock(*this);
 	_ll_put(in, in->ll_ref);
+      }
 
-      _put_inode(in, 0);
+      {
+	ceph::unique_unlock<Client> unlock(*this);
+	_put_inode(in, 0);
+      }
     }
     delay_put_inodes();
 
@@ -4226,28 +4342,41 @@ void Client::dispose_orphan_inodes()
     if (in->get_nref() == 0)
       continue;
 
-    remove_all_caps(in);
+    if (in->dirty_caps) {
+      ceph::unique_unlock<Client> unlock(*this);
+      in->mark_caps_clean();
+    }
+    {
+      ceph::unique_unlock<Client> unlock(*this);
+      client_caps->prepare_inode_unmount(in);
+    }
+    {
+      ceph::unique_unlock<Client> unlock(*this);
+      std::unique_lock in_lock(*in);
+      if (!in->caps.empty())
+	client_caps->remove_all_caps(in, !is_unmounting());
+    }
 
     if (in->dir) {
       while (!in->dir->dentries.empty()) {
 	Dentry *dn = in->dir->dentries.begin()->second;
-	unlink(dn, true, false);
+	unlink_locked(dn, true, false);
       }
       if (in->dir->is_empty())
 	close_dir(in->dir);
     }
     while (!in->dentries.empty())
-      unlink(*in->dentries.begin(), true, true);
+      unlink_locked(*in->dentries.begin(), true, true);
 
-    client_caps->unlink_delay_cap_item(in);
-    in->dirty_cap_item.remove_myself();
-    in->flushing_cap_item.remove_myself();
-    in->mark_caps_clean();
-
-    if (in->ll_ref)
+    if (in->ll_ref) {
+      ceph::unique_unlock<Client> unlock(*this);
       _ll_put(in, in->ll_ref);
+    }
 
-    _put_inode(in, 0);
+    {
+      ceph::unique_unlock<Client> unlock(*this);
+      _put_inode(in, 0);
+    }
   }
   delay_put_inodes();
 }
@@ -4493,6 +4622,11 @@ int Client::get_caps_used(Inode *in)
 void Client::cap_delay_requeue(Inode *in)
 {
   client_caps->cap_delay_requeue(in);
+}
+
+void Client::unlink_delay_cap_item(Inode *in)
+{
+  client_caps->unlink_delay_cap_item(in);
 }
 
 void Client::send_cap(Inode *in, MetaSession *session, Cap *cap,
@@ -5834,7 +5968,7 @@ void Client::handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, con
     signal_caps_inode(in);
     session->with_flushing_caps_tids([&](auto& tids) {
       if (tids.empty() || *tids.begin() > flush_ack_tid)
-	sync_cond.notify_all();
+	sync_cond.notify_all_sloppy();
     });
   }
 
@@ -5875,7 +6009,7 @@ void Client::handle_cap_flushsnap_ack(MetaSession *session, Inode *in, const MCo
       signal_caps_inode(in);
       session->with_flushing_caps_tids([&](auto& tids) {
         if (tids.empty() || *tids.begin() > flush_ack_tid)
-          sync_cond.notify_all();
+          sync_cond.notify_all_sloppy();
       });
     }
   } else {
@@ -5933,25 +6067,45 @@ void Client::_schedule_invalidate_dentry_callback(Dentry *dn, bool del)
 void Client::_try_to_trim_inode(Inode *in, bool sched_inval)
 {
   int ref = in->get_nref();
-  ldout(cct, 5) << __func__ << " in " << *in <<dendl;
+  {
+    unique_unlock cl_unlock(*this, std::defer_lock);
 
-  if (in->dir && !in->dir->dentries.empty()) {
-    for (auto p = in->dir->dentries.begin();
-	 p != in->dir->dentries.end(); ) {
-      Dentry *dn = p->second;
-      ++p;
-      /* rmsnap removes whole subtree, need trim inodes recursively.
-       * we don't need to invalidate dentries recursively. because
-       * invalidating a directory dentry effectively invalidate
-       * whole subtree */
-      if (in->snapid != CEPH_NOSNAP && dn->inode && dn->inode->is_dir())
-	_try_to_trim_inode(dn->inode.get(), false);
-
-      if (dn->lru_is_expireable())
-	unlink(dn, true, false);  // keep dir, drop dentry
+    if (this->is_locked_by_me()) {
+      cl_unlock.release();
     }
-    if (in->dir->dentries.empty()) {
-      close_dir(in->dir);
+    ldout(cct, 5) << __func__ << " in " << *in <<dendl;
+  }
+
+  Dir *dir = in->dir;
+  std::vector<Dentry*> to_unlink;
+  std::vector<Inode*> child_dirs;
+  {
+    std::scoped_lock<Client> cl(*this);
+    if (dir && !dir->dentries.empty()) {
+      for (const auto& p : dir->dentries) {
+	Dentry *dn = p.second;
+	if (in->snapid != CEPH_NOSNAP && dn->inode && dn->inode->is_dir())
+	  child_dirs.push_back(dn->inode.get());
+	if (dn->lru_is_expireable())
+	  to_unlink.push_back(dn);
+      }
+    } else {
+      dir = NULL;
+    }
+  }
+  for (Inode *child : child_dirs) {
+    /* rmsnap removes whole subtree, need trim inodes recursively.
+     * we don't need to invalidate dentries recursively. because
+     * invalidating a directory dentry effectively invalidate
+     * whole subtree */
+    _try_to_trim_inode(child, false);
+  }
+  for (Dentry *dn : to_unlink)
+    unlink(dn, true, false);  // keep dir, drop dentry
+  if (dir) {
+    std::scoped_lock<Client> cl(*this);
+    if (dir->dentries.empty()) {
+      close_dir(dir);
       --ref;
     }
   }
@@ -6140,9 +6294,15 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
     signal_caps_inode(in);
   }
 
-  // may drop inode's last ref
-  if (deleted_inode)
-    _try_to_trim_inode(in, true);
+  // may drop inode's last ref; unmount may have queued puts from cap paths
+  if (deleted_inode || is_unmounting()) {
+    ceph::unique_unlock<Inode> in_unlock(*in);
+    std::unique_lock<Client> cl(*this);
+    if (deleted_inode)
+      _try_to_trim_inode(in, true);
+    if (is_unmounting())
+      delay_put_inodes(true);
+  }
 }
 
 int Client::mds_check_access(std::string& path, const UserPerm& perms, int mask)
@@ -6334,6 +6494,7 @@ out:
 
 int Client::may_open(const InodeRef& in, int flags, const UserPerm& perms)
 {
+  std::unique_lock in_lock(*in);
   ldout(cct, 20) << __func__ << " " << *in << "; " << perms << dendl;
   unsigned want = 0;
 
@@ -7128,7 +7289,8 @@ void Client::_unmount(bool abort)
     return;
   mref_writer.wait_readers_done();
 
-  std::unique_lock lock{client_lock};
+  std::unique_lock<Client> lock{*this};
+  unmount_anchor_pins.clear();
 
   if (abort || blocklisted) {
     ldout(cct, 2) << "unmounting (" << (abort ? "abort)" : "blocklisted)") << dendl;
@@ -7149,10 +7311,12 @@ void Client::_unmount(bool abort)
     flush_mdlog_sync();
   }
 
-  mount_cond.wait(lock, [this] {
-    // Only wait for write OPs
+  ceph::client_lock::wait_mount(*this, lock, [this] {
+    // Only wait for outstanding write OPs (skip aborted).
     for (auto& [tid, req] : mds_requests) {
-      if (req->is_write()) {
+      if (req->aborted())
+        continue;
+      if (req->is_write() && !(req->reply && req->reply->is_safe())) {
         ldout(cct, 10) << "waiting for write request '" << tid
                        << "' to complete, currently there are "
                        << mds_requests.size()
@@ -7195,7 +7359,8 @@ void Client::_unmount(bool abort)
 
   if (cct->_conf->client_oc) {
     // flush/release all buffered data
-    std::list<InodeRef> anchor;
+    std::vector<Inode*> anchor;
+    anchor.reserve(inode_map.size());
     for (auto& p : inode_map) {
       Inode *in = p.second;
       if (!in) {
@@ -7203,95 +7368,60 @@ void Client::_unmount(bool abort)
 	ceph_assert(in);
       }
 
-      // prevent inode from getting freed
-      anchor.emplace_back(in);
+      // prevent inode from getting freed during purge/cap work below
+      in->iget();
+      anchor.push_back(in);
+      unmount_anchor_pins.insert(in);
 
-      if (abort || blocklisted) {
-        objectcacher_purge_set(in);
-      } else if (!in->caps.empty()) {
-	_release(in);
-	_flush(in, new C_Client_FlushComplete(this, in));
+      if (!in->caps.empty()) {
+	if (abort || blocklisted) {
+	  objectcacher_purge_set(in);
+	} else {
+	  ceph::unique_unlock<Client> unlock(*this);
+	  client_caps->prepare_inode_unmount(in);
+	  check_caps(in, CHECK_CAPS_NODELAY | CHECK_CAPS_SYNCHRONOUS);
+	}
+	lock.lock();
+      } else {
+	objectcacher_purge_set(in);
       }
     }
-    if (!abort && !blocklisted) {
-      objectcacher_wait_for_flush_callbacks();
+    for (Inode *in : anchor) {
+      unmount_anchor_pins.erase(in);
+      put_inode(in);
     }
+    delay_put_inodes(true);
   }
 
   if (abort || blocklisted) {
     for (auto &q : mds_sessions) {
       auto s = q.second;
-      std::vector<Inode*> dirty;
-      dirty.reserve(s->dirty_list.size());
-      for (auto p = s->dirty_list.begin(); !p.end(); ++p)
-        dirty.push_back(*p);
-      for (Inode *in : dirty) {
-        if (in->dirty_caps) {
-          ldout(cct, 0) << " drop dirty caps on " << *in << dendl;
-          in->mark_caps_clean();
-          put_inode(in);
+      s->with_dirty_list([&](auto& dirty_list) {
+        for (auto p = dirty_list.begin(); !p.end(); ) {
+          Inode *in = *p;
+          ++p;
+          if (in->dirty_caps) {
+            ldout(cct, 0) << " drop dirty caps on " << *in << dendl;
+            in->mark_caps_clean();
+            put_inode(in);
+          }
         }
-      }
-    }
-  } else {
-    flush_caps_sync();
-    wait_sync_caps(client_caps->get_last_flush_tid());
-  }
-
-  // stop the tick thread and MDS sessions before draining the cache so
-  // dispatch cannot repopulate inode_map via insert_trace while we unmount.
-  {
-    std::scoped_lock l{upkeep_lock};
-    tick_thread_stopped = true;
-    upkeep_cond.notify_one();
-  }
-
-  _close_sessions();
-
-  while (!mds_requests.empty()) {
-    MetaRequest *req = mds_requests.begin()->second;
-    MetaSessionRef session;
-    if (req->mds >= 0) {
-      auto it = mds_sessions.find(req->mds);
-      if (it != mds_sessions.end())
-	session = it->second;
-    }
-    req->abort(-ESHUTDOWN);
-    if (req->caller_cond) {
-      req->kick = true;
-      req->caller_cond->notify_all();
-    }
-    if (session) {
-      session->with_requests([&](auto&) {
-	req->item.remove_myself();
       });
     }
-    if (req->got_unsafe) {
-      if (session) {
-	session->with_unsafe_requests([&](auto&) {
-	  req->unsafe_item.remove_myself();
-	});
-      }
-      if (is_dir_operation(req)) {
-	Inode *dir = req->inode();
-	if (dir) {
-	  std::unique_lock dir_lock(*dir);
-	  req->unsafe_dir_item.remove_myself();
-	}
-      }
-      if (req->target) {
-	std::unique_lock target_lock(*(req->target));
-	req->unsafe_target_item.remove_myself();
-      }
-      signal_deferred_context_list(req->waitfor_safe);
-    }
-    unregister_request(req);
+  } else {
+    lock.unlock();
+    flush_caps_sync();
+    lock.lock();
+    wait_sync_caps(client_caps->get_last_flush_tid());
   }
 
   // empty lru cache
   trim_cache();
-  dispose_stale_inodes();
 
+  delay_put_inodes(true);
+
+  unsigned unmount_stall_rounds = 0;
+  bool unmount_sessions_closed = false;
   while (lru.lru_get_size() > 0 ||
          !inode_map.empty()) {
     ldout(cct, 2) << "cache still has " << lru.lru_get_size()
@@ -7299,42 +7429,118 @@ void Client::_unmount(bool abort)
 	    << ", waiting (for caps to release?)"
             << dendl;
 
+    uint64_t size = lru.lru_get_size() + inode_map.size();
     trim_cache();
-    dispose_stale_inodes();
-    dispose_orphan_inodes();
+    delay_put_inodes(true);
 
-    if (auto r = mount_cond.wait_for(lock, ceph::make_timespan(5));
-	r == std::cv_status::timeout) {
+    // prepare_inode_unmount uses inode_lock only (see _put_inode); drop
+    // client_lock briefly to avoid ABBA with ms_dispatch.  Pin inodes first:
+    // delay_put_inodes/trim_cache may delete map entries while client_lock
+    // is dropped.
+    {
+      std::vector<Inode*> pinned;
+      pinned.reserve(inode_map.size());
+      for (auto& [vino, in] : inode_map) {
+        in->iget();
+        pinned.push_back(in);
+      }
+
+      std::vector<Inode*> caps_inodes;
+      for (Inode* in : pinned) {
+        {
+          ceph::unique_unlock<Client> unlock(*this);
+          client_caps->prepare_inode_unmount(in);
+        }
+        if (!in->caps.empty())
+          caps_inodes.push_back(in);
+      }
+      for (size_t i = 0; i < caps_inodes.size(); ++i) {
+        unsigned flags = CHECK_CAPS_NODELAY;
+        if (i + 1 == caps_inodes.size())
+          flags |= CHECK_CAPS_SYNCHRONOUS;
+        ceph::unique_unlock<Client> unlock(*this);
+        check_caps(InodeRef(caps_inodes[i]), flags);
+      }
+      for (Inode* in : pinned) {
+        ceph::unique_unlock<Client> unlock(*this);
+        std::unique_lock in_lock(*in);
+        if (!in->caps.empty()) {
+          remove_all_caps(in);
+          in->cap_snaps.clear();
+        }
+      }
+      for (Inode* in : pinned) {
+        {
+          ceph::unique_unlock<Client> unlock(*this);
+          _try_to_trim_inode(in, false);
+        }
+        int extra = 0;
+        {
+          ceph::unique_unlock<Client> unlock(*this);
+          std::unique_lock in_lock(*in);
+          extra = in->get_nref() - 1;
+        }
+        if (extra > 0)
+          put_inode(in, extra);
+      }
+    }
+    lock.unlock();
+    flush_caps_sync();
+    lock.lock();
+    wait_sync_caps(client_caps->get_last_flush_tid());
+    delay_put_inodes(true);
+    trim_cache();
+    mount_cond.notify_all();
+
+    if (size > lru.lru_get_size() + inode_map.size()) {
+      unmount_stall_rounds = 0;
+      continue;
+    }
+
+    auto r = ceph::client_lock::wait_mount_for(*this, lock, ceph::make_timespan(5));
+    // Process puts queued while we slept (e.g. from cap release paths).
+    delay_put_inodes(true);
+    if (r == std::cv_status::timeout &&
+	size == lru.lru_get_size() + inode_map.size()) {
       dump_cache(NULL);
+      if (++unmount_stall_rounds >= 1) {
+	ldout(cct, 1) << "unmount cache drain stalled; forcing eviction" << dendl;
+	if (!unmount_sessions_closed) {
+	  {
+	    std::scoped_lock l{upkeep_lock};
+	    tick_thread_stopped = true;
+	    upkeep_cond.notify_one();
+	  }
+	  _close_sessions();
+	  unmount_sessions_closed = true;
+	}
+	_force_evict_unmount_cache();
+	unmount_stall_rounds = 0;
+      }
     }
   }
   ceph_assert(lru.lru_get_size() == 0);
   ceph_assert(inode_map.empty());
-
-  for (unsigned i = 0; i < 64; ++i) {
-    delay_put_inodes();
-    bool any = false;
-    for (unsigned s = 0; s < delay_i_shards; ++s) {
-      std::scoped_lock dl(delay_i[s].lock);
-      if (!delay_i[s].release.empty()) {
-	any = true;
-	break;
-      }
-    }
-    if (!any)
-      break;
-    dispose_stale_inodes();
-  }
-
-  client_caps->purge_delayed_list();
-  delay_put_inodes();
-  dispose_orphan_inodes();
 
   // stop tracing
   if (!cct->_conf->client_trace.empty()) {
     ldout(cct, 1) << "closing trace file '" << cct->_conf->client_trace << "'" << dendl;
     traceout.close();
   }
+
+  // stop the tick thread
+  {
+    std::scoped_lock l{upkeep_lock};
+    tick_thread_stopped = true;
+    upkeep_cond.notify_one();
+  }
+
+  if (!unmount_sessions_closed)
+    _close_sessions();
+
+  client_caps->purge_delayed_list();
+  delay_put_inodes();
+  dispose_orphan_inodes();
 
   // release the global snapshot realm
   SnapRealm *global_realm = snap_realms[CEPH_INO_GLOBAL_SNAPREALM];
@@ -8195,14 +8401,14 @@ int Client::unlinkat(int dirfd, const char *relpath, int flags, const UserPerm& 
   tout(cct) << relpath << std::endl;
   tout(cct) << flags << std::endl;
 
-  std::scoped_lock lock(client_lock);
-
   InodeRef dirinode;
   int r = get_fd_inode(dirfd, &dirinode);
   if (r < 0) {
     return r;
   }
 
+  // Do not hold client_lock across path_walk/make_request: path_walk takes
+  // inode_lock and the MDS reply is handled on ms_dispatch with the same locks.
   if (flags & AT_REMOVEDIR) {
     r = _rmdir(dirinode.get(), relpath, perm);
   } else {
@@ -10819,7 +11025,6 @@ int Client::create_and_open(int dirfd, const char *relpath, int flags,
                             const UserPerm& perms, mode_t mode, int stripe_unit,
                             int stripe_count, int object_size, const char *data_pool,
                             std::string alternate_name, FSCrypt_Options fscrypt_options) {
-  ceph_assert(client_lock.is_locked_by_me());
   int cflags = ceph_flags_sys2wire(flags);
   tout(cct) << cflags << std::endl;
 
@@ -10857,15 +11062,25 @@ int Client::create_and_open(int dirfd, const char *relpath, int flags,
     return -EEXIST;
 
 #if defined(__linux__) && defined(O_PATH)
-  if (in && in->is_symlink() && (flags & O_NOFOLLOW) && !(flags & O_PATH))
+  if (in) {
+    std::unique_lock in_lock(*in);
+    if (in->is_symlink() && (flags & O_NOFOLLOW) && !(flags & O_PATH))
+      return -ELOOP;
+  }
 #else
-    if (in && in->is_symlink() && (flags & O_NOFOLLOW))
+  if (in) {
+    std::unique_lock in_lock(*in);
+    if (in->is_symlink() && (flags & O_NOFOLLOW))
+      return -ELOOP;
+  }
 #endif
-    return -ELOOP;
 
   if (!in && (flags & O_CREAT)) {
     if (should_check_perms()) {
-      r = may_create(wdr.diri, perms);
+      {
+	std::unique_lock diri_lock(*wdr.diri);
+	r = may_create(wdr.diri, perms);
+      }
       if (r < 0)
         goto out;
     }
@@ -10894,6 +11109,7 @@ int Client::create_and_open(int dirfd, const char *relpath, int flags,
     // allocate a integer file descriptor
     ceph_assert(fh);
     r = get_fd();
+    std::unique_lock<Client> lock(*this);
     auto [it, b] = fd_map.try_emplace(r, fh);
     ceph_assert(b);
   }
@@ -10917,8 +11133,6 @@ int Client::do_openat(int dirfd, const char *relpath, int flags, const UserPerm&
   tout(cct) << flags << std::endl;
   tout(cct) << mode << std::endl;
 
-  std::scoped_lock locker(client_lock);
-  // NEXT
   int r = create_and_open(dirfd, relpath, flags, perms, mode, stripe_unit, stripe_count,
                            object_size, data_pool, std::move(alternate_name), fscrypt_options);
 
@@ -11197,7 +11411,10 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
     std::string path;
     if (make_absolute_path_string(in, path)) {
       ldout(cct, 20) << __func__ << " absolute path: " << path << dendl;
-      result = mds_check_access(path, perms, mask);
+      {
+	ceph::unique_unlock<Inode> in_drop(*in);
+	result = mds_check_access(path, perms, mask);
+      }
       if (result) {
         return result;
       }
@@ -11221,7 +11438,10 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
       req->head.args.open.mask = 0;
     req->head.args.open.old_size = in->effective_size();   // for O_TRUNC
     req->set_inode(in);
-    result = make_request(req, perms);
+    {
+      ceph::unique_unlock<Inode> in_drop(*in);
+      result = make_request(req, perms);
+    }
 
     /*
      * NFS expects that delegations will be broken on a conflicting open,
@@ -11279,7 +11499,10 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
     in->put_open_ref(cmode);
   }
 
-  trim_cache();
+  {
+    ceph::unique_unlock<Inode> in_drop(*in);
+    trim_cache();
+  }
 
   return result;
 }
@@ -12048,26 +12271,33 @@ void Client::C_Readahead::finish(int r) {
 
 void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
 {
-  ClientLockIfNeeded lock_guard(this);
-  if(f->readahead.get_min_readahead_size() > 0) {
-    pair<uint64_t, uint64_t> readahead_extent = f->readahead.update(off, len, in->effective_size());
+  if (is_unmounting()) {
+    return;
+  }
+  std::unique_lock in_lock(*in);
+  if (f->readahead.get_min_readahead_size() > 0) {
+    pair<uint64_t, uint64_t> readahead_extent =
+      f->readahead.update(off, len, in->effective_size());
     if (readahead_extent.second > 0) {
-      ldout(cct, 20) << "readahead " << readahead_extent.first << "~" << readahead_extent.second
+      ldout(cct, 20) << "readahead " << readahead_extent.first << "~"
+		     << readahead_extent.second
 		     << " (caller wants " << off << "~" << len << ")" << dendl;
       Context *onfinish2 = new C_Readahead(this, f, in);
+      get_cap_ref(in, CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
       InodeOCState oc(in);
       int r2 = 0;
       {
-        ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
-        r2 = objectcacher->file_read(oc.oset, &oc.layout, oc.snapid,
+	ceph::unique_unlock<Inode> in_unlock(*in);
+	r2 = objectcacher->file_read(oc.oset, &oc.layout, oc.snapid,
 				     readahead_extent.first, readahead_extent.second,
 				     NULL, 0, onfinish2);
+	oc.release_pin();
       }
       if (r2 == 0) {
 	ldout(cct, 20) << "readahead initiated, c " << onfinish2 << dendl;
-	get_cap_ref(in, CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
       } else {
 	ldout(cct, 20) << "readahead was no-op, already cached" << dendl;
+	put_cap_ref(in, CEPH_CAP_FILE_RD | CEPH_CAP_FILE_CACHE);
 	delete onfinish2;
       }
     }
@@ -12092,8 +12322,7 @@ void Client::C_Read_Async_Finisher::finish(int r)
       }
   }
 #endif
-  // Do read ahead as long as we aren't completing with 0 bytes
-  if (r != 0)
+  if (r != 0 && !clnt->is_unmounting())
     clnt->do_readahead(f, in, off, len);
 
   onfinish->complete(r);
@@ -12102,10 +12331,9 @@ void Client::C_Read_Async_Finisher::finish(int r)
 int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 			Context *onfinish)
 {
-  ceph_assert(client_lock.is_locked_by_me());
-
   const auto& conf = cct->_conf;
   Inode *in = f->inode.get();
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
   std::unique_ptr<Context> io_finish = nullptr;
   C_SaferCond *io_finish_cond = nullptr;
 
@@ -12147,7 +12375,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
   if ((off >= effective_size) || (len == 0)) {
     // read is requested at the EOF or the read len is zero, therefore release
     // Fc cap first before proceeding further
-    put_file_cache_cap_if_held(this, in);
+    put_cap_ref(in, CEPH_CAP_FILE_CACHE);
 
     // If not async, immediate return of 0 bytes
     if (onfinish == nullptr) {
@@ -12184,14 +12412,15 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
   std::vector<ObjectCacher::ObjHole> holes;
   InodeOCState oc(in);
   {
-    ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
+    ceph::unique_unlock<Inode> in_unlock(*in);
     r = objectcacher->file_read_ex(oc.oset, &oc.layout, oc.snapid,
                                    read_start, read_len, bl, 0, &holes,
                                    io_finish.get());
+    oc.release_pin();
   }
   if (onfinish != nullptr) {
     // put the cap ref since we're releasing C_Read_Async_Finisher
-    put_file_cache_cap_if_held(this, in);
+    put_cap_ref(in, CEPH_CAP_FILE_CACHE);
     // Release C_Read_Async_Finisher from managed pointer, either
     // file_read will result in non-blocking complete, or we need to complete
     // immediately. In either case, the C_Read_Async_Finisher is safely
@@ -12204,15 +12433,15 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
     return 0;
   }
 
-  // Wait for the blocking read to complete and then do readahead
+  // Wait for the blocking read to complete and then do readahead.
+  // Release inode_lock while waiting so tick/_put_inode and read finishers
+  // (e.g. C_Readahead) can take the inode lock.
   if (r == 0) {
-    {
-      ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
-      r = io_finish_cond->wait();
-    }
-    put_file_cache_cap_if_held(this, in);
+    ceph::unique_unlock<Inode> in_unlock(*in);
+    r = io_finish_cond->wait();
+    put_cap_ref(in, CEPH_CAP_FILE_CACHE);
   } else {
-    put_file_cache_cap_if_held(this, in);
+    put_cap_ref(in, CEPH_CAP_FILE_CACHE);
   }
 
   if (r >= 0) {
@@ -12239,13 +12468,13 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 int Client::_read_sync(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 		       bool *checkeof)
 {
-  ceph_assert(client_lock.is_locked_by_me());
   if (len == 0) {
     // zero byte read is not supported by OSD
     return 0;
   }
 
   Inode *in = f->inode.get();
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
 
   auto effective_size = in->effective_size();
   auto target_len = std::min(len, effective_size - off);
@@ -12330,9 +12559,7 @@ uint64_t read_start;
 		      pos, left, &tbl, 0,
 		      in->truncate_size, in->truncate_seq,
 		      &onfinish);
-    client_lock.unlock();
     r = wait_and_copy(onfinish, tbl, wanted);
-    client_lock.lock();
     if (!r)
       break;
     if (r < 0)
@@ -14650,28 +14877,36 @@ int Client::_sync_fs()
   std::unique_ptr<C_SaferCond> cond = nullptr;
   if (cct->_conf->client_oc) {
     cond.reset(new C_SaferCond("Client::_sync_fs:lock"));
-    {
-      ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock);
-      objectcacher->flush_all(cond.get());
-      ldout(cct, 15) << __func__ << " waiting on data to flush" << dendl;
-      cond->wait();
-      ldout(cct, 15) << __func__ << " flush finished" << dendl;
-    }
+    objectcacher->flush_all(cond.get());
   }
 
-  // flush caps
-  flush_caps_sync();
-  ceph_tid_t flush_tid = client_caps->get_last_flush_tid();
+  // flush caps (inode_lock only; see lock_order.h)
+  ceph_tid_t flush_tid;
+  {
+    ceph::unique_unlock<Client> cl_drop(*this);
+    flush_caps_sync();
+    flush_tid = client_caps->get_last_flush_tid();
+  }
 
   // flush the mdlog before waiting for unsafe requests.
   flush_mdlog_sync();
 
   flush_cap_releases();
 
-  // wait for unsafe mds requests
-  wait_unsafe_requests();
+  // Drop client_lock before blocking waits so ms_dispatch (handle_client_reply)
+  // and tick can take it to complete unsafe requests and cap flushes.
+  {
+    ceph::unique_unlock<Client> cl_drop(*this);
+    wait_unsafe_requests();
+    wait_sync_caps(flush_tid);
+  }
 
-  wait_sync_caps(flush_tid);
+  if (cond) {
+    ldout(cct, 15) << __func__ << " waiting on data to flush" << dendl;
+    ceph::unique_unlock<Client> cl_drop(*this);
+    cond->wait();
+    ldout(cct, 15) << __func__ << " flush finished" << dendl;
+  }
 
   return 0;
 }
@@ -17084,6 +17319,7 @@ int Client::ll_unlink(Inode *in, const char *name, const UserPerm& perm)
   if (!mref_reader.is_state_satisfied())
     return -ENOTCONN;
 
+  std::scoped_lock lock(*in);
   vinodeno_t vino = _get_vino(in);
 
   ldout(cct, 3) << "ll_unlink " << vino << " " << name << dendl;
@@ -17091,7 +17327,6 @@ int Client::ll_unlink(Inode *in, const char *name, const UserPerm& perm)
   tout(cct) << vino.ino.val << std::endl;
   tout(cct) << name << std::endl;
 
-  std::scoped_lock lock(client_lock);
   return _unlink(in, name, perm);
 }
 
@@ -17536,7 +17771,7 @@ int Client::ll_opendir(Inode *in, int flags, dir_result_t** dirpp,
   tout(cct) << "ll_opendir" << std::endl;
   tout(cct) << vino.ino.val << std::endl;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock lock(*in);
 
   if (should_check_perms()) {
     int r = may_open(in, flags, perms);
@@ -17597,7 +17832,7 @@ int Client::ll_open(Inode *in, int flags, Fh **fhp, const UserPerm& perms)
   tout(cct) << vino.ino.val << std::endl;
   tout(cct) << ceph_flags_sys2wire(flags) << std::endl;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock lock(*in);
 
   int r;
   if (should_check_perms()) {
@@ -17611,6 +17846,8 @@ int Client::ll_open(Inode *in, int flags, Fh **fhp, const UserPerm& perms)
  out:
   Fh *fhptr = fhp ? *fhp : NULL;
   if (fhptr) {
+    ceph::unique_unlock<Inode> in_drop(*in);
+    std::scoped_lock<Client> cl_lock(*this);
     ll_unclosed_fh_set.insert(fhptr);
   }
   tout(cct) << (uintptr_t)fhptr << std::endl;
@@ -18336,6 +18573,12 @@ int Client::fallocate(int fd, int mode, loff_t offset, loff_t length)
 #endif
   std::scoped_lock lock(*(fh->inode));
   return _fallocate(fh, mode, offset, length);
+}
+
+bool Client::_ll_fh_exists(Fh *f)
+{
+  std::scoped_lock<Client> lock(*this);
+  return ll_unclosed_fh_set.count(f);
 }
 
 int Client::ll_release(Fh *fh)

@@ -351,7 +351,38 @@ void ClientCaps::cap_delay_requeue(Inode *in)
 void ClientCaps::unlink_delay_cap_item(Inode *in)
 {
   std::scoped_lock lock(caps_lock);
-  in->delay_cap_item.remove_myself();
+  if (in->delay_cap_item.is_on_list())
+    in->delay_cap_item.remove_myself();
+}
+
+void ClientCaps::prepare_inode_unmount(Inode *in)
+{
+  // inode_lock before client_lock (same order as _put_inode) — callers must
+  // not hold client_lock across this function.
+  ceph_assert(!client->is_locked_by_me());
+
+  std::vector<std::pair<int, int>> refs;
+  {
+    std::unique_lock in_lock(*in);
+    refs.assign(in->cap_refs.begin(), in->cap_refs.end());
+    {
+      std::scoped_lock lock(caps_lock);
+      if (in->delay_cap_item.is_on_list())
+	in->delay_cap_item.remove_myself();
+      in->hold_caps_until = ceph::coarse_mono_clock::time_point::min();
+    }
+  }
+
+  if (client->objectcacher)
+    client->objectcacher_purge_set(in);
+
+  if (!refs.empty()) {
+    std::unique_lock in_lock(*in);
+    for (auto &[cap, cnt] : refs) {
+      for (int i = 0; i < cnt; ++i)
+	put_cap_ref(in, cap);
+    }
+  }
 }
 
 void ClientCaps::purge_delayed_list()
@@ -365,7 +396,8 @@ void ClientCaps::purge_delayed_list()
     }
   }
   for (Inode *in : inodes) {
-    in->delay_cap_item.remove_myself();
+    if (in->delay_cap_item.is_on_list())
+      in->delay_cap_item.remove_myself();
     int extra = in->get_nref() - 1;
     if (extra > 0) {
       client->put_inode(in, extra);
@@ -564,8 +596,15 @@ int ClientCaps::adjust_caps_used_for_lazyio(int used, int issued, int implemente
 void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
 {
   std::unique_lock<Inode> in_lock(*in);
-  unsigned wanted = in->caps_wanted();
-  unsigned used = get_caps_used(in.get());
+  unsigned wanted;
+  unsigned used;
+  if (client->is_unmounting()) {
+    wanted = 0;
+    used = 0;
+  } else {
+    wanted = in->caps_wanted();
+    used = get_caps_used(in.get());
+  }
   unsigned cap_used;
 
   int implemented;
@@ -1173,7 +1212,7 @@ void ClientCaps::remove_session_caps(MetaSession *s, int err)
   s->with_flushing_caps_tids([](auto& tids) {
     tids.clear();
   });
-  client->sync_cond.notify_all();
+  client->sync_cond.notify_all_sloppy();
 }
 
 void ClientCaps::trim_caps(MetaSession *s, uint64_t max)
@@ -1325,22 +1364,25 @@ void ClientCaps::adjust_session_flushing_caps(Inode *in, MetaSession *old_s,  Me
 
 void ClientCaps::flush_caps_sync()
 {
+  ceph_assert(!client->is_locked_by_me());
+
   ldout(cct, 10) << __func__ << dendl;
   for (auto &q : client->mds_sessions) {
     auto s = q.second;
-    // Snapshot dirty inodes before flushing: nested check_caps() or cap
-    // waiters may mark_caps_clean() other inodes still referenced by the
-    // xlist iterator and corrupt ++p (cur->_list assert).
-    std::vector<Inode*> dirty;
-    dirty.reserve(s->dirty_list.size());
-    for (auto p = s->dirty_list.begin(); !p.end(); ++p)
-      dirty.push_back(*p);
-
-    for (unsigned i = 0; i < dirty.size(); ++i) {
+    std::vector<Inode*> dirty_inodes;
+    s->with_dirty_list([&](auto& dirty_list) {
+      dirty_inodes.reserve(dirty_list.size());
+      for (auto p = dirty_list.begin(); !p.end(); ++p) {
+        dirty_inodes.push_back(*p);
+      }
+    });
+    for (size_t i = 0; i < dirty_inodes.size(); ++i) {
       unsigned flags = CHECK_CAPS_NODELAY;
-      if (i + 1 == dirty.size())
+      if (i + 1 == dirty_inodes.size()) {
         flags |= CHECK_CAPS_SYNCHRONOUS;
-      check_caps(dirty[i], flags);
+      }
+      std::scoped_lock in_lock(*dirty_inodes[i]);
+      check_caps(dirty_inodes[i], flags);
     }
   }
 }
