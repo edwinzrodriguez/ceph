@@ -11327,6 +11327,7 @@ int Client::lookup_name(Inode *ino, Inode *parent, const UserPerm& perms)
 Fh *Client::_create_fh(Inode *in, int flags, int cmode, const UserPerm& perms)
 {
   ceph_assert(in);
+  std::unique_lock in_lock(*in);
   Fh *f = new Fh(in, flags, cmode, fd_gen, perms);
 
   ldout(cct, 10) << __func__ << " " << in->ino << " mode " << cmode << dendl;
@@ -11344,13 +11345,15 @@ Fh *Client::_create_fh(Inode *in, int flags, int cmode, const UserPerm& perms)
   if (conf->client_readahead_max_bytes) {
     max_readahead = std::min(max_readahead, (uint64_t)conf->client_readahead_max_bytes);
   }
+  const uint64_t layout_period = in->layout.get_period();
+  const uint64_t layout_stripe_unit = in->layout.stripe_unit;
   if (conf->client_readahead_max_periods) {
-    max_readahead = std::min(max_readahead, in->layout.get_period()*(uint64_t)conf->client_readahead_max_periods);
+    max_readahead = std::min(max_readahead, layout_period*(uint64_t)conf->client_readahead_max_periods);
   }
   f->readahead.set_max_readahead_size(max_readahead);
   vector<uint64_t> alignments;
-  alignments.push_back(in->layout.get_period());
-  alignments.push_back(in->layout.stripe_unit);
+  alignments.push_back(layout_period);
+  alignments.push_back(layout_stripe_unit);
   f->readahead.set_alignments(alignments);
 
   return f;
