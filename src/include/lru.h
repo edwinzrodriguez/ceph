@@ -33,6 +33,7 @@ public:
   void lru_pin();
   void lru_unpin();
   bool lru_is_expireable() const { return !lru_pinned; }
+  bool lru_is_cached() const { return lru != nullptr; }
 
   friend class LRU;
 private:
