@@ -9,10 +9,13 @@
 #include "InodeRef.h"
 #include "Dir.h"
 
+class Client;
+
 class Dentry : public LRUObject {
 public:
   explicit Dentry(Dir *_dir, const std::string &_name) :
-    dir(_dir), name(_name), inode_xlist_link(this)
+    dir(_dir), name(_name), client(_dir->parent_inode->client),
+    inode_xlist_link(this)
   {
     auto r = dir->dentries.insert(make_pair(name, this));
     ceph_assert(r.second);
@@ -27,22 +30,15 @@ public:
    * ref==1 -> cached, unused
    * ref >1 -> pinned in lru
    */
-  void get() {
-    ceph_assert(ref > 0);
-    if (++ref == 2)
-      lru_pin();
-    //cout << "dentry.get on " << this << " " << name << " now " << ref << std::endl;
+  void get();
+  void put();
+  // Assign inode under client_lock; attach dentry list under inode_lock.
+  void link_assign_inode(InodeRef in) {
+    inode = std::move(in);
   }
-  void put() {
-    ceph_assert(ref > 0);
-    if (--ref == 1)
-      lru_unpin();
-    //cout << "dentry.put on " << this << " " << name << " now " << ref << std::endl;
-    if (ref == 0)
-      delete this;
-  }
-  void link(InodeRef in) {
-    inode = in;
+  void link_attach() {
+    ceph_assert(inode);
+    ceph_assert(ceph_mutex_is_locked_by_me(*inode));
     inode->dentries.push_back(&inode_xlist_link);
     if (inode->is_dir()) {
       if (inode->dir)
@@ -50,19 +46,23 @@ public:
       if (inode->ll_ref)
         get(); // ll_ref -> dn pin
     }
-    dir->num_null_dentries--;
   }
   void unlink(void) {
+    if (!inode || !dir)
+      return;
+    Dir *d = dir;
     if (inode->is_dir()) {
       if (inode->dir)
         put(); // dir -> dn pin
       if (inode->ll_ref)
         put(); // ll_ref -> dn pin
     }
-    ceph_assert(inode_xlist_link.get_list() == &inode->dentries);
-    inode_xlist_link.remove_myself();
+    if (inode_xlist_link.is_on_list()) {
+      ceph_assert(inode_xlist_link.get_list() == &inode->dentries);
+      inode_xlist_link.remove_myself();
+    }
     inode.reset();
-    dir->num_null_dentries++;
+    d->num_null_dentries++;
   }
   void mark_primary() {
     if (inode && inode->dentries.front() != this)
@@ -98,6 +98,7 @@ public:
 
   Dir	   *dir;
   const std::string name;
+  Client    *client;
   InodeRef inode;
   int	   ref = 1; // 1 if there's a dir beneath me.
   int64_t offset = 0;

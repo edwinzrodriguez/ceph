@@ -5,11 +5,30 @@
 #include "include/utime.h"
 
 #include "Dentry.h"
+#include "Client.h"
 #include "Dir.h"
 #include "Inode.h"
 
 #include "common/Formatter.h"
 #include "common/strescape.h"
+
+void Dentry::get()
+{
+  std::scoped_lock<Client> l(*client);
+  ceph_assert(ref > 0);
+  if (++ref == 2)
+    lru_pin();
+}
+
+void Dentry::put()
+{
+  std::scoped_lock<Client> l(*client);
+  ceph_assert(ref > 0);
+  if (--ref == 1)
+    lru_unpin();
+  if (ref == 0)
+    delete this;
+}
 
 void Dentry::dump(Formatter *f) const
 {
@@ -33,18 +52,20 @@ void Dentry::print(std::ostream& os) const
   os << dir->parent_inode->vino();
   os << "[";
   os << "\"" << binstrprint(name) << "\"";
-  if (!alternate_name.empty()) {
-    os << " altn=\"" << binstrprint(alternate_name, 16) << "\"";
-  }
-  os << " ref=" << ref;
-  if (inode) {
-    os << " ino=" << inode->vino();
-  } else {
-    os << " ino=nil";
-  }
-  os << " csg=" << cap_shared_gen;
-  if (is_renaming) {
-    os << " is_renaming=true";
+  if (client->get_client_lock().is_locked_by_me()) {
+    if (!alternate_name.empty()) {
+      os << " altn=\"" << binstrprint(alternate_name, 16) << "\"";
+    }
+    os << " ref=" << ref;
+    if (inode) {
+      os << " ino=" << inode->vino();
+    } else {
+      os << " ino=nil";
+    }
+    os << " csg=" << cap_shared_gen;
+    if (is_renaming) {
+      os << " is_renaming=true";
+    }
   }
   os << "]";
 }
