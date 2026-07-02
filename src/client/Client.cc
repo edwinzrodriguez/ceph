@@ -5233,10 +5233,16 @@ bool Client::_flush(Inode *in, Context *onfinish)
 
   int64_t pool_id = 0;
   bool has_dirty = false;
-  {
+  auto read_oset_state = [&]() {
     std::scoped_lock<Inode> il(*in);
     pool_id = in->layout.pool_id;
     has_dirty = in->oset.dirty_or_tx;
+  };
+  if (is_locked_by_me()) {
+    ceph::unique_unlock<Client> cl_drop(*this);
+    read_oset_state();
+  } else {
+    read_oset_state();
   }
 
   if (!has_dirty) {
@@ -8280,7 +8286,6 @@ int Client::do_link(const char *relexisting, const char *relpath, const UserPerm
   tout(cct) << relexisting << std::endl;
   tout(cct) << relpath << std::endl;
 
-  std::scoped_lock lock(client_lock);
   return _link(cwd.get(), relexisting, cwd.get(), relpath, perm, std::move(alternate_name));
 }
 
@@ -8348,11 +8353,13 @@ int Client::do_mkdirat(int dirfd, const char *relpath, mode_t mode, const UserPe
 
   const auto path = filepath(relpath, {.drop_trailing = true});
 
-  std::scoped_lock lock(client_lock);
   InodeRef dirinode;
-  int r = get_fd_inode(dirfd, &dirinode);
-  if (r < 0) {
-    return r;
+  {
+    std::scoped_lock lock(client_lock);
+    int r = get_fd_inode(dirfd, &dirinode);
+    if (r < 0) {
+      return r;
+    }
   }
 
   walk_dentry_result wdr;
@@ -8376,7 +8383,6 @@ int Client::mkdirs(const char *relpath, mode_t mode, const UserPerm& perms)
 
   const auto path = filepath(relpath, {.drop_trailing = true});
 
-  std::scoped_lock lock(client_lock);
   for (;;) {
     walk_dentry_result wdr;
     if (int rc = path_walk(cwd, path, &wdr, perms, {.followsym = false}); rc < 0) {
@@ -8416,7 +8422,6 @@ int Client::mknod(const char *relpath, mode_t mode, const UserPerm& perms, dev_t
   tout(cct) << mode << std::endl;
   tout(cct) << rdev << std::endl;
 
-  std::scoped_lock lock(client_lock);
   return _mknod(cwd.get(), relpath, mode, rdev, perms);
 }
 
@@ -8435,11 +8440,12 @@ int Client::do_symlinkat(const char *target, int dirfd, const char *relpath, con
   tout(cct) << dirfd << std::endl;
   tout(cct) << relpath << std::endl;
 
-  std::scoped_lock lock(client_lock);
-
   InodeRef dirinode;
-  if (int rc = get_fd_inode(dirfd, &dirinode); rc < 0) {
-    return rc;
+  {
+    std::scoped_lock lock(client_lock);
+    if (int rc = get_fd_inode(dirfd, &dirinode); rc < 0) {
+      return rc;
+    }
   }
   return _symlink(dirinode.get(), relpath, target, perms, std::move(alternate_name), 0, fscrypt_options);
 }
@@ -8526,6 +8532,20 @@ int without_inode_lock_if_held(Inode *in, Fn&& fn)
 {
   if (in && in->is_locked_by_me()) {
     ceph::unique_unlock<Inode> drop(*in);
+    return fn();
+  }
+  return fn();
+}
+
+template<typename Fn>
+auto without_conflicting_lock_for_quota(Client *cl, Inode *in, Fn&& fn)
+{
+  if (in && in->is_locked_by_me()) {
+    ceph::unique_unlock<Inode> drop(*in);
+    return fn();
+  }
+  if (cl && cl->is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*cl);
     return fn();
   }
   return fn();
@@ -8690,11 +8710,15 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
   if (in->snapid != CEPH_NOSNAP) {
     return -EROFS;
   }
-  if ((mask & CEPH_SETATTR_SIZE) &&
-      (uint64_t)stx->stx_size > in->effective_size() &&
-      is_quota_bytes_exceeded(in, (uint64_t)stx->stx_size - in->effective_size(),
-			      perms)) {
-    return -EDQUOT;
+  if (mask & CEPH_SETATTR_SIZE) {
+    const uint64_t new_bytes = (uint64_t)stx->stx_size - in->effective_size();
+    if ((uint64_t)stx->stx_size > in->effective_size()) {
+      if (without_conflicting_lock_for_quota(this, in, [&] {
+	    return is_quota_bytes_exceeded(in, new_bytes, perms);
+	  })) {
+	return -EDQUOT;
+      }
+    }
   }
 
   // Can't set fscrypt_auth and file at the same time!
@@ -12737,7 +12761,12 @@ int64_t Client::_write_success(Fh *f, utime_t start, uint64_t fpos,
     in->size = totalwritten + offset;
     in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
-    if (is_quota_bytes_approaching(in, f->actor_perms)) {
+    bool quota_approaching = false;
+    {
+      ceph::unique_unlock<Inode> in_unlock(*in);
+      quota_approaching = is_quota_bytes_approaching(in, f->actor_perms);
+    }
+    if (quota_approaching) {
       check_caps(in, CHECK_CAPS_NODELAY);
     } else if (ClientCaps::is_max_size_approaching(in)) {
       check_caps(in, 0);
@@ -13359,9 +13388,12 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
 
   // check quota
   uint64_t endoff = offset + size;
-  if (endoff > in->size && is_quota_bytes_exceeded(in, endoff - in->size,
-						   f->actor_perms)) {
-    return -EDQUOT;
+  if (endoff > in->size) {
+    const int64_t new_bytes = endoff - in->size;
+    ceph::unique_unlock<Inode> in_unlock(*in);
+    if (is_quota_bytes_exceeded(in, new_bytes, f->actor_perms)) {
+      return -EDQUOT;
+    }
   }
 
   //bool lazy = f->mode == CEPH_FILE_MODE_LAZY;
@@ -16909,11 +16941,6 @@ int Client::_mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& p
     return -EEXIST;
   }
 
-  if (should_check_perms()) {
-    if (int rc = may_create(wdr.diri, perm); rc < 0) {
-      return rc;
-    }
-  }
   if (wdr.diri->snapid != CEPH_NOSNAP && wdr.diri->snapid != CEPH_SNAPDIR) {
     return -EROFS;
   }
@@ -16921,8 +16948,18 @@ int Client::_mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& p
     return -EDQUOT;
   }
 
+  MetaRequest *req = nullptr;
+  int res = 0;
+  {
+    std::unique_lock in_lock(*wdr.diri);
+    if (should_check_perms()) {
+      if (int rc = may_create(wdr.diri, perm); rc < 0) {
+	return rc;
+      }
+    }
+
   bool is_snap_op = wdr.diri->snapid == CEPH_SNAPDIR;
-  MetaRequest *req = new MetaRequest(is_snap_op ?
+  req = new MetaRequest(is_snap_op ?
 				     CEPH_MDS_OP_MKSNAP : CEPH_MDS_OP_MKDIR);
 
   if (!is_snap_op)
@@ -16944,7 +16981,7 @@ int Client::_mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& p
 
   mode |= S_IFDIR;
   bufferlist bl;
-  int res = _posix_acl_create(wdr.diri, &mode, bl, perm);
+  res = _posix_acl_create(wdr.diri, &mode, bl, perm);
   if (res < 0) {
     put_request(req);
     return res;
@@ -16961,6 +16998,7 @@ int Client::_mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& p
   }
   if (bl.length() > 0) {
     req->set_data(bl);
+  }
   }
 
   req->set_dentry(wdr.dn);
@@ -18368,8 +18406,6 @@ int Client::clear_suid_sgid(Inode *in, const UserPerm& perms, bool defer)
 
 int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 {
-  ceph_assert(client_lock.is_locked_by_me());
-
   if (offset < 0 || length <= 0)
     return -EINVAL;
 
@@ -18380,6 +18416,7 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
     return -EOPNOTSUPP;
 
   Inode *in = fh->inode.get();
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
 
   if (objecter->osdmap_pool_full(in->layout.pool_id) &&
       !(mode & FALLOC_FL_PUNCH_HOLE)) {
@@ -18394,9 +18431,12 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
 
   uint64_t size = offset + length;
   if (!(mode & (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)) &&
-      size > in->size &&
-      is_quota_bytes_exceeded(in, size - in->size, fh->actor_perms)) {
-    return -EDQUOT;
+      size > in->size) {
+    const int64_t new_bytes = size - in->size;
+    ceph::unique_unlock<Inode> in_unlock(*in);
+    if (is_quota_bytes_exceeded(in, new_bytes, fh->actor_perms)) {
+      return -EDQUOT;
+    }
   }
 
   int have;
@@ -18455,9 +18495,10 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
       in->change_attr++;
       in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
-      client_lock.unlock();
-      onfinish.wait();
-      client_lock.lock();
+      {
+	ceph::unique_unlock<Inode> in_unlock(*in);
+	onfinish.wait();
+      }
       put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
     }
   } else if (!(mode & FALLOC_FL_KEEP_SIZE)) {
@@ -18474,8 +18515,13 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
       in->change_attr++;
       in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
-      if (is_quota_bytes_approaching(in, fh->actor_perms)) {
-        check_caps(in, CHECK_CAPS_NODELAY);
+      bool quota_approaching = false;
+      {
+	ceph::unique_unlock<Inode> in_unlock(*in);
+	quota_approaching = is_quota_bytes_approaching(in, fh->actor_perms);
+      }
+      if (quota_approaching) {
+	check_caps(in, CHECK_CAPS_NODELAY);
       } else if (ClientCaps::is_max_size_approaching(in)) {
 	check_caps(in, 0);
       }
@@ -18483,9 +18529,11 @@ int Client::_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
   }
 
   if (nullptr != onuninline) {
-    client_lock.unlock();
-    int ret = onuninline->wait();
-    client_lock.lock();
+    int ret = 0;
+    {
+      ceph::unique_unlock<Inode> in_unlock(*in);
+      ret = onuninline->wait();
+    }
 
     if (ret >= 0 || ret == -ECANCELED) {
       in->inline_data.clear();
@@ -18510,7 +18558,7 @@ int Client::ll_fallocate(Fh *fh, int mode, int64_t offset, int64_t length)
   tout(cct) << __func__ << " " << mode << " " << offset << " " << length << std::endl;
   tout(cct) << (uintptr_t)fh << std::endl;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock lock(*(fh->inode));
   return _fallocate(fh, mode, offset, length);
 }
 
@@ -18522,7 +18570,6 @@ int Client::fallocate(int fd, int mode, loff_t offset, loff_t length)
 
   tout(cct) << __func__ << " " << fd << mode << " " << offset << " " << length << std::endl;
 
-  std::scoped_lock lock(client_lock);
   Fh *fh = get_filehandle(fd);
   if (!fh)
     return -EBADF;
@@ -18530,6 +18577,7 @@ int Client::fallocate(int fd, int mode, loff_t offset, loff_t length)
   if (fh->flags & O_PATH)
     return -EBADF;
 #endif
+  std::scoped_lock lock(*(fh->inode));
   return _fallocate(fh, mode, offset, length);
 }
 
@@ -19046,12 +19094,21 @@ Inode *Client::get_quota_root(Inode *in, const UserPerm& perms, quota_max_t type
   while (realm) {
     ldout(cct, 10) << __func__ << " realm " << realm->ino << dendl;
     if (realm->ino != in->ino) {
-      auto p = inode_map.find(vinodeno_t(realm->ino, CEPH_NOSNAP));
-      if (p == inode_map.end())
-	break;
-
-      if (p->second->quota.is_enabled(type)) {
-	quota_in = p->second;
+      Inode *candidate = nullptr;
+      {
+	std::scoped_lock<Client> cl(*this);
+	auto p = inode_map.find(vinodeno_t(realm->ino, CEPH_NOSNAP));
+	if (p == inode_map.end())
+	  break;
+	candidate = p->second;
+      }
+      bool enabled = false;
+      {
+	std::scoped_lock<Inode> realm_in_lock(*candidate);
+	enabled = candidate->quota.is_enabled(type);
+      }
+      if (enabled) {
+	quota_in = candidate;
 	break;
       }
     }
@@ -19073,15 +19130,20 @@ bool Client::check_quota_condition(Inode *in, const UserPerm& perms,
 
   while (true) {
     ceph_assert(in != NULL);
-    if (test(*in)) {
-      return true;
+    {
+      std::scoped_lock<Inode> in_lock(*in);
+      if (test(*in)) {
+	return true;
+      }
     }
 
     if (in == root_ancestor) {
       // We're done traversing, drop out
       return false;
     } else {
-      // Continue up the tree
+      // Continue up the tree.  Do not hold any inode_lock here:
+      // get_quota_root may lock quota ancestors while path_walk holds
+      // parent/child locks in the opposite order.
       in = get_quota_root(in, perms);
     }
   }
@@ -19109,20 +19171,18 @@ bool Client::is_quota_bytes_exceeded(Inode *in, int64_t new_bytes,
 
 bool Client::is_quota_bytes_approaching(Inode *in, const UserPerm& perms)
 {
-  ceph_assert(in->size >= in->reported_size);
-  const uint64_t size = in->size - in->reported_size;
   return check_quota_condition(in, perms,
-      [&size](const Inode &in) {
-        if (in.quota.max_bytes) {
-          if (in.rstat.rbytes >= in.quota.max_bytes) {
-            return true;
-          }
-
-          const uint64_t space = in.quota.max_bytes - in.rstat.rbytes;
-          return (space >> 4) < size;
-        } else {
+      [](const Inode &in) {
+        if (!in.quota.max_bytes) {
           return false;
         }
+        ceph_assert(in.size >= in.reported_size);
+        const uint64_t pending = in.size - in.reported_size;
+        if (in.rstat.rbytes >= in.quota.max_bytes) {
+          return true;
+        }
+        const uint64_t space = in.quota.max_bytes - in.rstat.rbytes;
+        return (space >> 4) < pending;
       });
 }
 
