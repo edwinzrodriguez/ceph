@@ -445,13 +445,19 @@ bool Inode::have_valid_size()
 // open Dir for an inode.  if it's not open, allocated it (and pin dentry in memory).
 Dir *Inode::open_dir()
 {
+  std::unique_lock<Inode> in_lock(*this);
   if (!dir) {
     dir = new Dir(this);
     lsubdout(client->cct, client, 15) << "open_dir " << dir << " on " << this << dendl;
     ceph_assert(dentries.size() < 2); // dirs can't be hard-linked
+    Dentry *parent_dn = nullptr;
     if (!dentries.empty())
-      get_first_parent()->get();      // pin dentry
-    iget();                  // pin inode
+      parent_dn = get_first_parent();
+    iget();
+    if (parent_dn) {
+      ceph::unique_unlock<Inode> u(*this);
+      parent_dn->get();
+    }
   }
   return dir;
 }

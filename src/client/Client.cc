@@ -648,6 +648,18 @@ Inode *Client::get_root()
   return root.get();
 }
 
+InodeRef Client::get_root_ref()
+{
+  std::scoped_lock<Client> lock(*this);
+  return root;
+}
+
+InodeRef Client::get_cwd_ref()
+{
+  std::scoped_lock<Client> lock(*this);
+  return cwd;
+}
+
 
 // debug crapola
 
@@ -999,6 +1011,11 @@ void Client::update_io_stat_write(utime_t latency) {
 
 void Client::trim_cache(bool trim_kernel_dcache)
 {
+  const bool held = is_locked_by_me();
+  std::unique_lock<Client> lock(*this, std::defer_lock);
+  if (!held) {
+    lock.lock();
+  }
   uint64_t max = cct->_conf->client_cache_size;
   ldout(cct, 20) << "trim_cache size " << lru.lru_get_size() << " max " << max << dendl;
   unsigned last = 0;
@@ -1009,8 +1026,26 @@ void Client::trim_cache(bool trim_kernel_dcache)
 
     // trim!
     Dentry *dn = static_cast<Dentry*>(lru.lru_get_next_expire());
-    if (!dn)
+    if (!dn) {
+      // During unmount, pinned dentries of open-but-empty directories
+      // block progress. Force-close one to unpin its dentry, then retry.
+      if (is_unmounting()) {
+        bool found = false;
+        for (auto& [vino, in] : inode_map) {
+          if (in->dir && in->dir->is_empty()) {
+            ldout(cct, 10) << "trim_cache force-closing empty dir on " << *in << dendl;
+            close_dir(in->dir);
+            found = true;
+            break;
+          }
+        }
+        if (found) {
+          last = 0;  // force the outer while to retry
+          continue;
+        }
+      }
       break;  // done
+    }
 
     trim_dentry(dn);
   }
@@ -1057,15 +1092,27 @@ void Client::trim_cache_for_reconnect(MetaSession *s)
 
 void Client::trim_dentry(Dentry *dn)
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
+  if (!dn->dir) {
+    ldout(cct, 15) << "trim_dentry skipping already-detached dn " << dn->name
+		   << dendl;
+    if (dn->lru_is_cached())
+      lru.lru_remove(dn);
+    return;
+  }
   ldout(cct, 15) << "trim_dentry unlinking dn " << dn->name 
 		 << " in dir "
 		 << std::hex << dn->dir->parent_inode->ino << std::dec
 		 << dendl;
   if (dn->inode) {
     Inode *diri = dn->dir->parent_inode;
+    // clear_dir_complete_and_ordered takes inode_lock and then re-acquires
+    // client_lock; drop client_lock first so ms_dispatch/_put_inode cannot
+    // block unmount behind finisher wait while we hold a dir inode_lock.
+    ceph::unique_unlock<Client> ulock(*this);
     clear_dir_complete_and_ordered(diri, true);
   }
-  unlink(dn, false, false);  // drop dir, drop dentry
+  unlink_locked(dn, false, false);  // drop dir, drop dentry
 }
 
 
@@ -4260,27 +4307,36 @@ void Client::close_dir(Dir *dir)
    */
 Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
 {
+  std::unique_lock<Client> cl(*this);
   if (!dn) {
-    // create a new Dentry
-    dn = new Dentry(dir, name);
+    // Another thread may have created the dentry while we waited for locks.
+    auto it = dir->dentries.find(name);
+    if (it != dir->dentries.end()) {
+      dn = it->second;
+      ensure_dentry_lru(dn);
+    } else {
+      dn = new Dentry(dir, name);
+      ensure_dentry_lru(dn);
+    }
 
-    lru.lru_insert_mid(dn);    // mid or top?
-
-    if(in) {
-      ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' to inode " << *in
-		     << " dn " << *dn << " (new dn)" << dendl;
+    if (in) {
+      ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' to inode "
+		     << in->vino() << " dn " << *dn << " (new dn)" << dendl;
     } else {
       ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' "
         << " dn " << *dn << " (new dn)" << dendl;
     }
   } else {
     ceph_assert(!dn->inode);
+    ensure_dentry_lru(dn);
     ldout(cct, 15) << "link dir " << *dir->parent_inode << " '" << name << "' to inode " << in
 		   << " dn " << *dn << " (old dn)" << dendl;
   }
 
   if (in) {    // link to inode
     InodeRef tmp_ref;
+    cl.unlock();
+    std::unique_lock in_lock(*in);
     // only one parent for directories!
     if (in->is_dir() && !in->dentries.empty()) {
       tmp_ref = in; // prevent unlink below from freeing the inode.
@@ -4288,10 +4344,21 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
       ceph_assert(olddn->dir != dir || olddn->name != name);
       Inode *old_diri = olddn->dir->parent_inode;
       clear_dir_complete_and_ordered(old_diri, true);
+      in_lock.unlock();
       unlink(olddn, true, true);  // keep dir, dentry
+      in_lock.lock();
     }
 
-    dn->link(in);
+    in_lock.unlock();
+    cl.lock();
+    dn->link_assign_inode(in);
+    cl.unlock();
+    in_lock.lock();
+    dn->link_attach();
+    in_lock.unlock();
+
+    cl.lock();
+    dir->num_null_dentries--;
     inc_dentry_nr();
     ldout(cct, 20) << "link  inode " << in << " parents now " << in->dentries << dendl;
   }
@@ -4299,20 +4366,25 @@ Dentry* Client::link(Dir *dir, const string& name, Inode *in, Dentry *dn)
   return dn;
 }
 
-void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
+void Client::unlink_locked(Dentry *dn, bool keepdir, bool keepdentry)
 {
-  InodeRef in(dn->inode);
-  // Keep the dentry alive for the duration of this function.
-  // Without the O_DIRECTORY dentry pin (PR #60909), a directory dentry can
-  // remain at ref=1 while its inode->dir is still active. When trim_cache()
-  // evicts it, Dentry::unlink() calls put() for the dir pin, dropping ref
-  // to 0 and freeing the dentry while we still need it for detach/lru_remove.
-  // The DentryRef guard prevents use-after-free regardless of pin state.
-  // See: https://tracker.ceph.com/issues/74625
-  DentryRef dnref(dn);
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
 
-  ldout(cct, 15) << "unlink dir " << dn->dir->parent_inode << " '" << dn->name << "' dn " << dn
-		 << " inode " << dn->inode << dendl;
+  // Capture the parent dir now; another trim may detach this dentry before
+  // we finish, but only while m_client_lock is held.
+  Dir *dir = dn->dir;
+
+  if (!keepdentry && !dir) {
+    if (dn->lru_is_cached())
+      lru.lru_remove(dn);
+    return;
+  }
+
+  InodeRef in(dn->inode);
+  if (dir) {
+    ldout(cct, 15) << "unlink dir " << dir->parent_inode << " '" << dn->name
+		   << "' dn " << dn << " inode " << dn->inode << dendl;
+  }
 
   // unlink from inode
   if (dn->inode) {
@@ -4320,24 +4392,36 @@ void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
     dec_dentry_nr();
     ldout(cct, 20) << "unlink  inode " << in << " parents now " << in->dentries << dendl;
   }
-  ceph_assert(dn->ref > 1);
 
   if (keepdentry) {
     dn->lease_mds = -1;
   } else {
     ldout(cct, 15) << "unlink  removing '" << dn->name << "' dn " << dn << dendl;
 
-    // unlink from dir
-    Dir *dir = dn->dir;
-    dn->detach();
+    if (!dir) {
+      // Already detached; drop any LRU pin only.
+      if (dn->lru_is_cached())
+	lru.lru_remove(dn);
+      if (dn->ref > 0)
+	dn->put();
+    } else {
+      dn->detach();
+      lru.lru_remove(dn);
+      dn->put();
+    }
 
-    // delete den
-    lru.lru_remove(dn);
-    dn->put();
-
-    if (dir->is_empty() && !keepdir)
-      close_dir(dir);
+    if (dir && dir->is_empty() && !keepdir) {
+      Inode *diri = dir->parent_inode;
+      if (diri && diri->dir == dir)
+	close_dir(dir);
+    }
   }
+}
+
+void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
+{
+  std::unique_lock<Client> cl(*this);
+  unlink_locked(dn, keepdir, keepdentry);
 }
 
 Client::ClientLockIfNeeded::ClientLockIfNeeded(Client *clnt)
@@ -4720,11 +4804,10 @@ void Client::early_kick_flushing_caps(MetaSession *session)
 
 void Client::wait_on_list(list<ceph::reentrant_condition_variable*>& ls)
 {
+  std::unique_lock<Client> l{*this};
   ceph::reentrant_condition_variable cond;
   ls.push_back(&cond);
-  std::unique_lock l{client_lock, std::adopt_lock};
-  cond.wait(l);
-  l.release();
+  ceph::client_lock::wait_on(*this, cond, l);
   ls.remove(&cond);
 }
 
@@ -6880,6 +6963,7 @@ int Client::mount(const std::string &mount_root, const UserPerm& perms,
   }
 
   ceph_assert(root);
+  cl.unlock();
   _ll_get(root.get());
 
   // trace?
@@ -7628,38 +7712,60 @@ int Client::_do_lookup(const InodeRef& dir, const string& name, int mask,
   return r;
 }
 
-bool Client::_dentry_valid(const Dentry *dn)
+bool Client::_dentry_lease_valid(mds_rank_t lease_mds, utime_t lease_ttl,
+				 uint64_t lease_gen)
 {
-  ceph_assert(client_lock.is_locked_by_me());
-
-  // is dn lease valid?
   utime_t now = ceph_clock_now();
-  if (dn->lease_mds >= 0 && dn->lease_ttl > now) {
-    if (auto it = mds_sessions.find(dn->lease_mds); it != mds_sessions.end()) {
-      auto s = it->second;
-      if (s->cap_ttl > now && s->cap_gen == dn->lease_gen) {
-        dlease_hit();
-        return true;
-      }
+  if (lease_mds < 0 || lease_ttl <= now) {
+    dlease_miss();
+    return false;
+  }
 
-      ldout(cct, 20) << " bad lease, cap_ttl " << s->cap_ttl << ", cap_gen " << s->cap_gen
-                     << " vs lease_gen " << dn->lease_gen << dendl;
+  std::scoped_lock<Client> cl(*this);
+  if (auto it = mds_sessions.find(lease_mds); it != mds_sessions.end()) {
+    auto s = it->second;
+    if (s->cap_lease_valid(lease_gen)) {
+      dlease_hit();
+      return true;
     }
+
+    std::scoped_lock s_lock(s->session_lock);
+    ldout(cct, 20) << " bad lease, cap_ttl " << s->cap_ttl << ", cap_gen " << s->cap_gen
+		   << " vs lease_gen " << lease_gen << dendl;
   }
 
   dlease_miss();
   return false;
 }
 
+void Client::ensure_dentry_lru(Dentry *dn)
+{
+  if (dn->lru_is_cached())
+    return;
+  ceph::unique_unlock<Inode> in_lock(*(dn->dir->parent_inode));
+  std::unique_lock<Client> lock(*this);
+  if (!dn->lru_is_cached())
+    lru.lru_insert_mid(dn);
+}
+
 int Client::_lookup(const InodeRef& dir, const std::string& name, std::string& alternate_name, int mask, InodeRef *target, const UserPerm& perms, bool is_rename)
 {
   int r = 0;
   Dentry *dn = NULL;
+  InodeRef dn_inode;
+  mds_rank_t dn_lease_mds = -1;
+  utime_t dn_lease_ttl;
+  ceph_seq_t dn_lease_seq = 0;
+  uint64_t dn_lease_gen = 0;
+  int dn_cap_shared_gen = -1;
+  bool dn_is_renaming = false;
+  std::string dn_alternate_name;
   bool did_lookup_request = false;
   // can only request shared caps
   mask &= CEPH_CAP_ANY_SHARED | CEPH_STAT_RSTAT;
   std::string dname = name;
 
+  std::unique_lock dir_lock(*dir);
   if (!dir->is_dir()) {
     r = -ENOTDIR;
     goto done;
@@ -7672,6 +7778,7 @@ int Client::_lookup(const InodeRef& dir, const std::string& name, std::string& a
       req->set_filepath(path);
 
       InodeRef tmptarget;
+      dir_lock.unlock();
       int r = make_request(req, perms, &tmptarget, NULL, rand() % mdsmap->get_num_in_mds());
 
       if (r == 0) {
@@ -7708,42 +7815,78 @@ int Client::_lookup(const InodeRef& dir, const std::string& name, std::string& a
   }
 
 relookup:
-
+  dn = NULL;
+  dn_inode.reset();
+  dn_lease_mds = -1;
+  dn_lease_seq = 0;
+  dn_lease_gen = 0;
+  dn_cap_shared_gen = -1;
+  dn_is_renaming = false;
+  dn_alternate_name.clear();
   if (dir->dir) {
-    auto it = dir->dir->dentries.find(dname);
-    dn = it != dir->dir->dentries.end() ? it->second : nullptr;
+    Dir *d = dir->dir;
+    dir_lock.unlock();
+    {
+      std::scoped_lock<Client> cl(*this);
+      auto it = d->dentries.find(dname);
+      if (it != d->dentries.end()) {
+	dn = it->second;
+	dn_inode = dn->inode;
+	dn_lease_mds = dn->lease_mds;
+	dn_lease_ttl = dn->lease_ttl;
+	dn_lease_seq = dn->lease_seq;
+	dn_lease_gen = dn->lease_gen;
+	dn_cap_shared_gen = dn->cap_shared_gen;
+	dn_is_renaming = dn->is_renaming;
+	dn_alternate_name = dn->alternate_name;
+      }
+    }
+    dir_lock.lock();
   }
 
   if (dn) {
 
-    ldout(cct, 20) << __func__ << " have " << *dn << " from mds." << dn->lease_mds
-        << " ttl " << dn->lease_ttl << " seq " << dn->lease_seq << dendl;
+    ldout(cct, 20) << __func__ << " have dn '" << dname << "' from mds." << dn_lease_mds
+		   << " ttl " << dn_lease_ttl << " seq " << dn_lease_seq << dendl;
 
-    if (!dn->inode || dn->inode->caps_issued_mask(mask, true)) {
+    bool has_caps = false;
+    if (dn_inode) {
+      std::unique_lock dn_lock(*dn_inode);
+      has_caps = dn_inode->caps_issued_mask(mask, true);
+    }
+
+    if (!dn_inode || has_caps) {
       ldout(cct, 25) << __func__ << " no inode or have caps" << dendl;
 
-      if (_dentry_valid(dn)) {
+      dir_lock.unlock();
+      bool dentry_lease_ok = _dentry_lease_valid(dn_lease_mds, dn_lease_ttl,
+						 dn_lease_gen);
+      dir_lock.lock();
+      if (dentry_lease_ok) {
         ldout(cct, 25) << __func__ << " dentry is valid" << dendl;
         // touch this mds's dir cap too, even though we don't _explicitly_ use it here, to
         // make trim_caps() behave.
-        dir->try_touch_cap(dn->lease_mds);
+          dir->try_touch_cap(dn_lease_mds);
           goto hit_dn;
       }
+
       // dir shared caps?
-      if (dir->caps_issued_mask(CEPH_CAP_FILE_SHARED, true)) {
+      bool dir_has_caps = dir->caps_issued_mask(CEPH_CAP_FILE_SHARED, true);
+
+      if (dir_has_caps) {
         ldout(cct, 25) << __func__ << " dir has Fs" << dendl;
-	if (dn->cap_shared_gen == dir->shared_gen) {
+	if (dn_cap_shared_gen == dir->shared_gen) {
           ldout(cct, 25) << __func__ << " valid shared_gen match" << dendl;
 	  goto hit_dn;
         }
-	if (!dn->inode && (dir->flags & I_COMPLETE)) {
+	if (!dn_inode && (dir->flags & I_COMPLETE)) {
 	  ldout(cct, 10) << __func__ << " concluded ENOENT locally for "
 			 << *dir << " dn '" << dname << "'" << dendl;
 	  return -ENOENT;
 	}
       }
     } else {
-      ldout(cct, 20) << " no cap on " << dn->inode->vino() << dendl;
+      ldout(cct, 20) << " no cap on " << dn_inode->vino() << dendl;
     }
 
     // In rare case during the rename if another thread tries to
@@ -7751,11 +7894,13 @@ relookup:
     // that both src dentry and dst dentry will link to the same
     // inode at the same time.
     // Will wait the rename to finish and try it again.
-    if (!is_rename && dn->is_renaming) {
+    if (!is_rename && dn_is_renaming) {
       ldout(cct, 1) << __func__ << " dir " << *dir
                     << " rename is on the way, will wait for dn '"
                     << dname << "'" << dendl;
+      dir_lock.unlock();
       wait_on_list(waiting_for_rename);
+      dir_lock.lock();
       goto relookup;
     }
   } else {
@@ -7771,7 +7916,11 @@ relookup:
     r = 0;
     goto done;
   }
+
+  dir_lock.unlock();
   r = _do_lookup(dir, dname, mask, target, perms);
+  dir_lock.lock();
+
   did_lookup_request = true;
   if (r == 0) {
     /* complete lookup to get dentry for alternate_name */
@@ -7781,9 +7930,9 @@ relookup:
   }
 
  hit_dn:
-  if (dn->inode) {
-    *target = dn->inode;
-    alternate_name = dn->alternate_name;
+  if (dn_inode) {
+    *target = dn_inode;
+    alternate_name = dn_alternate_name;
   } else {
     r = -ENOENT;
   }
@@ -7800,14 +7949,18 @@ relookup:
 
 Dentry *Client::get_or_create(Inode *dir, const std::string& name)
 {
-  // lookup
   ldout(cct, 20) << __func__ << " " << *dir << " name " << name << dendl;
-  dir->open_dir();
-  auto it = dir->dir->dentries.find(name);
-  if (it != dir->dir->dentries.end())
+  Dir *d = dir->open_dir();
+
+  std::unique_lock<Client> cl(*this);
+  auto it = d->dentries.find(name);
+  if (it != d->dentries.end()) {
+    ensure_dentry_lru(it->second);
     return it->second;
-  else // otherwise link up a new one
-    return link(dir->dir, name, NULL, NULL);
+  }
+  Dentry *dn = new Dentry(d, name);
+  ensure_dentry_lru(dn);
+  return dn;
 }
 
 int Client::walk(std::string_view path, walk_dentry_result* wdr, const UserPerm& perms, bool followsym)
@@ -7818,8 +7971,7 @@ int Client::walk(std::string_view path, walk_dentry_result* wdr, const UserPerm&
 
   ldout(cct, 10) << __func__ << ": " << path << dendl;
 
-  std::scoped_lock lock(client_lock);
-  return path_walk(cwd, path, wdr, perms, {.followsym = followsym});
+  return path_walk(get_cwd_ref(), path, wdr, perms, {.followsym = followsym});
 }
 
 int Client::path_walk(InodeRef dirinode, const filepath& origpath, InodeRef *end, const UserPerm& perms, const PathWalk_ExtraOptions& extra_options)
@@ -7844,9 +7996,9 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
   auto& target = result->target;
   dn = DentryRef();
   if (origpath.absolute())
-    diri = root;
+    diri = get_root_ref();
   else if (!dirinode)
-    diri = cwd;
+    diri = get_cwd_ref();
   else {
     diri = std::move(dirinode);
   }
@@ -7857,8 +8009,8 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
   int symlinks = 0;
   unsigned i = 0;
 
-  if (trimmed_path == "") {
-    std::string trimmed_path = path.get_trimmed_path();
+  if (trimmed_path.empty()) {
+    trimmed_path = path.get_trimmed_path();
   }
 
   ldout(cct, 10) << __func__ << ": cur=" << *diri << " path=" << binstrprint(trimmed_path) << dendl;
@@ -7877,37 +8029,49 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
     ldout(cct, 10) << " " << i << " " << *diri << " " << binstrprint(dname) << dendl;
     ldout(cct, 20) << "  (path is " << binstrprint(trimmed_path) << ")" << dendl;
     InodeRef next;
-    if (!diri.get()->is_dir()) {
-      ldout(cct, 20) << diri.get() << " is not a dir inode, name " << dname.c_str() << dendl;
-      rc = -ENOTDIR;
-      goto out;
-    }
-    if (should_check_perms()) {
-      int r = may_lookup(diri.get(), perms);
-      if (r < 0) {
-        rc = r;
-        goto out;
+    {
+      std::unique_lock diri_lock(*diri);
+      if (!diri->is_dir()) {
+	ldout(cct, 20) << diri.get() << " is not a dir inode, name " << dname.c_str() << dendl;
+	rc = -ENOTDIR;
+	goto out;
       }
-      caps = CEPH_CAP_AUTH_SHARED;
     }
+    {
+      if (should_check_perms()) {
+	std::unique_lock in_lock(*diri);
+	int r = may_lookup(diri.get(), perms);
+	if (r < 0) {
+	  rc = r;
+	  goto out;
+	}
+	caps = CEPH_CAP_AUTH_SHARED;
+      }
 
-    if (dname.size() > NAME_MAX) {
-      rc = -ENAMETOOLONG;
-      goto out;
-    }
+      if (dname.size() > NAME_MAX) {
+	rc = -ENAMETOOLONG;
+	goto out;
+      }
 
-    // N.B.: we don't validate alternate_name we generate during wrapping
-    // matches the dentry. We probably should!
-    if (!_wrap_name(*diri, dname, alternate_name)) {
-      rc = -EACCES;
-      goto out;
-    }
+      // N.B.: we don't validate alternate_name we generate during wrapping
+      // matches the dentry. We probably should!
+      if (!_wrap_name(*diri, dname, alternate_name)) {
+	rc = -EACCES;
+	goto out;
+      }
 
-    dn = get_or_create(diri.get(), dname.c_str());
+      // get_or_create takes client_lock for dentry map ops; do not hold diri
+      // inode_lock here.  _lookup/_do_lookup may take client_lock (make_request).
+      if (i == (path.depth() - 1)) {
+	dn = get_or_create(diri.get(), dname.c_str());
+      } else {
+	(void)get_or_create(diri.get(), dname.c_str());
+      }
 
-    /* Get extra requested caps on the last component */
-    if (i == (path.depth() - 1)) {
-      caps |= extra_options.mask;
+      /* Get extra requested caps on the last component */
+      if (i == (path.depth() - 1)) {
+	caps |= extra_options.mask;
+      }
     }
 
     int r = _lookup(diri, dname, alternate_name, caps, &next, perms, extra_options.is_rename);
@@ -7921,55 +8085,65 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
     }
     // only follow trailing symlink if followsym.  always follow
     // 'directory' symlinks.
-    if (next && next->is_symlink()) {
-      symlinks++;
-      ldout(cct, 20) << " symlink count " << symlinks << ", value is '" << next->symlink << "'" << dendl;
-      if (symlinks > MAXSYMLINKS) {
-        rc = -ELOOP;
-        goto out;
-      }
-
+    if (next) {
       std::string symlink;
+      bool follow_symlink = false;
+      {
+	std::unique_lock next_lock(*next);
+	if (next->is_symlink()) {
+	  follow_symlink = true;
+	  symlinks++;
+	  ldout(cct, 20) << " symlink count " << symlinks << ", value is '"
+			 << next->symlink << "'" << dendl;
+	  if (symlinks > MAXSYMLINKS) {
+	    rc = -ELOOP;
+	    goto out;
+	  }
 #if defined(__linux__)
-      auto fscrypt_denc = fscrypt->get_fname_denc(next->fscrypt_ctx, &next->fscrypt_key_validator, true);
+	  auto fscrypt_denc = fscrypt->get_fname_denc(next->fscrypt_ctx,
+						      &next->fscrypt_key_validator, true);
 
-      if (fscrypt_denc) {
-        int ret = fscrypt_denc->get_decrypted_symlink(next->symlink, &symlink);
-        if (ret < 0) {
-          ldout(cct, 0) << __FILE__ << ":" << __LINE__ << ": failed to decrypt symlink (r=" << ret << ")" << dendl;
-          ret = -EPERM;
-          goto out;
-        }
-        ldout(cct, 25) << "decrypted symlink is: " << binstrprint(symlink) << dendl;
-      } else
+	  if (fscrypt_denc) {
+	    int ret = fscrypt_denc->get_decrypted_symlink(next->symlink, &symlink);
+	    if (ret < 0) {
+	      ldout(cct, 0) << __FILE__ << ":" << __LINE__
+			    << ": failed to decrypt symlink (r=" << ret << ")" << dendl;
+	      rc = -EPERM;
+	      goto out;
+	    }
+	    ldout(cct, 25) << "decrypted symlink is: " << binstrprint(symlink) << dendl;
+	  } else
 #endif
-        symlink = next->symlink;
-
-      if (i < path.depth() - 1) {
-	// dir symlink
-	// replace consumed components of path with symlink dir target
-	if (symlink[0] == '/') {
-	  diri = root;
+	    symlink = next->symlink;
 	}
-	filepath resolved(std::move(symlink));
-	resolved.append(path.postfixpath(i + 1));
-	path = std::move(resolved);
-	i = 0;
-	continue;
-      } else if (extra_options.followsym) {
-	if (symlink[0] == '/') {
-	  path = filepath(std::move(symlink));
+      }
+      if (follow_symlink) {
+	if (i < path.depth() - 1) {
+	  // dir symlink
+	  // replace consumed components of path with symlink dir target
+	  if (symlink[0] == '/') {
+	    diri = get_root_ref();
+	  }
+	  filepath resolved(std::move(symlink));
+	  resolved.append(path.postfixpath(i + 1));
+	  path = std::move(resolved);
 	  i = 0;
-	  // reset position
-	  diri = root;
-	} else {
-	  // we need to remove the symlink component from off of the path
-	  // before adding the target that the symlink points to.  remain
-	  // at the same position in the path.
-	  path.pop_dentry();
-	  path.append(filepath(std::move(symlink)));
+	  continue;
+	} else if (extra_options.followsym) {
+	  if (symlink[0] == '/') {
+	    path = filepath(std::move(symlink));
+	    i = 0;
+	    // reset position
+	    diri = get_root_ref();
+	  } else {
+	    // we need to remove the symlink component from off of the path
+	    // before adding the target that the symlink points to.  remain
+	    // at the same position in the path.
+	    path.pop_dentry();
+	    path.append(filepath(std::move(symlink)));
+	  }
+	  continue;
 	}
-	continue;
       }
     }
     if (i == (path.depth() - 1)) {
@@ -10814,7 +10988,6 @@ int Client::_lookup_vino(vinodeno_t vino, const UserPerm& perms, Inode **inode)
     auto p = inode_map.find(vino);
     ceph_assert(p != inode_map.end());
     *inode = p->second;
-    _ll_get(*inode);
   }
   ldout(cct, 8) << __func__ << " exit(" << vino << ") = " << r << dendl;
   return r;
@@ -10823,8 +10996,17 @@ int Client::_lookup_vino(vinodeno_t vino, const UserPerm& perms, Inode **inode)
 int Client::lookup_ino(inodeno_t ino, const UserPerm& perms, Inode **inode)
 {
   vinodeno_t vino(ino, CEPH_NOSNAP);
-  std::scoped_lock lock(client_lock);
-  return _lookup_vino(vino, perms, inode);
+  Inode *in = nullptr;
+  int r;
+  {
+    std::scoped_lock lock(client_lock);
+    r = _lookup_vino(vino, perms, &in);
+  }
+  if (r == 0 && in)
+    _ll_get(in);
+  if (inode)
+    *inode = in;
+  return r;
 }
 
 /**
@@ -12434,6 +12616,7 @@ void Client::C_Write_Finisher::finish_io(int r)
     }
   }
 
+  in_lock.unlock();
   finish_io_complete(r);
 }
 
@@ -14780,8 +14963,6 @@ int Client::ll_lookup(Inode *parent, const char *name, struct stat *attr,
   tout(cct) << __func__ << std::endl;
   tout(cct) << name << std::endl;
 
-  std::scoped_lock lock(client_lock);
-
   int r = 0;
   if (should_check_perms()) {
     if (strcmp(name, ".") && strcmp(name, "..")) {
@@ -14795,14 +14976,15 @@ int Client::ll_lookup(Inode *parent, const char *name, struct stat *attr,
   r = path_walk(parent, filepath(name), &in, perms, {.followsym = false, .mask = CEPH_STAT_CAP_INODE_ALL});
   if (r < 0) {
     attr->st_ino = 0;
-    goto out;
+  } else {
+    ceph_assert(in);
+    {
+      std::unique_lock in_lock(*in);
+      fill_stat(in, attr);
+    }
+    _ll_get(in.get());
   }
 
-  ceph_assert(in);
-  fill_stat(in, attr);
-  _ll_get(in.get());
-
- out:
   ldout(cct, 3) << __func__ << " " << vparent << " " << name
 	  << " -> " << r << " (" << hex << attr->st_ino << dec << ")" << dendl;
   tout(cct) << attr->st_ino << std::endl;
@@ -14823,14 +15005,16 @@ int Client::ll_lookup_vino(
   if (is_reserved_vino(vino))
     return -ESTALE;
 
-  std::scoped_lock lock(client_lock);
+  std::unique_lock<Client> cl(*this);
   ldout(cct, 3) << __func__ << " " << vino << dendl;
 
   // Check the cache first
   auto p = inode_map.find(vino);
   if (p != inode_map.end()) {
-    *inode = p->second;
-    _ll_get(*inode);
+    Inode *in = p->second;
+    cl.unlock();
+    _ll_get(in);
+    *inode = in;
     return 0;
   }
 
@@ -14851,9 +15035,15 @@ int Client::ll_lookup_vino(
     // open the snapdir and put the inode ref
     auto snapdir = open_snapdir(tmp);
     *inode = snapdir.get();
+    cl.unlock();
     _ll_forget(tmp, 1);
     _ll_get(*inode);
+    return 0;
   }
+
+  Inode *in = *inode;
+  cl.unlock();
+  _ll_get(in);
   return 0;
 }
 
@@ -14878,8 +15068,6 @@ int Client::ll_lookupx(Inode *parent, const char *name, Inode **out,
   ldout(cct, 3) << __func__ << " " << vparent << " " << name << dendl;
   tout(cct) << "ll_lookupx" << std::endl;
   tout(cct) << name << std::endl;
-
-  std::scoped_lock lock(client_lock);
 
   int r = 0;
   if (should_check_perms()) {
@@ -14921,8 +15109,7 @@ int Client::ll_walk(const char* name, Inode **out, struct ceph_statx *stx,
   tout(cct) << __func__ << std::endl;
   tout(cct) << name << std::endl;
 
-  std::scoped_lock lock(client_lock);
-  if (int rc = path_walk(cwd, filepath(name), &in, perms, {.followsym = !(flags & AT_SYMLINK_NOFOLLOW), .mask = mask}); rc < 0) {
+  if (int rc = path_walk(get_cwd_ref(), filepath(name), &in, perms, {.followsym = !(flags & AT_SYMLINK_NOFOLLOW), .mask = mask}); rc < 0) {
     /* zero out mask, just in case... */
     stx->stx_mask = 0;
     stx->stx_ino = 0;
@@ -14939,55 +15126,91 @@ int Client::ll_walk(const char* name, Inode **out, struct ceph_statx *stx,
 
 void Client::_ll_get(Inode *in)
 {
-  if (in->ll_ref == 0) {
-    in->iget();
-    if (in->is_dir() && !in->dentries.empty()) {
-      ceph_assert(in->dentries.size() == 1); // dirs can't be hard-linked
-      in->get_first_parent()->get(); // pin dentry
+  Dentry *parent_dn = nullptr;
+  snapid_t snapid = CEPH_NOSNAP;
+  bool bump_snap_ref = false;
+  uint64_t ll_ref = 0;
+
+  {
+    std::unique_lock in_lock(*in);
+    if (in->ll_ref == 0) {
+      in->iget();
+      if (in->is_dir() && !in->dentries.empty()) {
+	ceph_assert(in->dentries.size() == 1); // dirs can't be hard-linked
+	parent_dn = in->get_first_parent();
+      }
+      if (in->snapid != CEPH_NOSNAP) {
+	snapid = in->snapid;
+	bump_snap_ref = true;
+      }
     }
-    if (in->snapid != CEPH_NOSNAP)
-      ll_snap_ref[in->snapid]++;
+    in->ll_get();
+    ll_ref = in->ll_ref;
   }
-  in->ll_get();
-  ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " -> " << in->ll_ref << dendl;
+
+  if (parent_dn)
+    parent_dn->get();
+
+  if (bump_snap_ref) {
+    std::scoped_lock<Client> cl(*this);
+    ll_snap_ref[snapid]++;
+  }
+
+  ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " -> " << ll_ref << dendl;
 }
 
 int Client::_ll_put(Inode *in, uint64_t num)
 {
-  in->ll_put(num);
-  ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " " << num << " -> " << in->ll_ref << dendl;
-  if (in->ll_ref == 0) {
+  Dentry *parent_dn = nullptr;
+  snapid_t snapid = CEPH_NOSNAP;
+
+  {
+    std::unique_lock in_lock(*in);
+    in->ll_put(num);
+    ldout(cct, 20) << __func__ << " " << in << " " << in->ino << " " << num
+		   << " -> " << in->ll_ref << dendl;
+    if (in->ll_ref != 0)
+      return in->ll_ref;
+
     if (in->is_dir() && !in->dentries.empty()) {
       ceph_assert(in->dentries.size() == 1); // dirs can't be hard-linked
-      in->get_first_parent()->put(); // unpin dentry
+      parent_dn = in->get_first_parent();
     }
-    if (in->snapid != CEPH_NOSNAP) {
-      auto p = ll_snap_ref.find(in->snapid);
-      ceph_assert(p != ll_snap_ref.end());
-      ceph_assert(p->second > 0);
-      if (--p->second == 0)
-	ll_snap_ref.erase(p);
-    }
-    put_inode(in);
-    return 0;
-  } else {
-    return in->ll_ref;
+    if (in->snapid != CEPH_NOSNAP)
+      snapid = in->snapid;
   }
+
+  if (parent_dn)
+    parent_dn->put();
+
+  if (snapid != CEPH_NOSNAP) {
+    std::scoped_lock<Client> cl(*this);
+    auto p = ll_snap_ref.find(snapid);
+    ceph_assert(p != ll_snap_ref.end());
+    ceph_assert(p->second > 0);
+    if (--p->second == 0)
+      ll_snap_ref.erase(p);
+  }
+
+  put_inode(in);
+  return 0;
 }
 
 void Client::_ll_drop_pins()
 {
+  ceph_assert(ceph_mutex_is_locked_by_me(*this));
+
   ldout(cct, 10) << __func__ << dendl;
-  std::set<InodeRef> to_be_put; //this set will be deconstructed item by item when exit
-  std::unordered_map<vinodeno_t, Inode*>::iterator next;
-  for (auto it = inode_map.begin(); it != inode_map.end(); it = next) {
-    Inode *in = it->second;
-    next = it;
-    ++next;
-    if (in->ll_ref){
-      to_be_put.insert(in);
-      _ll_put(in, in->ll_ref);
-    }
+  std::vector<std::pair<Inode*, uint64_t>> pending;
+  pending.reserve(inode_map.size());
+  for (auto& [vino, in] : inode_map) {
+    if (in->ll_ref)
+      pending.emplace_back(in, in->ll_ref);
+  }
+
+  for (auto& [in, num] : pending) {
+    ceph::unique_unlock<Client> cl_unlock(*this);
+    _ll_put(in, num);
   }
 }
 
@@ -15007,29 +15230,26 @@ bool Client::_ll_forget(Inode *in, uint64_t count)
 
   if (ino == 1) return true;  // ignore forget on root.
 
-  bool last = false;
-  if (in->ll_ref < count) {
-    ldout(cct, 1) << "WARNING: ll_forget on " << ino << " " << count
-		  << ", which only has ll_ref=" << in->ll_ref << dendl;
-    _ll_put(in, in->ll_ref);
-    last = true;
-  } else {
-    if (_ll_put(in, count) == 0)
-      last = true;
+  uint64_t put_count = count;
+  {
+    std::unique_lock in_lock(*in);
+    if (in->ll_ref < count) {
+      ldout(cct, 1) << "WARNING: ll_forget on " << ino << " " << count
+		    << ", which only has ll_ref=" << in->ll_ref << dendl;
+      put_count = in->ll_ref;
+    }
   }
 
-  return last;
+  return _ll_put(in, put_count) == 0;
 }
 
 void Client::ll_get(Inode *in)
 {
-  std::scoped_lock lock(client_lock);
   _ll_get(in);
 }
 
 bool Client::ll_forget(Inode *in, uint64_t count)
 {
-  std::scoped_lock lock(client_lock);
   return _ll_forget(in, count);
 }
 
@@ -15050,7 +15270,7 @@ int Client::ll_get_snap_ref(snapid_t snap)
 
 snapid_t Client::ll_get_snapid(Inode *in)
 {
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock lock(*in);
   return in->snapid;
 }
 
@@ -15060,13 +15280,16 @@ Inode *Client::ll_get_inode(ino_t ino)
   if (!mref_reader.is_state_satisfied())
     return NULL;
 
-  std::scoped_lock lock(client_lock);
+  Inode *in = nullptr;
+  {
+    std::scoped_lock lock(client_lock);
 
-  vinodeno_t vino = _map_faked_ino(ino);
-  auto p = inode_map.find(vino);
-  if (p == inode_map.end())
-    return NULL;
-  Inode *in = p->second;
+    vinodeno_t vino = _map_faked_ino(ino);
+    auto p = inode_map.find(vino);
+    if (p == inode_map.end())
+      return NULL;
+    in = p->second;
+  }
   _ll_get(in);
   return in;
 }
@@ -15080,12 +15303,15 @@ Inode *Client::ll_get_inode(vinodeno_t vino)
   if (is_reserved_vino(vino))
     return NULL;
 
-  std::scoped_lock lock(client_lock);
+  Inode *in = nullptr;
+  {
+    std::scoped_lock lock(client_lock);
 
-  auto p = inode_map.find(vino);
-  if (p == inode_map.end())
-    return NULL;
-  Inode *in = p->second;
+    auto p = inode_map.find(vino);
+    if (p == inode_map.end())
+      return NULL;
+    in = p->second;
+  }
   _ll_get(in);
   return in;
 }
@@ -16615,8 +16841,6 @@ int Client::ll_mkdir(Inode *parent, const char *name, mode_t mode,
   tout(cct) << name << std::endl;
   tout(cct) << mode << std::endl;
 
-  std::scoped_lock lock(client_lock);
-
   walk_dentry_result wdr;
   if (int rc = path_walk(parent, filepath(name), &wdr, perm, {.require_target = false}); rc < 0) {
     return rc;
@@ -16625,7 +16849,10 @@ int Client::ll_mkdir(Inode *parent, const char *name, mode_t mode,
   InodeRef in;
   int r = _mkdir(wdr, mode, perm, &in);
   if (r == 0) {
-    fill_stat(in, attr);
+    {
+      std::unique_lock in_lock(*in);
+      fill_stat(in, attr);
+    }
     _ll_get(in.get());
   }
   tout(cct) << attr->st_ino << std::endl;
@@ -16650,8 +16877,6 @@ int Client::ll_mkdirx(Inode *parent, const char *name, mode_t mode, Inode **out,
   tout(cct) << vparent.ino.val << std::endl;
   tout(cct) << name << std::endl;
   tout(cct) << mode << std::endl;
-
-  std::scoped_lock lock(client_lock);
 
   walk_dentry_result wdr;
   if (int rc = path_walk(parent, filepath(name), &wdr, perms, {.require_target = false}); rc < 0) {
@@ -17492,7 +17717,7 @@ int Client::ll_create(Inode *parent, const char *name, mode_t mode,
   if (!mref_reader.is_state_satisfied())
     return -ENOTCONN;
 
-  std::scoped_lock lock(client_lock);
+  std::scoped_lock lock(*parent);
   InodeRef in;
 
   int r = _ll_create(parent, name, mode, flags, &in, CEPH_STAT_CAP_INODE_ALL,
@@ -17523,19 +17748,16 @@ int Client::ll_createx(Inode *parent, const char *name, mode_t mode,
   if (!mref_reader.is_state_satisfied())
     return -ENOTCONN;
 
-  std::scoped_lock lock(client_lock);
   InodeRef in;
 
   int r = _ll_create(parent, name, mode, oflags, &in, caps, fhp, perms);
   if (r >= 0) {
     ceph_assert(in);
-
-    // passing an Inode in outp requires an additional ref
+    fill_statx(in, caps, stx);
     if (outp) {
       _ll_get(in.get());
       *outp = in.get();
     }
-    fill_statx(in, caps, stx);
   } else {
     stx->stx_ino = 0;
     stx->stx_mask = 0;
