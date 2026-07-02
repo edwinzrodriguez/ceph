@@ -276,7 +276,10 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
       // Register before check_caps / ms_dispatch: a grant can arrive as soon as
       // the MDS sees our cap update; signaling an empty waitfor_caps leaves the
       // waiter stuck with done=false even after max_size is granted.
-      wait_list.push_back(new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete));
+      {
+	std::scoped_lock l{caps_lock};
+	wait_list.push_back(new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete));
+      }
       if (waitfor_caps) {
 	// We may have already sent a max_size request (requested_max_size ==
 	// wanted_max_size) but the MDS grant was still too small.  Allow
@@ -299,9 +302,12 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
       }
       if (!waitfor_caps && !waitfor_commit) {
 	// ms_dispatch may have already finish()ed our context after push_back.
-	if (!wait_list.empty()) {
-	  signal_context_list(wait_list);
+	std::vector<Context*> early;
+	{
+	  std::scoped_lock l{caps_lock};
+	  early.swap(wait_list);
 	}
+	signal_context_list(early);
 	continue;
       }
       // Drop client_lock when held so ms_dispatch can take scoped_lock<Client>
@@ -892,32 +898,33 @@ void ClientCaps::wait_on_context_cond(
 
 void ClientCaps::signal_caps_inode_sync(Inode *in)
 {
-  // insert_trace (no client_lock) and put_cap_ref (inode_lock only) both call
-  // here.  Defer to client_finisher when client_lock is already held; take
-  // client_lock when neither tier is held; finish inline when inode_lock is
-  // held and client_lock cannot be taken (lock-order rule).
-  auto wake_waiters = [this](Inode *inode, auto&& signal_list) {
-    do {
-      signal_list(inode->waitfor_caps);
-      if (inode->waitfor_caps_pending.empty())
-	break;
-      std::swap(inode->waitfor_caps, inode->waitfor_caps_pending);
-    } while (true);
+  // wait_on_context_list registers under caps_lock; extract waiters the same way
+  // before signaling.  Defer to client_finisher when client_lock is already
+  // held; finish inline when inode_lock is held (handle_cap_grant path).
+  std::vector<Context*> batches[2];
+  {
+    std::unique_lock l(caps_lock);
+    batches[0].swap(in->waitfor_caps);
+    std::swap(in->waitfor_caps, in->waitfor_caps_pending);
+    batches[1].swap(in->waitfor_caps);
+  }
+
+  auto signal_batch = [this](std::vector<Context*>& ls) {
+    if (ls.empty())
+      return;
+    signal_context_list(ls);
   };
 
   if (client->is_locked_by_me()) {
-    wake_waiters(in, [this](std::vector<Context*>& ls) {
+    for (auto& ls : batches)
       client->signal_deferred_context_list(ls);
-    });
   } else if (in->is_locked_by_me()) {
-    wake_waiters(in, [this](std::vector<Context*>& ls) {
-      signal_context_list(ls);
-    });
+    for (auto& ls : batches)
+      signal_batch(ls);
   } else {
     std::unique_lock<Client> cl(*client);
-    wake_waiters(in, [this](std::vector<Context*>& ls) {
+    for (auto& ls : batches)
       client->signal_deferred_context_list(ls);
-    });
   }
 }
 

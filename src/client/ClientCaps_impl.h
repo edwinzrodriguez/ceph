@@ -23,12 +23,14 @@ void ClientCaps::process_delayed_caps(ceph::coarse_mono_time now, bool mount_abo
 	  in->hold_caps_until > now)
         break;
       delayed_list.pop_front();
+      in->iget();
       to_process.push_back(in);
     }
   }
 
   for (Inode *in : to_process) {
     func(in);
+    client->put_inode(in);
   }
 }
 

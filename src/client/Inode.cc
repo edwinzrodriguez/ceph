@@ -260,17 +260,18 @@ bool auth_cap_is_live(const Inode *in)
 
 bool Inode::cap_is_valid(const Cap &cap) const
 {
-  /*cout << "cap_gen     " << cap->session-> cap_gen << std::endl
-    << "session gen " << cap->gen << std::endl
-    << "cap expire  " << cap->session->cap_ttl << std::endl
-    << "cur time    " << ceph_clock_now(cct) << std::endl;*/
-  if (!cap.session)
+  // cap_lease_valid takes session_lock.  When inode_lock is already held,
+  // drop it briefly so we do not invert lock order (inode_lock -> session_lock).
+  // Snapshot cap.gen under inode_lock first; it is updated by add_update_cap.
+  MetaSession *session = cap.session;
+  if (!session)
     return false;
-  if ((cap.session->cap_gen <= cap.gen)
-      && (ceph_clock_now() < cap.session->cap_ttl)) {
-    return true;
+  __u32 gen = cap.gen;
+  ceph::unique_unlock<Inode> in_unlock(const_cast<Inode&>(*this), std::defer_lock);
+  if (is_locked_by_me()) {
+    in_unlock.release();
   }
-  return false;
+  return session->cap_lease_valid(gen);
 }
 
 int Inode::caps_issued(int *implemented) const
@@ -321,6 +322,8 @@ void Inode::try_touch_cap(mds_rank_t mds)
  */
 bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
 {
+  std::unique_lock<Inode> in_lock(*this);
+
   int c = snap_caps;
   int i = 0;
 
@@ -919,6 +922,8 @@ FSCryptContextRef Inode::init_fscrypt_ctx(FSCrypt *fscrypt)
 
 void Inode::gen_inherited_fscrypt_auth(std::vector<uint8_t> *fsa)
 {
+  std::unique_lock<Inode> in_lock(*this);
+
   if (!fscrypt_ctx) {
     //TODO:Revisit to make sure that we do not skip entire subtree somehow
     return;

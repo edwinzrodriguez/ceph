@@ -18,6 +18,7 @@
 #define CEPH_CLIENT_H
 
 #include <array>
+#include <atomic>
 #include <dirent.h>
 
 #include "common/admin_socket.h"
@@ -1007,7 +1008,7 @@ public:
     ++dlease_misses;
   }
   std::tuple<uint64_t, uint64_t, uint64_t> get_dlease_hit_rates() {
-    return std::make_tuple(dlease_hits, dlease_misses, dentry_nr);
+    return std::make_tuple(dlease_hits.load(), dlease_misses.load(), dentry_nr.load());
   }
 
   void cap_hit() {
@@ -1017,7 +1018,7 @@ public:
     ++cap_misses;
   }
   std::pair<uint64_t, uint64_t> get_cap_hit_rates() {
-    return std::make_pair(cap_hits, cap_misses);
+    return std::make_pair(cap_hits.load(), cap_misses.load());
   }
 
   void inc_opened_files() {
@@ -1027,7 +1028,7 @@ public:
     --opened_files;
   }
   std::pair<uint64_t, uint64_t> get_opened_files_rates() {
-    return std::make_pair(opened_files, inode_map.size());
+    return std::make_pair(opened_files.load(), inode_map.size());
   }
 
   void inc_pinned_icaps() {
@@ -1037,7 +1038,7 @@ public:
     pinned_icaps -= nr;
   }
   std::pair<uint64_t, uint64_t> get_pinned_icaps_rates() {
-    return std::make_pair(pinned_icaps, inode_map.size());
+    return std::make_pair(pinned_icaps.load(), inode_map.size());
   }
 
   void inc_opened_inodes() {
@@ -1047,7 +1048,7 @@ public:
     --opened_inodes;
   }
   std::pair<uint64_t, uint64_t> get_opened_inodes_rates() {
-    return std::make_pair(opened_inodes, inode_map.size());
+    return std::make_pair(opened_inodes.load(), inode_map.size());
   }
 
   void set_is_fuse() {
@@ -1211,24 +1212,34 @@ protected:
   void refresh_snapdir_attrs(Inode *in, Inode *diri);
   InodeRef open_snapdir(const InodeRef& diri);
 
-  int get_fd() {
+  int _get_fd() {
     int fd = free_fd_set.range_start();
     free_fd_set.erase(fd, 1);
     return fd;
   }
-  void put_fd(int fd) {
+
+  int get_fd();
+
+  void _put_fd(int fd) {
     free_fd_set.insert(fd, 1);
   }
+
+  void put_fd(int fd);
 
   /*
    * Resolve file descriptor, or return NULL.
    */
-  Fh *get_filehandle(int fd) {
+  Fh *_get_filehandle(int fd) {
+    ceph_assert(ceph_mutex_is_locked_by_me(*this));
+
     auto it = fd_map.find(fd);
     if (it == fd_map.end())
       return NULL;
     return it->second;
   }
+
+  Fh *get_filehandle(int fd);
+  int _get_fd_inode(int fd, InodeRef *in);
   int get_fd_inode(int fd, InodeRef *in);
   bool _ll_fh_exists(Fh *f);
 
@@ -2169,7 +2180,7 @@ private:
   int _unlink(Inode *dir, const char *name, const UserPerm& perm);
 #if defined(__linux__)
   int get_keyhandler(FSCryptContextRef fscrypt_ctx, FSCryptKeyHandlerRef& kh);
-  bool is_inode_locked(const InodeRef& to_check);
+  bool is_inode_locked(const InodeRef& to_check) const;
 #endif
   int _rename(Inode *olddir, const char *oname, Inode *ndir, const char *nname, const UserPerm& perm, std::string alternate_name);
   int _mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& perm,
@@ -2449,22 +2460,22 @@ private:
   entity_addrvec_t reclaim_target_addrs;
 
   // dentry lease metrics
-  uint64_t dentry_nr = 0;
-  uint64_t dlease_hits = 0;
-  uint64_t dlease_misses = 0;
+  std::atomic<uint64_t> dentry_nr = 0;
+  std::atomic<uint64_t> dlease_hits = 0;
+  std::atomic<uint64_t> dlease_misses = 0;
 
-  uint64_t cap_hits = 0;
-  uint64_t cap_misses = 0;
+  std::atomic<uint64_t> cap_hits = 0;
+  std::atomic<uint64_t> cap_misses = 0;
 
-  uint64_t opened_files = 0;
-  uint64_t pinned_icaps = 0;
-  uint64_t opened_inodes = 0;
+  std::atomic<uint64_t> opened_files = 0;
+  std::atomic<uint64_t> pinned_icaps = 0;
+  std::atomic<uint64_t> opened_inodes = 0;
 
-  uint64_t total_read_ops = 0;
-  uint64_t total_read_size = 0;
+  std::atomic<uint64_t> total_read_ops = 0;
+  std::atomic<uint64_t> total_read_size = 0;
 
-  uint64_t total_write_ops = 0;
-  uint64_t total_write_size = 0;
+  std::atomic<uint64_t> total_write_ops = 0;
+  std::atomic<uint64_t> total_write_size = 0;
 
   static constexpr unsigned delay_i_shards = 256;
   struct DelayInodeShard {
@@ -2477,9 +2488,9 @@ private:
   // Inodes pinned by the unmount oset anchor; defer _put_inode map removal.
   std::unordered_set<Inode*> unmount_anchor_pins;
 
-  uint64_t nr_metadata_request = 0;
-  uint64_t nr_read_request = 0;
-  uint64_t nr_write_request = 0;
+  std::atomic<uint64_t> nr_metadata_request = 0;
+  std::atomic<uint64_t> nr_read_request = 0;
+  std::atomic<uint64_t> nr_write_request = 0;
 
   std::vector<MDSCapAuth> cap_auths;
 
@@ -2509,4 +2520,35 @@ public:
 };
 
 #include "client_lock.h"
+
+inline int Client::get_fd()
+{
+  std::scoped_lock<Client> lock(*this);
+  return _get_fd();
+}
+
+inline void Client::put_fd(int fd)
+{
+  std::scoped_lock<Client> lock(*this);
+  _put_fd(fd);
+}
+
+inline Fh *Client::get_filehandle(int fd)
+{
+  if (!is_locked_by_me()) {
+    std::scoped_lock<Client> lock(*this);
+    return _get_filehandle(fd);
+  }
+  return _get_filehandle(fd);
+}
+
+inline int Client::get_fd_inode(int fd, InodeRef *in)
+{
+  if (!is_locked_by_me()) {
+    std::scoped_lock<Client> lock(*this);
+    return _get_fd_inode(fd, in);
+  }
+  return _get_fd_inode(fd, in);
+}
+
 #endif
