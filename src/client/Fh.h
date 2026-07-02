@@ -1,6 +1,8 @@
 #ifndef CEPH_CLIENT_FH_H
 #define CEPH_CLIENT_FH_H
 
+#include <atomic>
+
 #include "common/Readahead.h"
 #include "common/reentrant_lock.h"
 #include "include/types.h"
@@ -22,7 +24,8 @@ struct Fh {
   // they won't change, and putting them under the client_lock
   // makes no sense.
 
-  int       _ref = 1;
+  std::atomic<int> _ref{1};
+  std::atomic<bool> closing{false};
   loff_t    pos = 0;
   int       mode;       // the mode i opened the file with
 
@@ -58,8 +61,12 @@ struct Fh {
   Fh(InodeRef in, int flags, int cmode, uint64_t gen, const UserPerm &perms);
   ~Fh();
 
-  void get() { ++_ref; }
-  int put() { return --_ref; }
+  void get() { _ref.fetch_add(1, std::memory_order_relaxed); }
+  int put() {
+    return _ref.fetch_sub(1, std::memory_order_acq_rel) - 1;
+  }
+  void mark_closing() { closing.store(true, std::memory_order_release); }
+  bool is_closing() const { return closing.load(std::memory_order_acquire); }
 };
 
 

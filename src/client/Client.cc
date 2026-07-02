@@ -1667,9 +1667,10 @@ void Client::update_dentry_lease(Dentry *dn, LeaseStat *dlease, utime_t from, Me
   utime_t dttl = from;
   dttl += (float)dlease->duration_ms / 1000.0;
 
-  ldout(cct, 15) << __func__ << " " << *dn << " " << *dlease << " from " << from << dendl;
-  
   ceph_assert(dn);
+
+  std::scoped_lock<Client> cl(*this);
+  ldout(cct, 15) << __func__ << " " << *dn << " " << *dlease << " from " << from << dendl;
 
   if (dlease->mask & CEPH_LEASE_VALID) {
     if (dttl > dn->lease_ttl) {
@@ -2153,7 +2154,10 @@ Inode* Client::insert_trace(MetaRequest *request, MetaSession *session,
   if (realm)
     put_snap_realm(realm);
 
-  request->target = in;
+  {
+    std::scoped_lock<Client> cl(*this);
+    request->target = in;
+  }
   return in;
 }
 
@@ -4601,13 +4605,20 @@ private:
 public:
   C_Client_FlushComplete(Client *c, Inode *in) : client(c), inode(in) { }
   void finish(int r) override {
-    Client::ClientLockIfNeeded l(client);
     if (r != 0) {
       client_t const whoami = client->whoami;  // For the benefit of ldout prefix
+      std::unique_lock in_lock(*inode);
       ldout(client->cct, 1) << "I/O error from flush on inode " << inode
         << " 0x" << std::hex << inode->ino << std::dec
         << ": " << r << "(" << cpp_strerror(r) << ")" << dendl;
       inode->set_async_err(r);
+    }
+    if (client->is_unmounting()) {
+      // Wake the unmount thread only.  Do not call delay_put_inodes() here:
+      // this context runs on ObjectCacher's finisher, and _put_inode drains
+      // that finisher (wait_for_flush_callbacks), which deadlocks unmount.
+      client->mount_cond.notify_all_sloppy();
+      client->check_caps(inode, Client::CHECK_CAPS_NODELAY);
     }
   }
 };
@@ -6639,20 +6650,35 @@ int Client::may_delete(const walk_dentry_result& wdr, const UserPerm& perms, boo
   ldout(cct, 20) << __func__ << " " << wdr << "; " << perms << dendl;
   auto* diri = wdr.diri.get();
   auto* in = wdr.target.get();
-  int r = _getattr_for_perm(diri, perms);
-  if (r < 0)
-    goto out;
+  auto check = [&]() -> int {
+    int r = _getattr_for_perm(diri, perms);
+    if (r < 0)
+      return r;
 
-  r = inode_permission(diri, perms, CLIENT_MAY_EXEC | CLIENT_MAY_WRITE);
-  if (r < 0)
-    goto out;
+    r = inode_permission(diri, perms, CLIENT_MAY_EXEC | CLIENT_MAY_WRITE);
+    if (r < 0)
+      return r;
 
-  if (in && check_perms && perms.uid() != 0 && (diri->mode & S_ISVTX)) {
-    if (diri->uid != perms.uid() && in->uid != perms.uid())
-      r = -EPERM;
+    if (in && check_perms && perms.uid() != 0 && (diri->mode & S_ISVTX)) {
+      if (diri->uid != perms.uid() && in->uid != perms.uid())
+        return -EPERM;
+    }
+    return 0;
+  };
+
+  int r;
+  if (in && in != diri) {
+    // Always lock the parent directory inode before the child, matching
+    // path_walk/_lookup so we do not invert lock order on the same thread.
+    std::unique_lock diri_lock(*diri);
+    std::unique_lock in_lock(*in);
+    r = check();
+    ldout(cct, 3) << __func__ << " " << *diri << " = " << r <<  dendl;
+  } else {
+    std::unique_lock diri_lock(*diri);
+    r = check();
+    ldout(cct, 3) << __func__ << " " << *diri << " = " << r <<  dendl;
   }
-out:
-  ldout(cct, 3) << __func__ << " " << *diri << " = " << r <<  dendl;
   return r;
 }
 
@@ -8100,8 +8126,12 @@ relookup:
 
     bool has_caps = false;
     if (dn_inode) {
-      std::unique_lock dn_lock(*dn_inode);
-      has_caps = dn_inode->caps_issued_mask(mask, true);
+      dir_lock.unlock();
+      {
+        std::unique_lock dn_lock(*dn_inode);
+        has_caps = dn_inode->caps_issued_mask(mask, true);
+      }
+      dir_lock.lock();
     }
 
     if (!dn_inode || has_caps) {
@@ -11609,6 +11639,7 @@ int Client::_close(int fd)
       ldout(cct, 20) << " unpinning ll_put() call for " << *(fh->inode.get()) << dendl;
       unpin = true;
     }
+    fh->mark_closing();
     err = _release_fh(fh, false);
   }
   if (unpin)
@@ -12284,8 +12315,8 @@ Client::C_Readahead::~C_Readahead() {
   // finish() hands off fh cleanup to client_finisher; only handle the
   // synchronous-abort path (delete without finish) here.
   if (f) {
-    f->readahead.dec_pending();
     client->_put_fh(f);
+    f->readahead.dec_pending();
   }
 }
 
@@ -12312,14 +12343,16 @@ void Client::C_Readahead::finish(int r) {
 	client->subvolume_tracker->add_metric(
 	  in->ino, SimpleIOMetric(false, mono_clock_now()-start, r));
       }
-      fh->readahead.dec_pending();
+      // Drop the readahead fh pin before dec_pending wakes ll_release's
+      // wait_for_pending(), which then calls _put_fh on the caller's ref.
       client->_put_fh(fh);
+      fh->readahead.dec_pending();
     }));
 }
 
 void Client::do_readahead(Fh *f, Inode *in, uint64_t off, uint64_t len)
 {
-  if (is_unmounting()) {
+  if (is_unmounting() || f->is_closing()) {
     return;
   }
   std::unique_lock in_lock(*in);
@@ -18657,6 +18690,7 @@ int Client::ll_release(Fh *fh)
     std::scoped_lock<Client> lock(*this);
     ll_unclosed_fh_set.erase(fh);
   }
+  fh->mark_closing();
   int err = _release_fh(fh, false);
   fh->readahead.wait_for_pending();
   _put_fh(fh);
