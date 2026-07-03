@@ -13884,7 +13884,7 @@ void Client::C_nonblocking_fsync_state::advance()
                        << " onfinish " << onfinish
                        << dendl;
 
-  ceph_assert(clnt->client_lock.is_locked_by_me());
+  ceph_assert(in->is_locked_by_me());
 
   const int dirty_caps_at_start = in->dirty_caps;
 
@@ -13921,7 +13921,11 @@ void Client::C_nonblocking_fsync_state::advance()
       ldout(clnt->cct, 15) << "waiting on unsafe requests, last tid " << req->get_tid() <<  dendl;
 
       req->get();
-      req->waitfor_safe.push_back(advancer);
+      {
+	ceph::unique_unlock<Inode> in_unlock(*in);
+	std::unique_lock<Client> cl_lock(*clnt);
+	req->waitfor_safe.push_back(advancer);
+      }
       // ------------  here is a state machine break point
       return;
     } else if (!syncdataonly && !in->unsafe_ops.empty()) {
@@ -14075,7 +14079,9 @@ void Client::C_nonblocking_fsync_state::advance()
 
 void Client::C_nonblocking_fsync_flush_finisher::finish(int r)
 {
-  ClientLockIfNeeded l(clnt);
+  // Inline from _flush while advance() holds inode_lock, or async on
+  // ObjectCacher finisher without locks.  inode_lock is reentrant.
+  std::unique_lock in_lock(*state->in);
   state->complete_flush(r);
 }
 
@@ -14103,7 +14109,7 @@ void Client::C_nonblocking_fsync_state_advancer::finish(int r)
                        << " fsync_state=" << state
                        << dendl;
 
-  ClientLockIfNeeded lock(clnt);
+  std::unique_lock in_lock(*(state->in));
   state->advance();
 }
 
@@ -14113,7 +14119,7 @@ int64_t Client::nonblocking_fsync(Inode *in, bool syncdataonly, Context *onfinis
 
   ldout(cct, 10) << __func__ << dendl;
 
-  std::unique_lock cl(client_lock);
+  std::unique_lock in_lock(*in);
   // Kick fsync off...
   state->advance();
   return 0;
