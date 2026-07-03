@@ -13419,6 +13419,91 @@ int Client::WriteEncMgr_NotBuffered::do_write()
   return 0;
 }
 
+Client::C_DeferredAsyncWrite::C_DeferredAsyncWrite(
+    Client *clnt_, Fh *f_, int64_t offset_, uint64_t size_,
+    bufferlist& bl_, const struct iovec *iov_, int iovcnt_,
+    Context *onfinish_, bool do_fsync_, bool syncdataonly_)
+  : clnt(clnt_), f(f_), offset(offset_), size(size_), bl(bl_),
+    iov(iov_), iovcnt(iovcnt_), onfinish(onfinish_),
+    do_fsync(do_fsync_), syncdataonly(syncdataonly_),
+    inode_pin(f_->inode.get())
+{
+}
+
+int64_t Client::defer_async_write_cap_wait(
+    Fh *f, int64_t offset, uint64_t size, bufferlist& bl,
+    const struct iovec *iov, int iovcnt, Context *onfinish,
+    bool do_fsync, bool syncdataonly, loff_t endoff)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(*(f->inode)));
+  Inode *in = f->inode.get();
+
+  if (endoff > 0 &&
+      (endoff >= (loff_t)in->max_size ||
+       endoff > (loff_t)(in->size << 1)) &&
+      endoff > (loff_t)in->wanted_max_size) {
+    uint64_t want_size = endoff;
+#if defined(__linux__)
+    if (in->fscrypt_auth.size()) {
+      want_size = fscrypt_block_start(endoff + FSCRYPT_BLOCK_SIZE - 1);
+    }
+#endif
+    in->wanted_max_size = want_size;
+  }
+
+  auto *ctx = new C_DeferredAsyncWrite(this, f, offset, size, bl, iov, iovcnt,
+                                       onfinish, do_fsync, syncdataonly);
+  client_caps->enqueue_cap_waiter(in, ctx);
+  check_caps(in, CHECK_CAPS_NODELAY);
+
+  ldout(cct, 10) << "io_correl deferred async write cap wait"
+                 << " onfinish=" << onfinish
+                 << " ino=" << in->ino
+                 << " offset=" << offset
+                 << " size=" << size
+                 << dendl;
+  return 0;
+}
+
+void Client::C_DeferredAsyncWrite::finish(int r)
+{
+  client_t const whoami = clnt->whoami;
+
+  if (r < 0) {
+    ldout(clnt->cct, 10) << "io_correl deferred async write cap wait failed"
+                         << " onfinish=" << onfinish
+                         << " r=" << r
+                         << dendl;
+    onfinish->complete(r);
+    delete this;
+    return;
+  }
+
+  if (!clnt->_ll_fh_exists(f)) {
+    ldout(clnt->cct, 10) << "io_correl deferred async write stale fh"
+                         << " onfinish=" << onfinish
+                         << dendl;
+    onfinish->complete(-EBADF);
+    delete this;
+    return;
+  }
+
+  ldout(clnt->cct, 10) << "io_correl deferred async write resume"
+                       << " onfinish=" << onfinish
+                       << " ino=" << f->inode->ino
+                       << " offset=" << offset
+                       << dendl;
+
+  std::unique_lock<Inode> in_lock(*(f->inode));
+  int64_t wr = clnt->_write(f, offset, size, bl, iov, iovcnt,
+                            onfinish, do_fsync, syncdataonly);
+  if (wr < 0) {
+    ceph::unique_unlock<Inode> in_unlock(*(f->inode));
+    onfinish->complete(wr);
+  }
+  delete this;
+}
+
 int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
                        const struct iovec *iov, int iovcnt,
 	               Context *onfinish, bool do_fsync, bool syncdataonly)
@@ -13512,7 +13597,9 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
   if (onfinish) {
     r = try_get_caps(f, CEPH_CAP_FILE_WR|CEPH_CAP_AUTH_SHARED, want, &have);
     if (r == -EAGAIN)
-      r = get_caps(f, CEPH_CAP_FILE_WR|CEPH_CAP_AUTH_SHARED, want, &have, endoff);
+      return defer_async_write_cap_wait(f, offset, size, bl, iov, iovcnt,
+                                        onfinish, do_fsync, syncdataonly,
+                                        endoff);
   } else {
     r = get_caps(f, CEPH_CAP_FILE_WR|CEPH_CAP_AUTH_SHARED, want, &have, endoff);
   }

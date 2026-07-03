@@ -1789,6 +1789,26 @@ private:
 
   struct CWF_iofinish;
 
+  struct C_DeferredAsyncWrite : Context {
+    Client *clnt;
+    Fh *f;
+    int64_t offset;
+    uint64_t size;
+    bufferlist bl;
+    const struct iovec *iov;
+    int iovcnt;
+    Context *onfinish;
+    bool do_fsync;
+    bool syncdataonly;
+    InodeRef inode_pin;
+
+    C_DeferredAsyncWrite(Client *clnt_, Fh *f_, int64_t offset_, uint64_t size_,
+                         bufferlist& bl_, const struct iovec *iov_, int iovcnt_,
+                         Context *onfinish_, bool do_fsync_, bool syncdataonly_);
+
+    void finish(int r) override;
+  };
+
   class WriteEncMgr : public RefCountedObject {
   protected:
     Client *clnt;
@@ -2240,6 +2260,11 @@ private:
           const struct iovec *iov = nullptr, int iovcnt = 0,
           Context *onfinish = nullptr, bool do_fsync = false,
           bool syncdataonly = false);
+  int64_t defer_async_write_cap_wait(Fh *f, int64_t offset, uint64_t size,
+                                     bufferlist& bl, const struct iovec *iov,
+                                     int iovcnt, Context *onfinish,
+                                     bool do_fsync, bool syncdataonly,
+                                     loff_t endoff);
   int64_t _preadv_pwritev_locked(Fh *fh, const struct iovec *iov,
                                  int iovcnt, int64_t offset,
                                  bool write, bool clamp_to_int,

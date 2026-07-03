@@ -72,6 +72,8 @@ public:
   // are issued and none of @want are revoking; -EAGAIN otherwise.
   int try_get_caps(Fh *fh, int need, int want, int *have);
 
+  void enqueue_cap_waiter(Inode *in, Context *c);
+
   void get_cap_ref(Inode *in, int cap);
   void put_cap_ref(Inode *in, int cap);
 
