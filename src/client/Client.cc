@@ -8274,6 +8274,14 @@ int Client::path_walk(InodeRef dirinode, const filepath& origpath,
 		      const PathWalk_ExtraOptions& extra_options,
 		      std::string trimmed_path)
 {
+  // path_walk takes inode_lock; many callers hold client_lock for the
+  // subsequent metadata op.  Drop client_lock for the walk, then restore it.
+  if (is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*this);
+    return path_walk(std::move(dirinode), origpath, result, perms,
+		     extra_options, std::move(trimmed_path));
+  }
+
   int rc = 0;
   filepath path = origpath;
   auto& dn = result->dn;
