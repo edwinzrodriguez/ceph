@@ -14124,8 +14124,21 @@ void Client::C_nonblocking_fsync_state::advance()
     // do equivalent of wait_sync_caps(in, flush_tid)
     if (in->flushing_caps) {
       ldout(clnt->cct, 15) << "Client::C_nonblocking_fsync_state::advance - flushing_caps" << dendl;
+      if (in->flushing_cap_tids.empty()) {
+	lderr(clnt->cct) << __func__ << " " << *in
+			   << " has flushing_caps " << ccap_string(in->flushing_caps)
+			   << " but no flushing_cap_tids; clearing stale state" << dendl;
+	in->flushing_caps = 0;
+	clnt->client_caps->dec_num_flushing_caps();
+	if (in->auth_cap) {
+	  MetaSession *session = in->auth_cap->session;
+	  Inode *inode = in;
+	  session->with_flushing_caps([inode](auto& flushing_caps) {
+	    inode->flushing_cap_item.remove_myself();
+	  });
+	}
+      } else {
       map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
-      ceph_assert(it != in->flushing_cap_tids.end());
 
       ldout(clnt->cct, 15) << "Client::C_nonblocking_fsync_state::advance" 
                            << " it->first " << it->first
@@ -14158,6 +14171,7 @@ void Client::C_nonblocking_fsync_state::advance()
 
       // DONE!
       ldout(clnt->cct, 15) << "Client::C_nonblocking_fsync_state::advance - DONE!" << dendl;
+      }
     }
   }
 
@@ -18247,11 +18261,11 @@ int Client::ll_read(Fh *fh, loff_t off, loff_t len, bufferlist *bl)
     return -ENOTCONN;
   }
 
-  std::scoped_lock lock(client_lock);
   if (fh == NULL || !_ll_fh_exists(fh)) {
     ldout(cct, 3) << "(fh)" << fh << " is invalid" << dendl;
     return -EBADF;
   }
+  std::scoped_lock<Inode> lock(*(fh->inode));
 
 #if defined(__linux__)
   /* We can't return bytes written larger than INT_MAX, clamp size to
