@@ -19757,7 +19757,7 @@ int Client::start_reclaim(const std::string& uuid, unsigned flags,
   if (uuid.empty())
     return -EINVAL;
 
-  std::unique_lock l(client_lock);
+  std::unique_lock<Client> l(*this);
   {
     auto it = metadata.find("uuid");
     if (it != metadata.end() && it->second == uuid)
@@ -19793,8 +19793,7 @@ int Client::start_reclaim(const std::string& uuid, unsigned flags,
 	// umounting?
 	return -EINVAL;
       }
-      ldout(cct, 10) << "waiting for session to mds." << mds << " to open" << dendl;
-      wait_on_context_list(session->waiting_for_open);
+      wait_for_mds_session_open(session, l);
       continue;
     }
 
