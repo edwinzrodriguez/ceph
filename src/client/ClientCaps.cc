@@ -187,6 +187,12 @@ int ClientCaps::try_get_caps(Fh *fh, int need, int want, int *phave)
   return 0;
 }
 
+void ClientCaps::enqueue_cap_waiter(Inode *in, Context *c)
+{
+  std::scoped_lock l(caps_lock);
+  in->waitfor_caps.push_back(c);
+}
+
 int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 {
   Inode *in = fh->inode.get();
