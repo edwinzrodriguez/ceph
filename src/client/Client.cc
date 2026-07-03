@@ -9013,6 +9013,16 @@ int without_inode_locks_if_held(Inode *a, Inode *b, Fn&& fn)
   return fn();
 }
 
+bool caps_issued_mask_no_client_lock(Client *cl, Inode *in, unsigned mask,
+				     bool allow_impl = false)
+{
+  if (cl->is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*cl);
+    return in->caps_issued_mask(mask, allow_impl);
+  }
+  return in->caps_issued_mask(mask, allow_impl);
+}
+
 } // namespace
 
 int Client::_getattr(const InodeRef& in, int mask, const UserPerm& perms, bool force)
@@ -9192,20 +9202,20 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
       mask |= CEPH_SETATTR_CTIME;
   }
 
-  if (in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
+  if (caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_EXCL)) {
     kill_sguid = !!(mask & CEPH_SETATTR_KILL_SGUID);
   }
 
   if (mask & CEPH_SETATTR_UID) {
     ldout(cct,10) << "changing uid to " << stx->stx_uid << dendl;
 
-    if (!do_sync && in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
+    if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_EXCL)) {
       in->ctime = ceph_clock_now();
       in->uid = stx->stx_uid;
       in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_UID;
       kill_sguid = true;
-    } else if (!in->caps_issued_mask(CEPH_CAP_AUTH_SHARED) ||
+    } else if (!caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_SHARED) ||
                in->uid != stx->stx_uid) {
       args.setattr.uid = stx->stx_uid;
       inode_drop |= CEPH_CAP_AUTH_SHARED;
@@ -9217,13 +9227,13 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
   if (mask & CEPH_SETATTR_GID) {
     ldout(cct,10) << "changing gid to " << stx->stx_gid << dendl;
 
-    if (!do_sync && in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
+    if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_EXCL)) {
       in->ctime = ceph_clock_now();
       in->gid = stx->stx_gid;
       in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_GID;
       kill_sguid = true;
-    } else if (!in->caps_issued_mask(CEPH_CAP_AUTH_SHARED) ||
+    } else if (!caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_SHARED) ||
                in->gid != stx->stx_gid) {
       args.setattr.gid = stx->stx_gid;
       inode_drop |= CEPH_CAP_AUTH_SHARED;
@@ -9235,19 +9245,19 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
   if (mask & CEPH_SETATTR_MODE) {
     ldout(cct,10) << "changing mode to " << std::oct << stx->stx_mode << dendl;
 
-    if (!do_sync && in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
+    if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_EXCL)) {
       in->ctime = ceph_clock_now();
       in->mode = (in->mode & ~07777) | (stx->stx_mode & 07777);
       in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_MODE;
-    } else if (!in->caps_issued_mask(CEPH_CAP_AUTH_SHARED) ||
+    } else if (!caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_SHARED) ||
                in->mode != stx->stx_mode) {
       args.setattr.mode = stx->stx_mode;
       inode_drop |= CEPH_CAP_AUTH_SHARED;
     } else {
       mask &= ~CEPH_SETATTR_MODE;
     }
-  } else if (!do_sync && in->caps_issued_mask(CEPH_CAP_AUTH_EXCL) && S_ISREG(in->mode)) {
+  } else if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_EXCL) && S_ISREG(in->mode)) {
     if (kill_sguid && (in->mode & (S_IXUSR|S_IXGRP|S_IXOTH))) {
       in->mode &= ~(S_ISUID|S_ISGID);
     } else {
@@ -9265,12 +9275,12 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
   if (mask & CEPH_SETATTR_BTIME) {
     ldout(cct,10) << "changing btime to " << in->btime << dendl;
 
-    if (!do_sync && in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
+    if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_EXCL)) {
       in->ctime = ceph_clock_now();
       in->btime = utime_t(stx->stx_btime);
       in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_BTIME;
-    } else if (!in->caps_issued_mask(CEPH_CAP_AUTH_SHARED) ||
+    } else if (!caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_SHARED) ||
                in->btime != utime_t(stx->stx_btime)) {
       args.setattr.btime = utime_t(stx->stx_btime);
       inode_drop |= CEPH_CAP_AUTH_SHARED;
@@ -9283,7 +9293,7 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
     ldout(cct,10) << "resetting cached fscrypt_auth field. size now "
                   << in->fscrypt_auth.size() << dendl;
 
-    if (!do_sync && in->caps_issued_mask(CEPH_CAP_AUTH_EXCL)) {
+    if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_EXCL)) {
       in->ctime = ceph_clock_now();
       in->fscrypt_auth = *aux;
 #if defined(__linux__)
@@ -9291,7 +9301,7 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
 #endif
       in->mark_caps_dirty(CEPH_CAP_AUTH_EXCL);
       mask &= ~CEPH_SETATTR_FSCRYPT_AUTH;
-    } else if (!in->caps_issued_mask(CEPH_CAP_AUTH_SHARED) ||
+    } else if (!caps_issued_mask_no_client_lock(this, in, CEPH_CAP_AUTH_SHARED) ||
                in->fscrypt_auth != *aux) {
       inode_drop |= CEPH_CAP_AUTH_SHARED;
     } else {
@@ -9426,7 +9436,7 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
       setting_smaller = 1;
     }
 #endif
-    if (!do_sync && in->caps_issued_mask(CEPH_CAP_FILE_EXCL) &&
+    if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_FILE_EXCL) &&
         !(mask & CEPH_SETATTR_KILL_SGUID) &&
         stx_size >= in->effective_size()) {
       if (stx_size > in->effective_size()) {
@@ -9463,12 +9473,12 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
     ldout(cct,10) << "resetting cached fscrypt_file field. size now "
                   << in->fscrypt_file.size() << dendl;
 
-    if (!do_sync && in->caps_issued_mask(CEPH_CAP_FILE_EXCL)) {
+    if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_FILE_EXCL)) {
       in->ctime = ceph_clock_now();
       in->cap_dirtier_uid = perms.uid();
       in->cap_dirtier_gid = perms.gid();
       in->mark_caps_dirty(CEPH_CAP_FILE_EXCL);
-    } else if (!in->caps_issued_mask(CEPH_CAP_FILE_SHARED) ||
+    } else if (!caps_issued_mask_no_client_lock(this, in, CEPH_CAP_FILE_SHARED) ||
                (paux && in->fscrypt_file != *paux)) {
       inode_drop |= CEPH_CAP_FILE_SHARED | CEPH_CAP_FILE_RD | CEPH_CAP_FILE_WR;
     } else {
@@ -9477,19 +9487,19 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
   }
 
   if (mask & CEPH_SETATTR_MTIME) {
-    if (!do_sync && in->caps_issued_mask(CEPH_CAP_FILE_EXCL)) {
+    if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_FILE_EXCL)) {
       in->mtime = utime_t(stx->stx_mtime);
       in->ctime = ceph_clock_now();
       in->time_warp_seq++;
       in->mark_caps_dirty(CEPH_CAP_FILE_EXCL);
       mask &= ~CEPH_SETATTR_MTIME;
-    } else if (!do_sync && in->caps_issued_mask(CEPH_CAP_FILE_WR) &&
+    } else if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_FILE_WR) &&
                utime_t(stx->stx_mtime) > in->mtime) {
       in->mtime = utime_t(stx->stx_mtime);
       in->ctime = ceph_clock_now();
       in->mark_caps_dirty(CEPH_CAP_FILE_WR);
       mask &= ~CEPH_SETATTR_MTIME;
-    } else if (!in->caps_issued_mask(CEPH_CAP_FILE_SHARED) ||
+    } else if (!caps_issued_mask_no_client_lock(this, in, CEPH_CAP_FILE_SHARED) ||
 	       in->mtime != utime_t(stx->stx_mtime)) {
       args.setattr.mtime = utime_t(stx->stx_mtime);
       inode_drop |= CEPH_CAP_FILE_SHARED | CEPH_CAP_FILE_RD |
@@ -9500,13 +9510,13 @@ int Client::_do_setattr(Inode *in, struct ceph_statx *stx, int mask,
   }
 
   if (mask & CEPH_SETATTR_ATIME) {
-    if (!do_sync && in->caps_issued_mask(CEPH_CAP_FILE_EXCL)) {
+    if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_FILE_EXCL)) {
       in->atime = utime_t(stx->stx_atime);
       in->ctime = ceph_clock_now();
       in->time_warp_seq++;
       in->mark_caps_dirty(CEPH_CAP_FILE_EXCL);
       mask &= ~CEPH_SETATTR_ATIME;
-    } else if (!do_sync && in->caps_issued_mask(CEPH_CAP_FILE_WR) &&
+    } else if (!do_sync && caps_issued_mask_no_client_lock(this, in, CEPH_CAP_FILE_WR) &&
                utime_t(stx->stx_atime) > in->atime) {
       in->atime = utime_t(stx->stx_atime);
       in->ctime = ceph_clock_now();
