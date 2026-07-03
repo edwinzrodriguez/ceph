@@ -139,44 +139,59 @@ template <>
 class unique_unlock<Inode> {
 public:
   explicit unique_unlock(Inode& in)
-    : _in(&in), _inner(in.m_inode_lock, std::defer_lock)
+    : _in(&in), _saved(0), _released(false)
   {
     release();
   }
 
   unique_unlock(Inode& in, std::defer_lock_t)
-    : _in(&in), _inner(in.m_inode_lock, std::defer_lock)
+    : _in(&in), _saved(0), _released(false)
   {}
 
   void release()
   {
-    if (!_inner.released() && _in->m_inode_lock.is_locked_by_me()) {
+    if (_released || !_in || !_in->m_inode_lock.is_locked_by_me()) {
+      return;
+    }
+    _saved = _in->m_inode_lock.release_for_wait();
+    for (int i = 0; i < _saved; ++i) {
       ceph::client_lock::order::on_inode_unlocked();
     }
-    _inner.release();
+    _in->m_inode_lock.native_mutex().unlock();
+    _released = true;
   }
 
   bool released() const
   {
-    return _inner.released();
+    return _released;
   }
 
   void reacquire()
   {
-    if (!_inner.released()) {
+    if (!_released || _saved <= 0 || !_in) {
       return;
     }
     ceph::client_lock::order::assert_no_client_lock(_in->get_client_lock());
-    _inner.reacquire();
-    ceph::client_lock::order::on_inode_locked();
+    _in->m_inode_lock.native_mutex().lock();
+    _in->m_inode_lock.restore_after_wait(_saved);
+    for (int i = 0; i < _saved; ++i) {
+      ceph::client_lock::order::on_inode_locked();
+    }
+    _released = false;
+    _saved = 0;
   }
 
   void _abandon() noexcept
   {
-    if (!_inner.released() && _in->m_inode_lock.is_locked_by_me()) {
-      ceph::client_lock::order::on_inode_unlocked();
+    if (!_released && _in && _in->m_inode_lock.is_locked_by_me()) {
+      int saved = _in->m_inode_lock.release_for_wait();
+      for (int i = 0; i < saved; ++i) {
+	ceph::client_lock::order::on_inode_unlocked();
+      }
+      _in->m_inode_lock.native_mutex().unlock();
     }
-    _inner._abandon();
+    _released = false;
+    _saved = 0;
   }
 
   ~unique_unlock() noexcept(false)
@@ -189,7 +204,8 @@ public:
 
 private:
   Inode *_in;
-  unique_unlock<ReentrantLock> _inner;
+  int _saved;
+  bool _released;
 };
 
 } // namespace ceph
