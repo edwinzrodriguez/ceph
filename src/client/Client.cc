@@ -11414,6 +11414,11 @@ Fh *Client::_create_fh(Inode *in, int flags, int cmode, const UserPerm& perms)
 
 int Client::_release_fh(Fh *f, bool drop_ref)
 {
+  if (is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*this);
+    return _release_fh(f, drop_ref);
+  }
+
   //ldout(cct, 3) << "op: client->close(open_files[ " << fh << " ]);" << dendl;
   //ldout(cct, 3) << "op: open_files.erase( " << fh << " );" << dendl;
   Inode *in = f->inode.get();
