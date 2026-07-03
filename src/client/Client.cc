@@ -1427,9 +1427,14 @@ Inode * Client::add_update_inode(InodeStat *st, utime_t from,
 	ldout(cct, 10) << " dir is open on empty dir " << in->ino << " with "
 		       << in->dir->dentries.size() << " entries, marking all dentries null" << dendl;
 	in->dir->readdir_cache.clear();
-	for (const auto& p : in->dir->dentries) {
-	  unlink(p.second, true, true);  // keep dir, keep dentry
-	}
+	std::vector<Dentry*> stale_dns;
+	stale_dns.reserve(in->dir->dentries.size());
+	for (const auto& p : in->dir->dentries)
+	  stale_dns.push_back(p.second);
+	in_lock.unlock();
+	for (Dentry *dn : stale_dns)
+	  unlink(dn, true, true);  // keep dir, keep dentry
+	in_lock.lock();
 	if (in->dir->dentries.empty())
 	  close_dir(in->dir);
       }
@@ -4092,11 +4097,16 @@ void Client::_put_inode(Inode *in, int n)
     remove_all_caps(in);
 
     if (in->dir && !in->dir->dentries.empty()) {
+      std::vector<Dentry*> stale_dns;
       for (auto p = in->dir->dentries.begin(); p != in->dir->dentries.end(); ) {
 	Dentry *dn = p->second;
 	++p;
-	unlink(dn, true, false);
+	stale_dns.push_back(dn);
       }
+      in_lock.unlock();
+      for (Dentry *dn : stale_dns)
+	unlink(dn, true, false);
+      in_lock.lock();
     }
     if (in->dir && in->dir->is_empty()) {
       close_dir(in->dir);
@@ -4582,6 +4592,10 @@ void Client::unlink_locked(Dentry *dn, bool keepdir, bool keepdentry)
 
 void Client::unlink(Dentry *dn, bool keepdir, bool keepdentry)
 {
+  if (is_locked_by_me()) {
+    unlink_locked(dn, keepdir, keepdentry);
+    return;
+  }
   std::unique_lock<Client> cl(*this);
   unlink_locked(dn, keepdir, keepdentry);
 }
@@ -5126,14 +5140,15 @@ void Client::signal_deferred_context_list(std::vector<Context*>& ls)
   if (ls.empty())
     return;
 
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
-
   std::vector<Context*> batch;
   batch.swap(ls);
   for (Context *c : batch) {
     // wait_on_context_list() installs C_TrackedCond waiters that must run
-    // under client_lock so notify_all() sees the mutex held.
-    if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr) {
+    // under client_lock so notify_all() sees the mutex held.  Do not block on
+    // client_lock here (e.g. ms_dispatch after cl.unlock()): make_request may
+    // hold it while waiting for this reply.
+    if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr &&
+	is_locked_by_me()) {
       c->complete(0);
     } else {
       queue_client_finisher(c);
@@ -6550,6 +6565,10 @@ out:
 
 int Client::may_open(const InodeRef& in, int flags, const UserPerm& perms)
 {
+  if (is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*this);
+    return may_open(in, flags, perms);
+  }
   std::unique_lock in_lock(*in);
   ldout(cct, 20) << __func__ << " " << *in << "; " << perms << dendl;
   unsigned want = 0;
@@ -6611,6 +6630,10 @@ out:
 
 int Client::may_create(const InodeRef& dir, const UserPerm& perms)
 {
+  if (is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*this);
+    return may_create(dir, perms);
+  }
   std::unique_lock dir_lock(*dir);
   ldout(cct, 20) << __func__ << " " << *dir << "; " << perms << dendl;
 #if defined(__linux__)
@@ -9618,6 +9641,11 @@ int Client::fill_stat(Inode *in, struct stat *st, frag_info_t *dirstat, nest_inf
 
 void Client::fill_statx(Inode *in, unsigned int mask, struct ceph_statx *stx)
 {
+  if (is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*this);
+    fill_statx(in, mask, stx);
+    return;
+  }
   ldout(cct, 10) << __func__ << " on " << in->ino << " snap/dev" << in->snapid
 	   << " mode 0" << oct << in->mode << dec
 	   << " mtime " << in->mtime << " ctime " << in->ctime << " change_attr " << in->change_attr << dendl;
@@ -14251,6 +14279,10 @@ int64_t Client::nonblocking_fsync(Inode *in, bool syncdataonly, Context *onfinis
 
 int Client::_fsync(Inode *in, bool syncdataonly)
 {
+  if (is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*this);
+    return _fsync(in, syncdataonly);
+  }
   std::unique_lock<Inode> in_guard(*in);
 
   int r = 0;
