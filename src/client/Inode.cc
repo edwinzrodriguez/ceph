@@ -869,6 +869,11 @@ void Inode::unset_deleg(Fh *fh)
 */
 void Inode::mark_caps_dirty(int caps)
 {
+  if (client->is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*client);
+    mark_caps_dirty(caps);
+    return;
+  }
   std::unique_lock<Inode> in_lock(*this);
 
   /*
@@ -901,6 +906,11 @@ void Inode::mark_caps_dirty(int caps)
 */
 void Inode::mark_caps_clean()
 {
+  if (client->is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*client);
+    mark_caps_clean();
+    return;
+  }
   std::unique_lock<Inode> in_lock(*this);
 
   lsubdout(client->cct, client, 10) << __func__ << " " << *this << dendl;
