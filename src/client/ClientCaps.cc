@@ -796,6 +796,13 @@ void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
 
 void ClientCaps::queue_cap_snap(Inode *in, const SnapContext& old_snapc)
 {
+  if (client->is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*client);
+    queue_cap_snap(in, old_snapc);
+    return;
+  }
+  std::unique_lock<Inode> in_lock(*in);
+
   int used = get_caps_used(in);
   int dirty = in->caps_dirty();
   ldout(cct, 10) << __func__ << " " << *in << " snapc " << old_snapc << " used " << ccap_string(used) << dendl;

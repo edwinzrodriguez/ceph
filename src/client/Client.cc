@@ -4648,12 +4648,22 @@ void Client::_flush_cap_snap_buffer(Inode *in)
 
 void Client::get_cap_ref(Inode *in, int cap)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  if (is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*this);
+    get_cap_ref(in, cap);
+    return;
+  }
+  std::unique_lock in_lock(*in);
   client_caps->get_cap_ref(in, cap);
 }
 
 void Client::put_cap_ref(Inode *in, int cap)
 {
+  if (is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*this);
+    put_cap_ref(in, cap);
+    return;
+  }
   std::unique_lock in_lock(*in);
   client_caps->put_cap_ref(in, cap);
 }
@@ -5258,7 +5268,14 @@ void Client::_invalidate_inode_cache(Inode *in, int64_t off, int64_t len)
 
 bool Client::_release(Inode *in)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
+  if (!client_lock.is_locked_by_me()) {
+    if (in->is_locked_by_me()) {
+      ceph::unique_unlock<Inode> drop(*in);
+      return _release(in);
+    }
+    std::scoped_lock cl(client_lock);
+    return _release(in);
+  }
 
   ldout(cct, 20) << "_release " << *in << dendl;
   if (in->cap_refs[CEPH_CAP_FILE_CACHE] == 0) {
@@ -6373,6 +6390,7 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
       _try_to_trim_inode(in, true);
     if (is_unmounting())
       delay_put_inodes(true);
+    in_unlock._abandon();
   }
 }
 
@@ -6681,6 +6699,10 @@ void Client::walk_dentry_result::print(std::ostream& os) const
 
 int Client::may_delete(const walk_dentry_result& wdr, const UserPerm& perms, bool check_perms)
 {
+  if (is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*this);
+    return may_delete(wdr, perms, check_perms);
+  }
   ldout(cct, 20) << __func__ << " " << wdr << "; " << perms << dendl;
   auto* diri = wdr.diri.get();
   auto* in = wdr.target.get();
@@ -14334,7 +14356,10 @@ int Client::_fsync(Inode *in, bool syncdataonly)
     }
 
     if (unsafe_req) {
-      wait_on_context_list(unsafe_req->waitfor_safe);
+      // The safe reply may land while we dropped inode_lock for _flush;
+      // wait_unsafe_requests() uses the same guard to avoid a lost wakeup.
+      if (unsafe_req->unsafe_item.is_on_list())
+	wait_on_context_list(unsafe_req->waitfor_safe);
       put_request(unsafe_req);
     }
   }
@@ -17252,18 +17277,14 @@ int Client::_mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& p
     return -EDQUOT;
   }
 
-  MetaRequest *req = nullptr;
-  int res = 0;
-  {
-    std::unique_lock in_lock(*wdr.diri);
-    if (should_check_perms()) {
-      if (int rc = may_create(wdr.diri, perm); rc < 0) {
-	return rc;
-      }
+  if (should_check_perms()) {
+    if (int rc = may_create(wdr.diri, perm); rc < 0) {
+      return rc;
     }
+  }
 
   bool is_snap_op = wdr.diri->snapid == CEPH_SNAPDIR;
-  req = new MetaRequest(is_snap_op ?
+  MetaRequest *req = new MetaRequest(is_snap_op ?
 				     CEPH_MDS_OP_MKSNAP : CEPH_MDS_OP_MKDIR);
 
   if (!is_snap_op)
@@ -17285,7 +17306,7 @@ int Client::_mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& p
 
   mode |= S_IFDIR;
   bufferlist bl;
-  res = _posix_acl_create(wdr.diri, &mode, bl, perm);
+  int res = _posix_acl_create(wdr.diri, &mode, bl, perm);
   if (res < 0) {
     put_request(req);
     return res;
@@ -17302,7 +17323,6 @@ int Client::_mkdir(const walk_dentry_result& wdr, mode_t mode, const UserPerm& p
   }
   if (bl.length() > 0) {
     req->set_data(bl);
-  }
   }
 
   req->set_dentry(wdr.dn);
@@ -17703,7 +17723,6 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
   if (int rc = path_walk(fromdir, filepath(fromname), &wdr_from, perm, {.followsym = false, .is_rename = true}); rc < 0) {
     return rc;
   }
-  std::unique_lock in_lock(*wdr_from.diri);
 
   /* annoying special case: wdr_from.dn is null if referring to "/" */
   if (wdr_from.diri == root && wdr_from.dname.empty()) {
@@ -17714,30 +17733,38 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
   if (int rc = path_walk(todir, filepath(toname), &wdr_to, perm, {.followsym = false, .is_rename = true, .require_target = false}); rc < 0) {
     return rc;
   }
-  std::unique_lock in_lock2(*wdr_to.diri);
 
   /* annoying special case: wdr_to.dn is null if referring to "/" */
   if (wdr_to.diri == root && wdr_to.dname.empty()) {
     return -EINVAL;
   }
 
-#if defined(__linux__)
-  bool source_locked = is_inode_locked(wdr_from.diri);
-  bool dest_locked = is_inode_locked(wdr_to.diri);
-  if (source_locked || dest_locked)
-    return -ENOKEY;
-#endif
-  if (wdr_from.diri->snapid != wdr_to.diri->snapid)
-    return -EXDEV;
-
   int op = CEPH_MDS_OP_RENAME;
-  if (wdr_from.diri->snapid != CEPH_NOSNAP) {
-    if (wdr_from.diri == wdr_to.diri && wdr_from.diri->snapid == CEPH_SNAPDIR)
-      op = CEPH_MDS_OP_RENAMESNAP;
-    else
-      return -EROFS;
+  {
+    ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+    if (is_locked_by_me()) {
+      cl_drop.release();
+    }
+    std::unique_lock in_lock(*wdr_from.diri);
+    std::unique_lock in_lock2(*wdr_to.diri);
+#if defined(__linux__)
+    if (is_inode_locked(wdr_from.diri) || is_inode_locked(wdr_to.diri)) {
+      return -ENOKEY;
+    }
+#endif
+    if (wdr_from.diri->snapid != wdr_to.diri->snapid) {
+      return -EXDEV;
+    }
+    if (wdr_from.diri->snapid != CEPH_NOSNAP) {
+      if (wdr_from.diri == wdr_to.diri && wdr_from.diri->snapid == CEPH_SNAPDIR)
+	op = CEPH_MDS_OP_RENAMESNAP;
+      else
+	return -EROFS;
+    }
+    in_lock2.unlock();
+    in_lock.unlock();
+    cl_drop.reacquire();
   }
-
 
   if (should_check_perms()) {
     if (int rc = may_delete(wdr_from, perm); rc < 0) {
@@ -17745,17 +17772,6 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
     }
     if (int rc = may_delete(wdr_to, perm); rc < 0) {
       return rc;
-    }
-  }
-
-  // don't allow cross-quota renames
-  if (cct->_conf.get_val<bool>("client_quota") && wdr_from.diri != wdr_to.diri) {
-    Inode *fromdir_root =
-      wdr_from.diri->quota.is_enabled() ? wdr_from.diri.get() : get_quota_root(wdr_from.diri.get(), perm);
-    Inode *todir_root =
-      wdr_to.diri->quota.is_enabled() ? wdr_to.diri.get() : get_quota_root(wdr_to.diri.get(), perm);
-    if (fromdir_root != todir_root) {
-      return -EXDEV;
     }
   }
 
@@ -17778,12 +17794,10 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
     req->dentry_drop = CEPH_CAP_FILE_SHARED;
     req->dentry_unless = CEPH_CAP_FILE_EXCL;
 
-    wdr_from.target->break_all_delegs();
     req->set_old_inode(wdr_from.target);
     req->old_inode_drop = CEPH_CAP_LINK_SHARED;
 
     if (wdr_to.target) {
-      wdr_to.target->break_all_delegs();
       req->set_other_inode(wdr_to.target);
       req->other_inode_drop = CEPH_CAP_LINK_SHARED | CEPH_CAP_LINK_EXCL;
     }
@@ -17795,6 +17809,24 @@ int Client::_rename(Inode *fromdir, const char *fromname, Inode *todir, const ch
 
   }
   req->set_inode(wdr_to.diri);
+
+  if (op == CEPH_MDS_OP_RENAME) {
+    wdr_from.target->break_all_delegs();
+    if (wdr_to.target) {
+      wdr_to.target->break_all_delegs();
+    }
+  }
+
+  // don't allow cross-quota renames (get_quota_root needs client_lock)
+  if (cct->_conf.get_val<bool>("client_quota") && wdr_from.diri != wdr_to.diri) {
+    Inode *fromdir_root =
+      wdr_from.diri->quota.is_enabled() ? wdr_from.diri.get() : get_quota_root(wdr_from.diri.get(), perm);
+    Inode *todir_root =
+      wdr_to.diri->quota.is_enabled() ? wdr_to.diri.get() : get_quota_root(wdr_to.diri.get(), perm);
+    if (fromdir_root != todir_root) {
+      return -EXDEV;
+    }
+  }
 
   InodeRef target;
   res = make_request(req, perm, &target);
@@ -19400,11 +19432,22 @@ bool Client::check_quota_condition(Inode *in, const UserPerm& perms,
 
   while (true) {
     ceph_assert(in != NULL);
-    {
+    auto check_one = [&]() -> bool {
       std::scoped_lock<Inode> in_lock(*in);
-      if (test(*in)) {
-	return true;
-      }
+      return test(*in);
+    };
+    bool exceeded = false;
+    if (is_locked_by_me()) {
+      ceph::unique_unlock<Client> drop(*this);
+      exceeded = check_one();
+    } else if (in->is_locked_by_me()) {
+      ceph::unique_unlock<Inode> drop(*in);
+      exceeded = check_one();
+    } else {
+      exceeded = check_one();
+    }
+    if (exceeded) {
+      return true;
     }
 
     if (in == root_ancestor) {
