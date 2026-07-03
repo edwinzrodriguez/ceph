@@ -322,6 +322,10 @@ void Inode::try_touch_cap(mds_rank_t mds)
  */
 bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
 {
+  if (client->is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*client);
+    return caps_issued_mask(mask, allow_impl);
+  }
   std::unique_lock<Inode> in_lock(*this);
 
   int c = snap_caps;
@@ -752,6 +756,11 @@ void Inode::break_deleg(bool skip_read)
   lsubdout(client->cct, client, 10) <<
 	  __func__ << ": breaking delegs on " << *this << dendl;
 
+  ceph::unique_unlock<Inode> in_drop(const_cast<Inode&>(*this), std::defer_lock);
+  if (is_locked_by_me()) {
+    in_drop.release();
+  }
+
   recall_deleg(skip_read);
 
   while (!delegations_broken(skip_read))
@@ -932,6 +941,11 @@ FSCryptContextRef Inode::init_fscrypt_ctx(FSCrypt *fscrypt)
 
 void Inode::gen_inherited_fscrypt_auth(std::vector<uint8_t> *fsa)
 {
+  if (client->is_locked_by_me()) {
+    ceph::unique_unlock<Client> drop(*client);
+    gen_inherited_fscrypt_auth(fsa);
+    return;
+  }
   std::unique_lock<Inode> in_lock(*this);
 
   if (!fscrypt_ctx) {
