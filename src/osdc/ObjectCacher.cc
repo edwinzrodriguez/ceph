@@ -2276,6 +2276,15 @@ bool ObjectCacher::_flush_set_finish(C_GatherBuilder *gather,
   return true;
 }
 
+// bh_write() drops cache_lock to arm write commits.  A commit for an object
+// already in the flush gather set can therefore complete before we register
+// waitfor_commit subs at the end of flush_set/flush_all.  Treat those as done.
+static bool object_write_already_committed(ObjectCacher::Object *ob)
+{
+  return ob->last_write_tid != 0 &&
+         ob->last_commit_tid >= ob->last_write_tid;
+}
+
 // flush.  non-blocking, takes callback.
 // returns true if already flushed
 bool ObjectCacher::flush_set(ObjectSet *oset, Context *onfinish)
@@ -2371,6 +2380,13 @@ bool ObjectCacher::flush_set(ObjectSet *oset, Context *onfinish)
        i != waitfor_commit.end(); ++i) {
     Object *ob = *i;
 
+    if (object_write_already_committed(ob)) {
+      ldout(cct, 10) << "flush_set " << oset << " tid "
+		     << ob->last_write_tid << " already committed on "
+		     << *ob << dendl;
+      continue;
+    }
+
     // we'll need to gather...
     ldout(cct, 10) << "flush_set " << oset << " will wait for ack tid "
 		   << ob->last_write_tid << " on " << *ob << dendl;
@@ -2414,6 +2430,12 @@ bool ObjectCacher::flush_set(ObjectSet *oset, vector<ObjectExtent>& exv,
 		   << " " << ob << dendl;
 
     if (!flush(ob, ex.offset, ex.length, trace)) {
+      if (object_write_already_committed(ob)) {
+	ldout(cct, 10) << "flush_set " << oset << " tid "
+		       << ob->last_write_tid << " already committed on "
+		       << *ob << dendl;
+	continue;
+      }
       // we'll need to gather...
       ldout(cct, 10) << "flush_set " << oset << " will wait for ack tid "
 		     << ob->last_write_tid << " on " << *ob << dendl;
@@ -2472,6 +2494,12 @@ bool ObjectCacher::flush_all(Context *onfinish)
        i != waitfor_commit.end();
        ++i) {
     Object *ob = *i;
+
+    if (object_write_already_committed(ob)) {
+      ldout(cct, 10) << "flush_all tid " << ob->last_write_tid
+		     << " already committed on " << *ob << dendl;
+      continue;
+    }
 
     // we'll need to gather...
     ldout(cct, 10) << "flush_all will wait for ack tid "
