@@ -16,13 +16,14 @@
 
 #include "common/code_environment.h"
 
+#include <atomic>
 #include <iostream>
 
 #include "acconfig.h"
 
 #include <string.h>
 
-code_environment_t g_code_env = CODE_ENVIRONMENT_UTILITY;
+std::atomic<code_environment_t> g_code_env{CODE_ENVIRONMENT_UTILITY};
 
 extern "C" const char *code_environment_to_str(enum code_environment_t e)
 {
