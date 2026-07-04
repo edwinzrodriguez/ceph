@@ -495,7 +495,7 @@ void global_print_banner(void)
 
 int global_init_prefork(CephContext *cct)
 {
-  if (g_code_env != CODE_ENVIRONMENT_DAEMON)
+  if (get_code_env() != CODE_ENVIRONMENT_DAEMON)
     return -1;
 
   const auto& conf = cct->_conf;
