@@ -21,7 +21,6 @@
 #include "common/dout.h"
 #include "common/hostname.h"
 #include "common/strtol.h"
-#include "common/valgrind.h"
 #include "common/zipkin_trace.h"
 #include "include/compat.h"
 #include "log/Log.h"
@@ -33,8 +32,7 @@ CephContext *common_preinit(const CephInitParameters &iparams,
 			    enum code_environment_t code_env, int flags)
 {
   // set code environment
-  ANNOTATE_BENIGN_RACE_SIZED(&g_code_env, sizeof(g_code_env), "g_code_env");
-  g_code_env = code_env;
+  set_code_env(code_env);
 
   // Create a configuration object
   CephContext *cct = new CephContext(iparams.module_type, code_env, flags);

@@ -132,7 +132,7 @@ int Thread::try_create(size_t stacksize)
 
   #ifndef _WIN32
   sigset_t old_sigset;
-  if (g_code_env == CODE_ENVIRONMENT_LIBRARY) {
+  if (get_code_env() == CODE_ENVIRONMENT_LIBRARY) {
     block_signals(NULL, &old_sigset);
   }
   else {

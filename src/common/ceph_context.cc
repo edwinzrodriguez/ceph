@@ -1055,7 +1055,7 @@ void CephContext::init_crypto()
 void CephContext::shutdown_crypto()
 {
   if (--_crypto_inited == 0) {
-    TOPNSPC::crypto::shutdown(g_code_env == CODE_ENVIRONMENT_LIBRARY);
+    TOPNSPC::crypto::shutdown(get_code_env() == CODE_ENVIRONMENT_LIBRARY);
   }
 }
 
