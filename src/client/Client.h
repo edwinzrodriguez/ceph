@@ -960,7 +960,8 @@ public:
   void handle_cap_trunc(MetaSession *session, Inode *in, const MConstRef<MClientCaps>& m);
   void handle_cap_flush_ack(MetaSession *session, Inode *in, Cap *cap, const MConstRef<MClientCaps>& m);
   void handle_cap_flushsnap_ack(MetaSession *session, Inode *in, const MConstRef<MClientCaps>& m);
-  void handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const MConstRef<MClientCaps>& m);
+  bool handle_cap_grant(MetaSession *session, Inode *in, Cap *cap,
+			const MConstRef<MClientCaps>& m, bool *need_delay_put=nullptr);
   void cap_delay_requeue(Inode *in);
   void unlink_delay_cap_item(Inode *in);
 
@@ -1385,6 +1386,8 @@ protected:
   void _force_evict_unmount_cache();
   void dispose_orphan_inodes();
   void put_inode(Inode *in, int n=1);
+  bool _inode_map_has(Inode *in) const;
+  bool _inode_is_deleting(Inode *in);
   void close_dir(Dir *dir);
 
   int subscribe_mdsmap(const std::string &fs_name="");
@@ -2205,6 +2208,11 @@ private:
       flush_completed = false;
       result = 0;
       waitfor_safe = false;
+      clnt->_fsync_enter(in);
+    }
+
+    ~C_nonblocking_fsync_state() {
+      clnt->_fsync_exit(in);
     }
 
     void advance();
@@ -2419,6 +2427,9 @@ private:
 
   int _fsync(Fh *fh, bool syncdataonly);
   int _fsync(Inode *in, bool syncdataonly);
+  void _fsync_enter(Inode *in);
+  void _fsync_exit(Inode *in);
+  int _fsync_wait_objectcacher(Inode *in);
   int _sync_fs();
   int clear_suid_sgid(Inode *in, const UserPerm& perms, bool defer=false);
   int _fallocate(Fh *fh, int mode, int64_t offset, int64_t length);
@@ -2645,11 +2656,14 @@ private:
 
   static constexpr unsigned delay_i_shards = 256;
   struct DelayInodeShard {
-    ceph::mutex lock = ceph::make_mutex("Client::delay_i_lock");
+    // lockdep off: 256 shards share no ordering relation with client_lock.
+    ceph::mutex lock = ceph::make_mutex("Client::delay_i_lock", false);
     std::map<Inode*,int> release;
     std::unordered_set<Inode*> deleting;
   };
   std::array<DelayInodeShard, delay_i_shards> delay_i;
+  // Filled under ObjectCacher::cache_lock; merged into delay_i in delay_put_inodes.
+  std::vector<std::pair<Inode*, int>> pending_oc_puts;
   unsigned delay_i_shard(Inode *in) const;
   // Inodes pinned by the unmount oset anchor; defer _put_inode map removal.
   std::unordered_set<Inode*> unmount_anchor_pins;

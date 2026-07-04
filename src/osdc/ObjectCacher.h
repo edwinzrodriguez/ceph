@@ -801,6 +801,10 @@ public:
     return finisher.am_self();
   }
 
+  bool cache_lock_is_locked_by_me() const {
+    return cache_lock.is_locked_by_me();
+  }
+
   void wait_for_flush_callbacks() {
     // Never block the finisher thread on its own queue (e.g. _put_inode from a
     // flush completion callback).
