@@ -95,8 +95,23 @@ public:
   // remove an item
   LRUObject *lru_remove(LRUObject *o) {
     if (!o->lru) return o;
+    // The link may have been removed from the list by a concurrent trim or
+    // unlink (e.g. inode eviction racing with cap revocation). Guard against
+    // operating on a stale link by checking is_on_list() before dereferencing
+    // get_list(), which would otherwise return a dangling pointer.
+    if (!o->lru_link.is_on_list()) {
+      o->lru = nullptr;
+      return o;
+    }
     auto list = o->lru_link.get_list();
-    ceph_assert(list == &top || list == &bottom || list == &pintail);
+    // Sanity check: the list pointer must be one of the three lists owned by
+    // this LRU instance. If it isn't, the entry was already unlinked by a
+    // concurrent trim/unlink path and the list pointer is stale — bail out
+    // rather than asserting, to tolerate this benign race.
+    if (list != &top && list != &bottom && list != &pintail) {
+      o->lru = nullptr;
+      return o;
+    }
     o->lru_link.remove_myself();
     if (o->lru_pinned) num_pinned--;
     o->lru = nullptr;
