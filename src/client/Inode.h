@@ -8,6 +8,7 @@
 
 #include "include/compat.h"
 #include "include/ceph_assert.h"
+#include "common/ceph_mutex.h"
 #include "common/reentrant_lock.h"
 #include "include/types.h"
 #include "include/xlist.h"
@@ -304,6 +305,12 @@ struct Inode : RefCountedObject {
   std::vector<Context*> waitfor_caps_pending;
   std::vector<Context*> waitfor_commit;
   std::list<ceph::reentrant_condition_variable*> waitfor_deleg;
+
+  // Serialize blocking/nonblocking fsync and COMMIT on one file (NFS-Ganesha
+  // may run several in parallel).  Independent of inode_lock.
+  mutable ceph::mutex fsync_mutex = ceph::make_mutex("Inode::fsync_mutex");
+  ceph::condition_variable fsync_cond;
+  unsigned fsync_active = 0;
 
   Dentry *get_first_parent() {
     ceph_assert(!dentries.empty());

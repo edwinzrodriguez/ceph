@@ -37,6 +37,7 @@
  *   * ll_sync_inode / ll_fsync / fsync: call _fsync without an outer
  *     inode_lock; _fsync acquires inode_lock and must drop it across
  *     ObjectCacher and caps_lock cond waits so parallel writers can finish.
+ *     Per-inode fsync_mutex serializes concurrent COMMIT/fsync on one file.
  *   * Metadata / ms_dispatch: client_lock only; drop it before taking
  *     inode_lock when inode state is required.
  *   * Cross-tier work (_put_inode, cap flush, send_request): finish under one
@@ -178,8 +179,6 @@
 
 namespace ceph::client_lock::order {
 
-#ifdef CEPH_DEBUG_MUTEX
-
 inline thread_local int inode_lock_depth = 0;
 
 inline void on_inode_locked()
@@ -189,9 +188,18 @@ inline void on_inode_locked()
 
 inline void on_inode_unlocked()
 {
+#ifdef CEPH_DEBUG_MUTEX
   ceph_assert(inode_lock_depth > 0);
+#endif
   --inode_lock_depth;
 }
+
+inline bool any_inode_lock_held()
+{
+  return inode_lock_depth > 0;
+}
+
+#ifdef CEPH_DEBUG_MUTEX
 
 inline void assert_no_inode_lock()
 {
@@ -214,8 +222,6 @@ inline void report_overlap_if_any(const ceph::ReentrantLock& client)
 
 #else // !CEPH_DEBUG_MUTEX
 
-inline void on_inode_locked() {}
-inline void on_inode_unlocked() {}
 inline void assert_no_inode_lock() {}
 inline void assert_no_client_lock(const ceph::ReentrantLock&) {}
 inline void report_overlap_if_any(const ceph::ReentrantLock&) {}
