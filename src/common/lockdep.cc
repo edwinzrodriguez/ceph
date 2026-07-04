@@ -400,6 +400,9 @@ int lockdep_will_unlock(const char *name, int id)
 
   delete held[p][id];
   held[p].erase(id);
+  if (held[p].empty()) {
+    held.erase(p);
+  }
 out:
   pthread_mutex_unlock(&lockdep_mutex);
   return id;
