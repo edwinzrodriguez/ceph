@@ -384,6 +384,8 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 int ClientCaps::get_caps_used(Inode *in)
 {
   unsigned used = in->caps_used();
+  if (in->get_nref() == 0 || client->_inode_is_deleting(in))
+    return used;
   if (!(used & CEPH_CAP_FILE_CACHE) &&
       !client->objectcacher_set_is_empty(in))
     used |= CEPH_CAP_FILE_CACHE;
@@ -412,6 +414,9 @@ void ClientCaps::prepare_inode_unmount(Inode *in)
   // inode_lock before client_lock (same order as _put_inode) — callers must
   // not hold client_lock across this function.
   ceph_assert(!client->is_locked_by_me());
+
+  if (!in || in->get_nref() == 0 || client->_inode_is_deleting(in))
+    return;
 
   std::vector<std::pair<int, int>> refs;
   {
@@ -448,6 +453,8 @@ void ClientCaps::purge_delayed_list()
     }
   }
   for (Inode *in : inodes) {
+    if (!in || in->get_nref() == 0 || client->_inode_is_deleting(in))
+      continue;
     if (in->delay_cap_item.is_on_list())
       in->delay_cap_item.remove_myself();
     int extra = in->get_nref() - 1;
@@ -647,6 +654,8 @@ int ClientCaps::adjust_caps_used_for_lazyio(int used, int issued, int implemente
  */
 void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
 {
+  if (!in || in->get_nref() == 0 || client->_inode_is_deleting(in.get()))
+    return;
   std::unique_lock<Inode> in_lock(*in);
   unsigned wanted;
   unsigned used;
