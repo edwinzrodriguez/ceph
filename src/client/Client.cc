@@ -20,6 +20,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -266,6 +267,10 @@ bool Client::objectcacher_set_is_empty(Inode *in)
 {
   if (in->get_nref() == 0 || _inode_is_deleting(in))
     return true;
+  // Caller already holds inode_lock — do not InodeRef-pin; ~InodeOsetPin would
+  // put_inode() and fight the outer inode guard.
+  if (in->is_locked_by_me())
+    return objectcacher->set_is_empty(&in->oset);
   InodeOsetPin oc(in);
   ceph::unique_unlock<ceph::ReentrantLock> cl_drop(client_lock, std::defer_lock);
   if (client_lock.is_locked_by_me())
@@ -277,25 +282,40 @@ void Client::objectcacher_purge_set(Inode *in)
 {
   if (!objectcacher || !in || in->get_nref() == 0)
     return;
-  InodeOsetPin oc(in);
+  ObjectCacher::ObjectSet *oset;
+  std::optional<InodeOsetPin> oc;
+  if (in->is_locked_by_me()) {
+    oset = &in->oset;
+  } else {
+    oc.emplace(in);
+    oset = oc->oset;
+  }
   ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
   if (is_locked_by_me())
     cl_drop.release();
   objectcacher->wait_for_flush_callbacks();
   auto oc_lock = objectcacher->acquire_cache_lock();
-  objectcacher->purge_set(oc.oset);
+  objectcacher->purge_set(oset);
 }
 
 void Client::objectcacher_release_set(Inode *in)
 {
   if (!objectcacher || !in || in->get_nref() == 0)
     return;
-  InodeOsetPin oc(in);
+  ObjectCacher::ObjectSet *oset;
+  std::optional<InodeOsetPin> oc;
+  if (in->is_locked_by_me()) {
+    oset = &in->oset;
+  } else {
+    oc.emplace(in);
+    oset = oc->oset;
+  }
   ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
   if (is_locked_by_me())
     cl_drop.release();
+  objectcacher->wait_for_flush_callbacks();
   auto oc_lock = objectcacher->acquire_cache_lock();
-  objectcacher->release_set(oc.oset);
+  objectcacher->release_set(oset);
 }
 
 int64_t Client::objectcacher_release_all()
@@ -4769,18 +4789,13 @@ void Client::put_inode(Inode *in, int n)
     return;
 
   // Never take client_lock while holding any inode_lock.
-  if (in->is_locked_by_me()) {
-    ceph::unique_unlock<Inode> u(*in);
-    put_inode(in, n);
-    return;
-  }
   if (objectcacher && objectcacher->cache_lock_is_locked_by_me()) {
     pending_oc_puts.emplace_back(in, n);
     if (is_unmounting())
       mount_cond.notify_all_sloppy();
     return;
   }
-  if (ceph::client_lock::order::any_inode_lock_held()) {
+  if (in->is_locked_by_me() || ceph::client_lock::order::any_inode_lock_held()) {
     const unsigned shard = delay_i_shard(in);
     {
       std::scoped_lock dl(delay_i[shard].lock);
@@ -14783,10 +14798,17 @@ void Client::C_nonblocking_fsync_state::advance()
 
     if (clnt->cct->_conf->client_oc) {
       Context *finisher = new C_nonblocking_fsync_flush_finisher(clnt, this);
-      flush_wait = true;
       tmp_ref = in; // take a reference; C_SaferCond doesn't and _flush won't either
-      clnt->_flush(in, finisher);
-      ldout(clnt->cct, 15) << "using return-valued form of _fsync" << dendl;
+      if (clnt->_flush(in, finisher)) {
+	flush_completed = true;
+	flush_wait = false;
+      } else {
+	flush_wait = true;
+	flush_async_pending = true;
+      }
+      ldout(clnt->cct, 15) << "using return-valued form of _fsync"
+			   << " flush_async_pending=" << flush_async_pending
+			   << dendl;
     }
 
     if (!syncdataonly && in->dirty_caps) {
@@ -14833,31 +14855,28 @@ void Client::C_nonblocking_fsync_state::advance()
     }
 
     if (flush_wait && !flush_completed) {
-      if (!in->oset.dirty_or_tx) {
-	ldout(clnt->cct, 10) << "ino " << in->ino
-			     << " oset clean, skipping orphaned flush waiter"
-			     << dendl;
-	flush_completed = true;
-	result = 0;
-      } else {
-	// wait on a real reply instead of guessing
-	ldout(clnt->cct, 15) << "waiting on data to flush" << dendl;
-	ldout(clnt->cct, 10) << "io_correl fsync wait flush"
-			     << " fsync_state=" << this
-			     << " onfinish=" << onfinish
-			     << " ino=" << in->ino
-			     << dendl;
-	// ------------  here is a state machine break point
-	return;
-      }
+      // Never infer completion from oset clean while an ObjectCacher flush_set
+      // gather may still hold our flush finisher as onfinish (UAF on complete).
+      ldout(clnt->cct, 15) << "waiting on data to flush"
+			   << " flush_async_pending=" << flush_async_pending
+			   << " dirty_or_tx=" << in->oset.dirty_or_tx
+			   << dendl;
+      ldout(clnt->cct, 10) << "io_correl fsync wait flush"
+			   << " fsync_state=" << this
+			   << " onfinish=" << onfinish
+			   << " ino=" << in->ino
+			   << dendl;
+      // ------------  here is a state machine break point
+      return;
     }
     if (flush_wait && flush_completed && result == 0 && in->oset.dirty_or_tx) {
       flush_completed = false;
+      flush_async_pending = false;
       tmp_ref = in;
-      clnt->_flush(in, new C_nonblocking_fsync_flush_finisher(clnt, this));
-      if (!in->oset.dirty_or_tx) {
+      if (clnt->_flush(in, new C_nonblocking_fsync_flush_finisher(clnt, this))) {
 	flush_completed = true;
       } else {
+	flush_async_pending = true;
 	progress = 2;
 	return;
       }
@@ -15017,6 +15036,7 @@ void Client::C_nonblocking_fsync_state::complete_flush(int r)
                        << dendl;
 
   flush_completed = true;
+  flush_async_pending = false;
   result = r;
   if (progress == 2)
     advance();

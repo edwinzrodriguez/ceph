@@ -2196,6 +2196,7 @@ private:
     int progress;
     bool flush_wait;
     bool flush_completed;
+    bool flush_async_pending;
     int result;
     bool waitfor_safe;
 
@@ -2206,6 +2207,7 @@ private:
       progress = 0;
       flush_wait = false;
       flush_completed = false;
+      flush_async_pending = false;
       result = 0;
       waitfor_safe = false;
       clnt->_fsync_enter(in);
