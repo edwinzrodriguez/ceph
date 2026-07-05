@@ -120,9 +120,9 @@
  *
  * Re-entering without holding either lock (e.g. put_inode):
  *
- *   if (in->is_locked_by_me()) {
- *     ceph::unique_unlock<Inode> u(*in);
- *     put_inode(in, n);                          // recursive call, no inode_lock
+ *   if (in->is_locked_by_me() || any_inode_lock_held()) {
+ *     // defer to delay_i — do not unique_unlock<Inode> while an outer inode
+ *     // guard still owns the lock (e.g. InodeRef release under scoped_lock)
  *     return;
  *   }
  *

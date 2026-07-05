@@ -12,6 +12,10 @@
 
 #include "mds/flock.h"
 
+#include <optional>
+#include <unordered_map>
+#include <vector>
+
 using std::dec;
 using std::list;
 using std::oct;
@@ -256,6 +260,45 @@ bool auth_cap_is_live(const Inode *in)
   }
   return false;
 }
+
+struct CapLeaseSnap {
+  uint64_t cap_gen = 0;
+  utime_t cap_ttl;
+};
+
+CapLeaseSnap snap_cap_lease(MetaSession *session)
+{
+  CapLeaseSnap snap;
+  if (!session)
+    return snap;
+  std::scoped_lock lock(session->session_lock);
+  snap.cap_gen = session->cap_gen;
+  snap.cap_ttl = session->cap_ttl;
+  return snap;
+}
+
+bool cap_lease_valid_from_snap(__u32 gen, const CapLeaseSnap &snap)
+{
+  return gen <= snap.cap_gen && ceph_clock_now() < snap.cap_ttl;
+}
+
+struct CapsIssuedEntry {
+  __u32 gen;
+  unsigned issued;
+  unsigned implemented;
+  MetaSession *session;
+};
+
+void snapshot_caps_for_lease_check(const Inode *in,
+				   std::vector<CapsIssuedEntry> *out)
+{
+  out->clear();
+  out->reserve(in->caps.size());
+  for (const auto &[mds, cap] : in->caps) {
+    out->push_back({cap.gen, cap.issued, cap.implemented, cap.session});
+  }
+}
+
 } // namespace
 
 bool Inode::cap_is_valid(const Cap &cap) const
@@ -271,24 +314,42 @@ bool Inode::cap_is_valid(const Cap &cap) const
   if (is_locked_by_me()) {
     in_unlock.release();
   }
-  return session->cap_lease_valid(gen);
+  return cap_lease_valid_from_snap(gen, snap_cap_lease(session));
 }
 
 int Inode::caps_issued(int *implemented) const
 {
+  std::vector<CapsIssuedEntry> entries;
+  snapshot_caps_for_lease_check(this, &entries);
+
+  unsigned auth_issued = 0;
+  unsigned auth_impl = 0;
+  const bool auth_live = auth_cap_is_live(this);
+  if (auth_live) {
+    auth_issued = auth_cap->issued;
+    auth_impl = auth_cap->implemented;
+  }
+
+  ceph::unique_unlock<Inode> in_unlock(const_cast<Inode&>(*this), std::defer_lock);
+  if (is_locked_by_me())
+    in_unlock.release();
+
   int c = snap_caps;
   int i = 0;
-  for (const auto &[mds, cap] : caps) {
-    if (cap_is_valid(cap)) {
-      c |= cap.issued;
-      i |= cap.implemented;
+  std::unordered_map<MetaSession*, CapLeaseSnap> leases;
+  for (const auto &e : entries) {
+    if (!e.session)
+      continue;
+    auto it = leases.find(e.session);
+    if (it == leases.end())
+      it = leases.emplace(e.session, snap_cap_lease(e.session)).first;
+    if (cap_lease_valid_from_snap(e.gen, it->second)) {
+      c |= e.issued;
+      i |= e.implemented;
     }
   }
-  // exclude caps issued by non-auth MDS, but are been revoking by
-  // the auth MDS. The non-auth MDS should be revoking/exporting
-  // these caps, but the message is delayed.
-  if (auth_cap_is_live(this))
-    c &= ~auth_cap->implemented | auth_cap->issued;
+  if (auth_live)
+    c &= ~auth_impl | auth_issued;
 
   if (implemented)
     *implemented = i;
@@ -329,47 +390,88 @@ bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
   std::unique_lock<Inode> in_lock(*this);
 
   int c = snap_caps;
-  int i = 0;
 
   if (auth_cap && !auth_cap_is_live(this))
     auth_cap = nullptr;
 
   if ((c & mask) == mask)
     return true;
-  // prefer auth cap
-  if (auth_cap &&
-      cap_is_valid(*auth_cap) &&
-      (auth_cap->issued & mask) == mask) {
-    auth_cap->touch();
+
+  struct CapMaskEntry {
+    mds_rank_t mds;
+    __u32 gen;
+    unsigned issued;
+    unsigned implemented;
+    MetaSession *session;
+  };
+  std::vector<CapMaskEntry> entries;
+  entries.reserve(caps.size());
+  for (const auto &[mds, cap] : caps) {
+    entries.push_back({mds, cap.gen, cap.issued, cap.implemented, cap.session});
+  }
+  Cap *auth = auth_cap;
+  __u32 auth_gen = 0;
+  unsigned auth_issued = 0;
+  MetaSession *auth_session = nullptr;
+  if (auth) {
+    auth_gen = auth->gen;
+    auth_issued = auth->issued;
+    auth_session = auth->session;
+  }
+
+  ceph::unique_unlock<Inode> in_unlock(*this, std::defer_lock);
+  in_unlock.release();
+
+  std::unordered_map<MetaSession*, CapLeaseSnap> leases;
+  auto lease_for = [&](MetaSession *session) -> const CapLeaseSnap & {
+    auto it = leases.find(session);
+    if (it == leases.end())
+      it = leases.emplace(session, snap_cap_lease(session)).first;
+    return it->second;
+  };
+  auto cap_valid = [&](__u32 gen, MetaSession *session) -> bool {
+    return session && cap_lease_valid_from_snap(gen, lease_for(session));
+  };
+
+  if (auth && cap_valid(auth_gen, auth_session) && (auth_issued & mask) == mask) {
+    in_unlock.reacquire();
+    auth->touch();
     client->cap_hit();
     return true;
   }
-  // try any cap
-  for (auto &pair : caps) {
-    Cap &cap = pair.second;
-    if (cap_is_valid(cap)) {
-      if ((cap.issued & mask) == mask) {
-        cap.touch();
-	client->cap_hit();
-	return true;
-      }
-      c |= cap.issued;
-      i |= cap.implemented;
+
+  int i = 0;
+  std::optional<mds_rank_t> hit_mds;
+  for (const auto &e : entries) {
+    if (!cap_valid(e.gen, e.session))
+      continue;
+    if ((e.issued & mask) == mask) {
+      hit_mds = e.mds;
+      break;
     }
+    c |= e.issued;
+    i |= e.implemented;
   }
 
   if (allow_impl)
     c |= i;
 
-  if ((c & mask) == mask) {
-    // bah.. touch them all
-    for (auto &pair : caps) {
-      pair.second.touch();
-    }
+  if (hit_mds) {
+    in_unlock.reacquire();
+    caps.at(*hit_mds).touch();
     client->cap_hit();
     return true;
   }
 
+  if ((c & mask) == mask) {
+    in_unlock.reacquire();
+    for (auto &pair : caps)
+      pair.second.touch();
+    client->cap_hit();
+    return true;
+  }
+
+  in_unlock.reacquire();
   client->cap_miss();
   return false;
 }
