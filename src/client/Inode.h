@@ -317,6 +317,7 @@ struct Inode : RefCountedObject {
   mutable ceph::mutex fsync_mutex = ceph::make_mutex("Inode::fsync_mutex");
   ceph::condition_variable fsync_cond;
   unsigned fsync_active = 0;
+  std::vector<Context*> waitfor_fsync;
 
   Dentry *get_first_parent() {
     ceph_assert(!dentries.empty());
