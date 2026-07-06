@@ -2242,6 +2242,10 @@ private:
     }
 
     void finish(int r) override;
+    // C_Gather calls complete(); do not self-delete (state may re-enter advance).
+    void complete(int r) override {
+      finish(r);
+    }
   };
 
   struct C_Readahead : public Context {
