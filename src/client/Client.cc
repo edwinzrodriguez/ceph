@@ -13710,7 +13710,7 @@ void Client::C_Write_Finisher::C_FsyncSlotWaiter::finish(int r)
       cwf->iofinished_r >= 0) {
     cwf->kickoff_nonblocking_fsync();
   }
-  delete this;
+  // Finisher calls Context::complete(), which deletes this after finish().
 }
 
 void Client::C_Write_Finisher::finish_io(int r)
