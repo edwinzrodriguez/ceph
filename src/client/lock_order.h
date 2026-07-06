@@ -34,9 +34,10 @@
  * Typical usage by path
  * ---------------------
  *   * VFS hot paths (read/write): inode_lock only for the whole syscall.
- *     Per-inode ll_io_mutex serializes concurrent ll_read/ll_write on one
- *     file so unique_unlock<Inode> drops do not let a second ll_* thread
- *     take inode_lock while the first is reacquiring.
+ *     Per-inode ll_io_mutex serializes the inode_lock handoff between
+ *     concurrent ll_read/ll_write on one file.  It is dropped across blocking
+ *     I/O waits (cond_iofinish, objectcacher read, _fsync) so other workers
+ *     are not stuck behind a thread sleeping without inode_lock.
  *   * ll_sync_inode / ll_fsync / fsync: call _fsync without an outer
  *     inode_lock; _fsync acquires inode_lock and must drop it across
  *     ObjectCacher and caps_lock cond waits so parallel writers can finish.
