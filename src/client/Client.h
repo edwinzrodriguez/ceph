@@ -2122,6 +2122,13 @@ private:
       }
     };
 
+    class C_FsyncSlotWaiter : public Context {
+      C_Write_Finisher *cwf;
+    public:
+      explicit C_FsyncSlotWaiter(C_Write_Finisher *c) : cwf(c) {}
+      void finish(int r) override;
+    };
+
     C_Write_Finisher(Client *clnt, Context *onfinish, bool dont_need_uninline,
                      bool is_file_write, Fh *f, Inode *in,
                      uint64_t fpos, int64_t req_ofs, uint64_t req_size,
@@ -2164,6 +2171,7 @@ private:
     InodeRef inode_pin;
     void release_inode_pin();
     void finish_io_complete(int r);
+    bool kickoff_nonblocking_fsync();
     bool try_complete();
   };
 
@@ -2200,7 +2208,8 @@ private:
     int result;
     bool waitfor_safe;
 
-    C_nonblocking_fsync_state(Client *clnt, Inode *in, bool syncdataonly, Context *onfinish)
+    C_nonblocking_fsync_state(Client *clnt, Inode *in, bool syncdataonly,
+                              Context *onfinish, bool fsync_slot_held = false)
       : clnt(clnt), in(in), syncdataonly(syncdataonly), onfinish(onfinish) {
       flush_tid = 0;
       start = mono_clock_now();
@@ -2210,7 +2219,8 @@ private:
       flush_async_pending = false;
       result = 0;
       waitfor_safe = false;
-      clnt->_fsync_enter(in);
+      if (!fsync_slot_held)
+        clnt->_fsync_enter(in);
     }
 
     ~C_nonblocking_fsync_state() {
@@ -2434,6 +2444,7 @@ private:
   int _fsync(Fh *fh, bool syncdataonly);
   int _fsync(Inode *in, bool syncdataonly);
   void _fsync_enter(Inode *in);
+  bool _fsync_try_enter(Inode *in, Context *waiter = nullptr);
   void _fsync_exit(Inode *in);
   int _fsync_wait_objectcacher(Inode *in);
   int _sync_fs();

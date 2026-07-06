@@ -13703,6 +13703,16 @@ void Client::C_Write_Finisher::C_FsyncFinish::finish(int r)
   cwf->finish_fsync(r);
 }
 
+void Client::C_Write_Finisher::C_FsyncSlotWaiter::finish(int r)
+{
+  std::unique_lock in_lock(*cwf->in);
+  if (cwf->onuninlinefinished && cwf->iofinished && !cwf->fsync_finished &&
+      cwf->iofinished_r >= 0) {
+    cwf->kickoff_nonblocking_fsync();
+  }
+  delete this;
+}
+
 void Client::C_Write_Finisher::finish_io(int r)
 {
   std::unique_lock in_lock(*in);
@@ -13829,6 +13839,48 @@ void Client::C_Write_Finisher::release_inode_pin()
   inode_pin.reset();
 }
 
+bool Client::C_Write_Finisher::kickoff_nonblocking_fsync()
+{
+  client_t const whoami = clnt->whoami;
+
+  ceph_assert(ceph_mutex_is_locked_by_me(*in));
+  ceph_assert(onuninlinefinished && iofinished && !fsync_finished &&
+              iofinished_r >= 0);
+
+  // Never block client_finisher on _fsync_enter: an in-flight fsync may be
+  // waiting for FILE_BUFFER refs held by other CWFs still queued on this
+  // finisher.  Defer until the active fsync slot is released.
+  ceph::unique_unlock<Inode> in_drop(*in);
+  auto *waiter = new C_FsyncSlotWaiter(this);
+  if (!clnt->_fsync_try_enter(in, waiter)) {
+    ldout(clnt->cct, 10) << "io_correl CWF defer fsync slot"
+                         << " CWF=" << this
+                         << " onfinish=" << onfinish
+                         << " ino=" << in->ino
+                         << " offset=" << offset
+                         << dendl;
+    return false;
+  }
+  delete waiter;
+
+  auto *state = new C_nonblocking_fsync_state(
+    clnt, in, syncdataonly, &fsync_finish_ctx, true);
+  {
+    std::unique_lock in_lock(*in);
+    ldout(clnt->cct, 10) << "io_correl CWF kickoff fsync"
+                         << " CWF=" << this
+                         << " onfinish=" << onfinish
+                         << " fsync_finish_ctx=" << &fsync_finish_ctx
+                         << " fsync_state=" << state
+                         << " ino=" << in->ino
+                         << " offset=" << offset
+                         << dendl;
+    ldout(clnt->cct, 19) << "kickoff fsync onfinish " << onfinish << dendl;
+    state->advance();
+  }
+  return false;
+}
+
 bool Client::C_Write_Finisher::try_complete()
 {
   client_t const whoami = clnt->whoami;  // For the benefit of ldout prefix
@@ -13843,25 +13895,7 @@ bool Client::C_Write_Finisher::try_complete()
                        << dendl;
 
   if (onuninlinefinished && iofinished && !fsync_finished && iofinished_r >= 0) {
-    // Done with I/O AND uninline, but we want to do fsync.
-    // _fsync_enter may block; never call it while holding inode_lock.
-    ceph::unique_unlock<Inode> in_drop(*in);
-    auto *state = new C_nonblocking_fsync_state(
-      clnt, in, syncdataonly, &fsync_finish_ctx);
-    {
-      std::unique_lock in_lock(*in);
-      ldout(clnt->cct, 10) << "io_correl CWF kickoff fsync"
-                           << " CWF=" << this
-                           << " onfinish=" << onfinish
-                           << " fsync_finish_ctx=" << &fsync_finish_ctx
-                           << " fsync_state=" << state
-                           << " ino=" << in->ino
-                           << " offset=" << offset
-                           << dendl;
-      ldout(clnt->cct, 19) << "kickoff fsync onfinish " << onfinish << dendl;
-      state->advance();
-    }
-    return false;
+    return kickoff_nonblocking_fsync();
   } else if (onuninlinefinished && iofinished) {
     // Now we are REALLY done...
     clnt->put_cap_ref(in, CEPH_CAP_FILE_WR);
@@ -15075,12 +15109,29 @@ void Client::_fsync_enter(Inode *in)
   in->fsync_active++;
 }
 
-void Client::_fsync_exit(Inode *in)
+bool Client::_fsync_try_enter(Inode *in, Context *waiter)
 {
   std::unique_lock l(in->fsync_mutex);
-  ceph_assert(in->fsync_active > 0);
-  in->fsync_active--;
-  in->fsync_cond.notify_all();
+  if (in->fsync_active > 0) {
+    if (waiter)
+      in->waitfor_fsync.push_back(waiter);
+    return false;
+  }
+  in->fsync_active++;
+  return true;
+}
+
+void Client::_fsync_exit(Inode *in)
+{
+  std::vector<Context*> wake;
+  {
+    std::unique_lock l(in->fsync_mutex);
+    ceph_assert(in->fsync_active > 0);
+    in->fsync_active--;
+    in->fsync_cond.notify_all();
+    wake.swap(in->waitfor_fsync);
+  }
+  signal_deferred_context_list(wake);
 }
 
 int Client::_fsync_wait_objectcacher(Inode *in)
