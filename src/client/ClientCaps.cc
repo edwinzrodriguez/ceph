@@ -395,6 +395,9 @@ int ClientCaps::get_caps_used(Inode *in)
 
 void ClientCaps::cap_delay_requeue(Inode *in)
 {
+  // Must not hold inode_lock: caps_lock and inode_lock nest with ms_dispatch
+  // and unique_unlock reacquire paths and can deadlock (AB-BA).
+  ceph_assert(!in->is_locked_by_me());
   std::scoped_lock lock(caps_lock);
   ldout(cct, 10) << __func__ << " on " << *in << dendl;
 
@@ -764,7 +767,10 @@ void ClientCaps::check_caps(const InodeRef& in, unsigned flags)
 
     if (!(flags & CHECK_CAPS_NODELAY)) {
       ldout(cct, 10) << "delaying cap release" << dendl;
-      cap_delay_requeue(in.get());
+      {
+	ceph::unique_unlock<Inode> drop(*in);
+	cap_delay_requeue(in.get());
+      }
       continue;
     }
 
@@ -1318,8 +1324,10 @@ void ClientCaps::trim_caps(MetaSession *s, uint64_t max)
     // is deleted inside remove_cap
     ++p;
 
-    if (in->dirty_caps || in->cap_snaps.size())
+    if (in->dirty_caps || in->cap_snaps.size()) {
+      ceph::unique_unlock<Inode> drop(*in);
       cap_delay_requeue(in.get());
+    }
 
     if (in->caps.size() > 1 && cap != in->auth_cap) {
       int mine = cap->issued | cap->implemented;

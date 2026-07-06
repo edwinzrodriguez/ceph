@@ -1009,7 +1009,10 @@ void Inode::mark_caps_dirty(int caps)
   auth_cap->session->with_dirty_list([this](auto& dirty_list) {
     dirty_list.push_back(&dirty_cap_item);
   });
-  client->cap_delay_requeue(this);
+  {
+    ceph::unique_unlock<Inode> drop(*this);
+    client->cap_delay_requeue(this);
+  }
 }
 
 /**
