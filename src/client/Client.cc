@@ -12875,7 +12875,8 @@ retry:
     if (onfinish) {
       r = try_get_caps(f, CEPH_CAP_FILE_RD, want, &have);
       if (r == -EAGAIN)
-        r = get_caps(f, CEPH_CAP_FILE_RD, want, &have, -1);
+        return defer_async_read_cap_wait(f, offset, size, bl, onfinish,
+                                         read_for_write);
     } else {
       r = get_caps(f, CEPH_CAP_FILE_RD, want, &have, -1);
     }
@@ -14347,6 +14348,75 @@ void Client::C_DeferredAsyncWrite::finish(int r)
   if (wr < 0) {
     ceph::unique_unlock<Inode> in_unlock(*(f->inode));
     onfinish->complete(wr);
+  }
+  delete this;
+}
+
+Client::C_DeferredAsyncRead::C_DeferredAsyncRead(
+    Client *clnt_, Fh *f_, int64_t offset_, uint64_t size_,
+    bufferlist *bl_, Context *onfinish_, bool read_for_write_)
+  : clnt(clnt_), f(f_), offset(offset_), size(size_), bl(bl_),
+    onfinish(onfinish_), read_for_write(read_for_write_),
+    inode_pin(f_->inode.get())
+{
+}
+
+int64_t Client::defer_async_read_cap_wait(
+    Fh *f, int64_t offset, uint64_t size, bufferlist *bl,
+    Context *onfinish, bool read_for_write)
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(*(f->inode)));
+  Inode *in = f->inode.get();
+
+  auto *ctx = new C_DeferredAsyncRead(this, f, offset, size, bl, onfinish,
+                                      read_for_write);
+  client_caps->enqueue_cap_waiter(in, ctx);
+  check_caps(in, CHECK_CAPS_NODELAY);
+
+  ldout(cct, 10) << "io_correl deferred async read cap wait"
+                 << " onfinish=" << onfinish
+                 << " ino=" << in->ino
+                 << " offset=" << offset
+                 << " size=" << size
+                 << dendl;
+  return 0;
+}
+
+void Client::C_DeferredAsyncRead::finish(int r)
+{
+  client_t const whoami = clnt->whoami;
+
+  if (r < 0) {
+    ldout(clnt->cct, 10) << "io_correl deferred async read cap wait failed"
+                         << " onfinish=" << (void *)onfinish
+                         << " r=" << r
+                         << dendl;
+    onfinish->complete(r);
+    delete this;
+    return;
+  }
+
+  if (!clnt->_ll_fh_exists(f)) {
+    ldout(clnt->cct, 10) << "io_correl deferred async read stale fh"
+                         << " onfinish=" << (void *)onfinish
+                         << dendl;
+    onfinish->complete(-EBADF);
+    delete this;
+    return;
+  }
+
+  ldout(clnt->cct, 10) << "io_correl deferred async read resume"
+                       << " onfinish=" << (void *)onfinish
+                       << " ino=" << f->inode->ino
+                       << " offset=" << offset
+                       << dendl;
+
+  std::lock_guard io_guard(f->inode->ll_io_mutex);
+  std::unique_lock<Inode> in_lock(*(f->inode));
+  int64_t rd = clnt->_read(f, offset, size, bl, onfinish, read_for_write);
+  if (rd < 0) {
+    ceph::unique_unlock<Inode> in_unlock(*(f->inode));
+    onfinish->complete(rd);
   }
   delete this;
 }
@@ -19533,6 +19603,7 @@ int64_t Client::ll_preadv_pwritev(struct Fh *fh, const struct iovec *iov,
       }
       return retval;
     }
+    std::lock_guard io_guard(fh->inode->ll_io_mutex);
     std::unique_lock<Inode> cl(*(fh->inode));
 
     retval = _preadv_pwritev_locked(fh, iov, iovcnt, offset, write, true,
