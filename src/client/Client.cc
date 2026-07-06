@@ -210,30 +210,6 @@ struct InodeOsetPin {
   {}
 };
 
-// ll_write/ll_read take ll_io_mutex before inode_lock.  Drop it across blocking
-// I/O waits so other Ganesha workers can enter ll_* on the same file.
-struct LlIoMutexScopeDrop {
-  Inode *in;
-  bool dropped = false;
-
-  explicit LlIoMutexScopeDrop(Inode *inode) : in(inode) {
-    ceph_assert(in);
-    if (ceph_mutex_is_locked_by_me(in->ll_io_mutex)) {
-      in->ll_io_mutex.unlock();
-      dropped = true;
-    }
-  }
-
-  ~LlIoMutexScopeDrop() {
-    if (dropped) {
-      in->ll_io_mutex.lock();
-    }
-  }
-
-  LlIoMutexScopeDrop(const LlIoMutexScopeDrop&) = delete;
-  LlIoMutexScopeDrop& operator=(const LlIoMutexScopeDrop&) = delete;
-};
-
 // Snapshot ObjectCacher I/O inputs for read/write/flush paths.
 // Pin the inode so it cannot be torn down while inode_lock is dropped for
 // cache I/O.  Call release_pin() inside a unique_unlock<Inode> scope before
@@ -13309,7 +13285,7 @@ int Client::_read_async(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
   // (e.g. C_Readahead) can take the inode lock.
   if (r == 0) {
     ceph::unique_unlock<Inode> in_unlock(*in);
-    LlIoMutexScopeDrop io_drop(in);
+    ceph::unique_unlock<ceph::TrackedLock> io_unlock(in->ll_io_mutex);
     r = io_finish_cond->wait();
     put_cap_ref(in, CEPH_CAP_FILE_CACHE);
   } else {
@@ -14660,7 +14636,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
     if (unlikely(delay > 0)) {
       ldout(cct, 20) << __func__ << ": delaying write for " << delay << " seconds" << dendl;
       ceph::unique_unlock<Inode> in_unlock(*in);
-      LlIoMutexScopeDrop io_drop(in);
+      ceph::unique_unlock<ceph::TrackedLock> io_unlock(in->ll_io_mutex);
       sleep(delay);
     }
 
@@ -14682,7 +14658,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, bufferlist bl,
 
     {
       ceph::unique_unlock<Inode> in_unlock(*in);
-      LlIoMutexScopeDrop io_drop(in);
+      ceph::unique_unlock<ceph::TrackedLock> io_unlock(in->ll_io_mutex);
       r = cond_iofinish->wait();
     }
     if (auto it = in->cap_refs.find(CEPH_CAP_FILE_BUFFER);
@@ -14707,7 +14683,7 @@ success:
     int64_t r1;
     {
       ceph::unique_unlock<Inode> in_unlock(*in);
-      LlIoMutexScopeDrop io_drop(in);
+      ceph::unique_unlock<ceph::TrackedLock> io_unlock(in->ll_io_mutex);
       r1 = _fsync(f, false);
     }
     if (r1 < 0)
@@ -14722,7 +14698,7 @@ done:
     int uninline_ret = 0;
     {
       ceph::unique_unlock<Inode> in_unlock(*in);
-      LlIoMutexScopeDrop io_drop(in);
+      ceph::unique_unlock<ceph::TrackedLock> io_unlock(in->ll_io_mutex);
       uninline_ret = onuninline->wait();
     }
 
