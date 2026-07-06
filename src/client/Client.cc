@@ -15097,24 +15097,19 @@ int Client::_fsync_wait_objectcacher(Inode *in)
       break;
 
     C_SaferCond flush_cond("Client::_fsync_wait_objectcacher");
-    _flush(in, &flush_cond);
+    const bool flushed_sync = _flush(in, &flush_cond);
 
-    bool still_dirty = false;
-    {
-      std::scoped_lock il(*in);
-      still_dirty = in->oset.dirty_or_tx;
+    // When _flush returns false, ObjectCacher::flush_set may still hold
+    // &flush_cond in a C_Gather onfinish.  Never skip the wait just because
+    // oset looks clean — the gather can outlive this stack frame and
+    // onfinish->complete() on a destroyed C_SaferCond (SIGSEGV).
+    if (!flushed_sync) {
+      ldout(cct, 15) << "waiting on data to flush" << dendl;
+      r = flush_cond.wait();
+      ldout(cct, 15) << "got " << r << " from flush writeback" << dendl;
+      if (r < 0)
+	return r;
     }
-    if (!still_dirty) {
-      ldout(cct, 10) << __func__ << " ino " << in->ino
-                     << " oset clean after flush, skipping waiter" << dendl;
-      continue;
-    }
-
-    ldout(cct, 15) << "waiting on data to flush" << dendl;
-    r = flush_cond.wait();
-    ldout(cct, 15) << "got " << r << " from flush writeback" << dendl;
-    if (r < 0)
-      return r;
   }
 
   return r;
