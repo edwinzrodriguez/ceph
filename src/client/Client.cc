@@ -218,7 +218,7 @@ struct LlIoMutexScopeDrop {
 
   explicit LlIoMutexScopeDrop(Inode *inode) : in(inode) {
     ceph_assert(in);
-    if (in->ll_io_mutex.is_locked_by_me()) {
+    if (ceph_mutex_is_locked_by_me(in->ll_io_mutex)) {
       in->ll_io_mutex.unlock();
       dropped = true;
     }
