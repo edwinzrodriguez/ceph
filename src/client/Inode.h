@@ -310,7 +310,11 @@ struct Inode : RefCountedObject {
   // those syscalls (e.g. objectcacher I/O); without this mutex a second
   // ll_write could take inode_lock while the first thread's unique_unlock is
   // reacquiring — deadlock.  Independent of inode_lock.
-  mutable ceph::mutex ll_io_mutex = ceph::make_mutex("Inode::ll_io_mutex");
+#if defined(CEPH_LOCKSTAT)
+  mutable ceph::TrackedLock ll_io_mutex = make_tracked("Inode::ll_io_mutex");
+#else
+  mutable ceph::TrackedLock ll_io_mutex = ceph::make_tracked("Inode::ll_io_mutex");
+#endif
 
   // Serialize blocking/nonblocking fsync and COMMIT on one file (NFS-Ganesha
   // may run several in parallel).  Independent of inode_lock.
