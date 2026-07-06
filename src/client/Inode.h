@@ -306,6 +306,12 @@ struct Inode : RefCountedObject {
   std::vector<Context*> waitfor_commit;
   std::list<ceph::reentrant_condition_variable*> waitfor_deleg;
 
+  // Serialize ll_read/ll_write on one file.  inode_lock may be dropped inside
+  // those syscalls (e.g. objectcacher I/O); without this mutex a second
+  // ll_write could take inode_lock while the first thread's unique_unlock is
+  // reacquiring — deadlock.  Independent of inode_lock.
+  mutable ceph::mutex ll_io_mutex = ceph::make_mutex("Inode::ll_io_mutex");
+
   // Serialize blocking/nonblocking fsync and COMMIT on one file (NFS-Ganesha
   // may run several in parallel).  Independent of inode_lock.
   mutable ceph::mutex fsync_mutex = ceph::make_mutex("Inode::fsync_mutex");

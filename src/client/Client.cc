@@ -19189,6 +19189,7 @@ int Client::ll_read(Fh *fh, loff_t off, loff_t len, bufferlist *bl)
     }
     return -EBADF;
   }
+  std::lock_guard io_guard(fh->inode->ll_io_mutex);
   std::scoped_lock<Inode> lock(*(fh->inode));
 
 #if defined(__linux__)
@@ -19354,6 +19355,7 @@ int Client::ll_write(Fh *fh, loff_t off, loff_t len, const char *data)
     }
     return -EBADF;
   }
+  std::lock_guard io_guard(fh->inode->ll_io_mutex);
   std::scoped_lock<Inode> lock(*(fh->inode));
 
 #if defined(__linux__)
@@ -19404,6 +19406,7 @@ int64_t Client::ll_writev(struct Fh *fh, const struct iovec *iov, int iovcnt, in
     }
     return -EBADF;
   }
+  std::lock_guard io_guard(fh->inode->ll_io_mutex);
   std::scoped_lock<Inode> cl(*(fh->inode));
   auto r = _preadv_pwritev_locked(fh, iov, iovcnt, off, true, true);
   if (logger) {
@@ -19429,6 +19432,7 @@ int64_t Client::ll_readv(struct Fh *fh, const struct iovec *iov, int iovcnt, int
     }
     return -EBADF;
   }
+  std::lock_guard io_guard(fh->inode->ll_io_mutex);
   std::scoped_lock<Inode> cl(*(fh->inode));
   auto r = _preadv_pwritev_locked(fh, iov, iovcnt, off, false, true);
   if (logger) {
