@@ -13865,19 +13865,20 @@ bool Client::C_Write_Finisher::kickoff_nonblocking_fsync()
 
   auto *state = new C_nonblocking_fsync_state(
     clnt, in, syncdataonly, &fsync_finish_ctx, true);
-  {
-    std::unique_lock in_lock(*in);
-    ldout(clnt->cct, 10) << "io_correl CWF kickoff fsync"
-                         << " CWF=" << this
-                         << " onfinish=" << onfinish
-                         << " fsync_finish_ctx=" << &fsync_finish_ctx
-                         << " fsync_state=" << state
-                         << " ino=" << in->ino
-                         << " offset=" << offset
-                         << dendl;
-    ldout(clnt->cct, 19) << "kickoff fsync onfinish " << onfinish << dendl;
-    state->advance();
-  }
+  // Re-acquire the caller's inode_lock depth; do not nest a second
+  // std::unique_lock<Inode> here — unique_unlock above already released the
+  // mutex out from under the caller's RAII lock object.
+  in_drop.reacquire();
+  ldout(clnt->cct, 10) << "io_correl CWF kickoff fsync"
+                       << " CWF=" << this
+                       << " onfinish=" << onfinish
+                       << " fsync_finish_ctx=" << &fsync_finish_ctx
+                       << " fsync_state=" << state
+                       << " ino=" << in->ino
+                       << " offset=" << offset
+                       << dendl;
+  ldout(clnt->cct, 19) << "kickoff fsync onfinish " << onfinish << dendl;
+  state->advance();
   return false;
 }
 
