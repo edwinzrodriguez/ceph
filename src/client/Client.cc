@@ -5542,7 +5542,7 @@ void Client::wait_on_context_list(std::vector<Context*>& ls)
   client_caps->wait_on_context_cond(cond, done, wake_complete);
 }
 
-void Client::signal_deferred_context_list(std::vector<Context*>& ls)
+void Client::signal_deferred_context_list(std::vector<Context*>& ls, int r)
 {
   if (ls.empty())
     return;
@@ -5556,7 +5556,7 @@ void Client::signal_deferred_context_list(std::vector<Context*>& ls)
     // hold it while waiting for this reply.
     if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr &&
 	is_locked_by_me()) {
-      c->complete(0);
+      c->complete(r);
     } else {
       queue_client_finisher(c);
     }
@@ -15195,7 +15195,7 @@ bool Client::_fsync_try_enter(Inode *in, Context *waiter)
   return true;
 }
 
-void Client::_fsync_exit(Inode *in)
+void Client::_fsync_exit(Inode *in, int r)
 {
   std::vector<Context*> wake;
   {
@@ -15205,7 +15205,12 @@ void Client::_fsync_exit(Inode *in)
     in->fsync_cond.notify_all();
     wake.swap(in->waitfor_fsync);
   }
-  signal_deferred_context_list(wake);
+  for (Context *c : wake) {
+    // C_FsyncSlotWaiter ignores r; C_LlFsyncCoalesceWaiter uses it.  Run
+    // directly so coalesced ll_fsync threads return without piling up on
+    // fsync_mutex like the old blocking _fsync_enter path.
+    c->complete(r);
+  }
 }
 
 int Client::_fsync_wait_objectcacher(Inode *in)
@@ -15240,6 +15245,18 @@ int Client::_fsync_wait_objectcacher(Inode *in)
   return r;
 }
 
+namespace {
+
+struct LlFsyncCoalesceWaiter : Context {
+  C_SaferCond cond;
+  LlFsyncCoalesceWaiter() : cond("Client::LlFsyncCoalesceWaiter") {}
+  void finish(int r) override { cond.complete(r); }
+  void complete(int r) override { finish(r); }
+  int wait() { return cond.wait(); }
+};
+
+} // namespace
+
 int Client::_fsync(Inode *in, bool syncdataonly)
 {
   if (is_locked_by_me()) {
@@ -15247,13 +15264,22 @@ int Client::_fsync(Inode *in, bool syncdataonly)
     return _fsync(in, syncdataonly);
   }
 
-  struct FsyncSlot {
-    Client *cl;
-    Inode *in;
-    FsyncSlot(Client *c, Inode *i) : cl(c), in(i) { cl->_fsync_enter(in); }
-    ~FsyncSlot() { cl->_fsync_exit(in); }
-  } fsync_slot(this, in);
+  // Coalesce concurrent ll_fsync on one inode: only one thread runs the
+  // fsync body; others wait on waitfor_fsync and return the same result.
+  while (true) {
+    LlFsyncCoalesceWaiter waiter;
+    if (_fsync_try_enter(in, &waiter)) {
+      int r = _fsync_with_slot_held(in, syncdataonly);
+      _fsync_exit(in, r);
+      return r;
+    }
+    int r = waiter.wait();
+    return r;
+  }
+}
 
+int Client::_fsync_with_slot_held(Inode *in, bool syncdataonly)
+{
   std::unique_lock<Inode> in_guard(*in);
 
   int r = 0;
