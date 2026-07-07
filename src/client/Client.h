@@ -1371,7 +1371,7 @@ protected:
   void wake_up_session_caps(MetaSession *s, bool reconnect);
 
   void wait_on_context_list(std::vector<Context*>& ls);
-  void signal_deferred_context_list(std::vector<Context*>& ls);
+  void signal_deferred_context_list(std::vector<Context*>& ls, int r = 0);
   void signal_context_list(std::vector<Context*>& ls) {
     finish_contexts(cct, ls, 0);
   }
@@ -2240,7 +2240,7 @@ private:
     }
 
     ~C_nonblocking_fsync_state() {
-      clnt->_fsync_exit(in);
+      clnt->_fsync_exit(in, result);
     }
 
     void advance();
@@ -2462,9 +2462,10 @@ private:
 
   int _fsync(Fh *fh, bool syncdataonly);
   int _fsync(Inode *in, bool syncdataonly);
+  int _fsync_with_slot_held(Inode *in, bool syncdataonly);
   void _fsync_enter(Inode *in);
   bool _fsync_try_enter(Inode *in, Context *waiter = nullptr);
-  void _fsync_exit(Inode *in);
+  void _fsync_exit(Inode *in, int r = 0);
   int _fsync_wait_objectcacher(Inode *in);
   int _sync_fs();
   int clear_suid_sgid(Inode *in, const UserPerm& perms, bool defer=false);
