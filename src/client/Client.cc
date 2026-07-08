@@ -4374,9 +4374,11 @@ void Client::_put_inode(Inode *in, int n)
 
   if (left == 1) {
     // dentry trim can put_inode() while an Fh still holds the last nref;
-    // do not delete an inode that is still open or ll-pinned.
-    if (!in->open_by_mode.empty() || in->ll_ref > 0 ||
-	(in->snapid != CEPH_NOSNAP && in->snap_cap_refs > 0)) {
+    // do not delete an inode that is still open or ll-pinned.  During
+    // unmount _ll_drop_pins and the drain loop already tear these down.
+    if (!is_unmounting() &&
+	(!in->open_by_mode.empty() || in->ll_ref > 0 ||
+	 (in->snapid != CEPH_NOSNAP && in->snap_cap_refs > 0))) {
       ldout(cct, 15) << __func__ << " defer delete (in use) " << *in
 		     << " open_by_mode=" << in->open_by_mode.size()
 		     << " ll_ref=" << in->ll_ref << dendl;
