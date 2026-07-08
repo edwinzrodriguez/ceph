@@ -4441,6 +4441,20 @@ void Client::_put_inode(Inode *in, int n)
       close_dir(in->dir);
     }
 
+    // Parent/alias dentry links must be dropped before ~Inode; dispose_* paths
+    // already did this but delay_put_inodes can reach _put_inode directly.
+    while (!in->dentries.empty()) {
+      in_lock.unlock();
+      unlink(*in->dentries.begin(), true, true);
+      in_lock.lock();
+    }
+
+    if (in->ll_ref) {
+      in_lock.unlock();
+      _ll_put(in, in->ll_ref);
+      in_lock.lock();
+    }
+
     ldout(cct, 10) << __func__ << " deleting " << *in << dendl;
     {
       in_lock.unlock();
