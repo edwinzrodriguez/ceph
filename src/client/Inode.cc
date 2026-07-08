@@ -488,6 +488,7 @@ int Inode::caps_used()
 
 int Inode::caps_file_wanted()
 {
+  ceph_assert(is_locked_by_me());
   int want = 0;
   for (const auto &[mode, cnt] : open_by_mode)
     if (cnt) {
