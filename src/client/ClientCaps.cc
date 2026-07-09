@@ -1,4 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:nil -*-
+#include <algorithm>
 #include <vector>
 
 #include "ClientCaps.h"
@@ -114,7 +115,7 @@ void ClientCaps::put_cap_ref(Inode *in, int cap)
 	  p.second.dirty_data = 0;
 	// _flushed runs on client_finisher.  Defer fsync advancers so we do not
 	// run them inline and starve C_Write_Finisher::finish_io.
-	client->signal_deferred_context_list(in->waitfor_commit);
+	signal_waitfor_commit(in);
 	ldout(cct, 5) << __func__ << " dropped last FILE_BUFFER ref on " << *in << dendl;
         if (!in->is_write_delegated()) {
           ++put_nref;
@@ -1003,6 +1004,38 @@ void ClientCaps::signal_caps_inode(Inode *in)
   // Waking cap waiters via finish_contexts() runs each fsync advancer inline
   // and starves C_Write_Finisher::finish_io on the same finisher queue.
   signal_caps_inode_sync(in);
+}
+
+void ClientCaps::push_waitfor_commit_waiter(Inode *in, Context *c)
+{
+  std::scoped_lock l{caps_lock};
+  in->waitfor_commit.push_back(c);
+}
+
+void ClientCaps::signal_waitfor_commit(Inode *in)
+{
+  std::vector<Context*> batch;
+  {
+    std::scoped_lock l{caps_lock};
+    batch.swap(in->waitfor_commit);
+  }
+  client->signal_deferred_context_list(batch);
+}
+
+void ClientCaps::push_waitfor_caps_waiter(Inode *in, Context *c)
+{
+  std::scoped_lock l{caps_lock};
+  in->waitfor_caps.push_back(c);
+}
+
+void ClientCaps::remove_context_waiter(std::vector<Context*>& ls, Context *c)
+{
+  std::scoped_lock l{caps_lock};
+  auto it = std::find(ls.begin(), ls.end(), c);
+  if (it != ls.end()) {
+    ls.erase(it);
+    delete c;
+  }
 }
 
 void ClientCaps::flush_snaps(Inode *in)
