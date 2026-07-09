@@ -5340,44 +5340,56 @@ void Client::flush_caps_sync()
 void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
 {
   while (true) {
-    bool wait = false;
-    {
-      std::unique_lock<Inode> in_lock(*in, std::defer_lock);
-      if (!in->is_locked_by_me()) {
-	in_lock.lock();
-      }
-      if (!in->flushing_caps) {
-	break;
-      }
-      if (in->flushing_cap_tids.empty()) {
-	lderr(cct) << __func__ << " " << *in
-		   << " has flushing_caps " << ccap_string(in->flushing_caps)
-		   << " but no flushing_cap_tids; clearing stale state" << dendl;
-	in->flushing_caps = 0;
-	client_caps->dec_num_flushing_caps();
-	if (in->auth_cap) {
-	  MetaSession *session = in->auth_cap->session;
-	  session->with_flushing_caps([in](auto& flushing_caps) {
-	    in->flushing_cap_item.remove_myself();
-	  });
-	}
-	break;
-      }
-      map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
-      if (it->first > want) {
-	break;
-      }
-      ldout(cct, 10) << __func__ << " on " << *in << " flushing "
-		     << ccap_string(it->second) << " want " << want
-		     << " last " << it->first << dendl;
-      wait = true;
+    std::unique_lock<Inode> in_lock(*in, std::defer_lock);
+    if (!in->is_locked_by_me()) {
+      in_lock.lock();
     }
-    if (!wait) {
+    if (!in->flushing_caps) {
+      break;
+    }
+    if (in->flushing_cap_tids.empty()) {
+      lderr(cct) << __func__ << " " << *in
+		 << " has flushing_caps " << ccap_string(in->flushing_caps)
+		 << " but no flushing_cap_tids; clearing stale state" << dendl;
+      in->flushing_caps = 0;
+      client_caps->dec_num_flushing_caps();
+      if (in->auth_cap) {
+	MetaSession *session = in->auth_cap->session;
+	session->with_flushing_caps([in](auto& flushing_caps) {
+	  in->flushing_cap_item.remove_myself();
+	});
+      }
+      break;
+    }
+    map<ceph_tid_t, int>::iterator it = in->flushing_cap_tids.begin();
+    if (it->first > want) {
+      break;
+    }
+    ldout(cct, 10) << __func__ << " on " << *in << " flushing "
+		   << ccap_string(it->second) << " want " << want
+		   << " last " << it->first << dendl;
+
+    ceph::reentrant_condition_variable cond;
+    std::atomic<bool> done{false};
+    std::atomic<bool> wake_complete{false};
+    int wr = 0;
+    Context *ctx = new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete);
+    // Register under caps_lock while inode_lock is held: handle_cap_flush_ack
+    // can signal waitfor_caps as soon as the MDS ack arrives.
+    client_caps->push_waitfor_caps_waiter(in, ctx);
+
+    if (!in->flushing_caps || in->flushing_cap_tids.begin()->first > want) {
+      if (!done.load(std::memory_order_acquire)) {
+	client_caps->remove_context_waiter(in->waitfor_caps, ctx);
+      }
+      break;
+    }
+    if (done.load(std::memory_order_acquire)) {
       break;
     }
     {
       ceph::unique_unlock<Inode> in_drop(*in);
-      client_caps->wait_on_context_list(in->waitfor_caps);
+      client_caps->wait_on_context_cond(cond, done, wake_complete);
     }
   }
 }
@@ -15021,18 +15033,22 @@ void Client::C_nonblocking_fsync_state::advance()
       // above; only block on inode-wide FILE_BUFFER refs when objectcacher is
       // disabled.
       // FIXME: this can starve
-      if (in->cap_refs[CEPH_CAP_FILE_BUFFER] > 0) {
+      if (!in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
         ldout(clnt->cct, 10) << "ino " << in->ino << " has "
                              << in->cap_refs[CEPH_CAP_FILE_BUFFER]
                              << " FILE_BUFFER refs, waitfor_commit="
                              << in->waitfor_commit.size()
                              << ", waiting" << dendl;
         advancer = new C_nonblocking_fsync_state_advancer(clnt, this);
-        in->waitfor_commit.push_back(advancer);
-        // ------------  here is a state machine break point but we have to
-        //               return to this case because this might loop.
-        progress = 1;
-        return;
+        clnt->client_caps->push_waitfor_commit_waiter(in, advancer);
+        if (in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
+          clnt->client_caps->signal_waitfor_commit(in);
+        } else {
+          // ------------  here is a state machine break point but we have to
+          //               return to this case because this might loop.
+          progress = 1;
+          return;
+        }
       }
     } else {
       ldout(clnt->cct, 10) << "ino " << in->ino
@@ -15398,10 +15414,20 @@ int Client::_fsync_with_slot_held(Inode *in, bool syncdataonly)
 		       << in->cap_refs[CEPH_CAP_FILE_BUFFER]
 		       << " uncommitted, waiting" << dendl;
 	need_wait = true;
-	in->waitfor_commit.push_back(
-	  new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete));
+	// Register under caps_lock before sleeping: put_cap_ref may drop the
+	// last FILE_BUFFER ref and signal waitfor_commit as soon as the write
+	// completes; signalling an empty list loses the wakeup and hangs fsync.
+	client_caps->push_waitfor_commit_waiter(
+	  in, new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete));
       }
       if (!need_wait) {
+	break;
+      }
+      if (in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
+	client_caps->signal_waitfor_commit(in);
+	break;
+      }
+      if (done.load(std::memory_order_acquire)) {
 	break;
       }
       // in_guard still holds inode_lock here; drop full depth before sleeping
