@@ -142,7 +142,8 @@ void ClientCaps::put_cap_ref(Inode *in, int cap)
     bool wake = false;
     {
       std::scoped_lock l{caps_lock};
-      wake = !in->waitfor_commit.empty();
+      wake = !in->waitfor_commit.empty() ||
+	     !in->waitfor_fsync_commit.empty();
     }
     if (wake) {
       signal_waitfor_commit_sync(in);
@@ -1060,22 +1061,13 @@ void ClientCaps::push_waitfor_fsync_commit_waiter(Inode *in, Context *c)
 
 void ClientCaps::signal_waitfor_fsync_commit_sync(Inode *in)
 {
-  std::vector<Context*> batch;
-  {
-    std::scoped_lock l{caps_lock};
-    batch = in->waitfor_fsync_commit;
-  }
-  if (batch.empty())
-    return;
-  // Notify in place: _fsync reuses one C_ReentrantCond across loop iterations.
-  if (in->is_locked_by_me()) {
-    signal_context_list(batch);
-  } else if (client->is_locked_by_me()) {
-    client->signal_deferred_context_list(batch);
-  } else {
-    std::unique_lock<Client> cl(*client);
-    client->signal_deferred_context_list(batch);
-  }
+  // Notify in place under caps_lock: _fsync reuses one C_ReentrantCond across
+  // loop iterations and remove_fsync_commit_waiter deletes it from the same
+  // list.  Signaling after copying the list released caps_lock and raced
+  // finish() against delete.
+  std::scoped_lock l{caps_lock};
+  for (Context *c : in->waitfor_fsync_commit)
+    c->complete(0);
 }
 
 void ClientCaps::remove_fsync_commit_waiter(Inode *in, Context *c)
@@ -1091,12 +1083,17 @@ void ClientCaps::push_waitfor_caps_waiter(Inode *in, Context *c)
 
 void ClientCaps::remove_context_waiter(std::vector<Context*>& ls, Context *c)
 {
-  std::scoped_lock l{caps_lock};
-  auto it = std::find(ls.begin(), ls.end(), c);
-  if (it != ls.end()) {
-    ls.erase(it);
-    delete c;
+  bool erase = false;
+  {
+    std::scoped_lock l{caps_lock};
+    auto it = std::find(ls.begin(), ls.end(), c);
+    if (it != ls.end()) {
+      ls.erase(it);
+      erase = true;
+    }
   }
+  if (erase)
+    delete c;
 }
 
 void ClientCaps::flush_snaps(Inode *in)
