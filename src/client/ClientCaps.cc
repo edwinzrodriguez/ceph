@@ -113,10 +113,8 @@ void ClientCaps::put_cap_ref(Inode *in, int cap)
       if (last & CEPH_CAP_FILE_BUFFER) {
 	for (auto &p : in->cap_snaps)
 	  p.second.dirty_data = 0;
-	// _flushed runs on client_finisher.  Defer fsync advancers so we do not
-	// run them inline and starve C_Write_Finisher::finish_io.
-	signal_waitfor_commit(in);
 	ldout(cct, 5) << __func__ << " dropped last FILE_BUFFER ref on " << *in << dendl;
+	signal_waitfor_commit_sync(in);
         if (!in->is_write_delegated()) {
           ++put_nref;
         }
@@ -137,6 +135,16 @@ void ClientCaps::put_cap_ref(Inode *in, int cap)
       check_caps(in, 0);
     if (put_nref)
       client->put_inode(in, put_nref);
+  } else if (cap & CEPH_CAP_FILE_BUFFER) {
+    // A FILE_BUFFER ref dropped but others remain; wake fsync waiters so they
+    // re-check is_last_cap_ref instead of missing a 2->1 progress signal.
+    bool wake = false;
+    {
+      std::scoped_lock l{caps_lock};
+      wake = !in->waitfor_commit.empty();
+    }
+    if (wake)
+      signal_waitfor_commit_sync(in);
   }
 }
 
@@ -1011,14 +1019,30 @@ void ClientCaps::push_waitfor_commit_waiter(Inode *in, Context *c)
   in->waitfor_commit.push_back(c);
 }
 
-void ClientCaps::signal_waitfor_commit(Inode *in)
+void ClientCaps::signal_waitfor_commit_sync(Inode *in)
 {
   std::vector<Context*> batch;
   {
     std::scoped_lock l{caps_lock};
     batch.swap(in->waitfor_commit);
   }
-  client->signal_deferred_context_list(batch);
+  if (batch.empty())
+    return;
+  // put_cap_ref runs under inode_lock; wake C_ReentrantCond waiters inline so
+  // _fsync_with_slot_held is not delayed behind client_finisher work.
+  if (in->is_locked_by_me()) {
+    signal_context_list(batch);
+  } else if (client->is_locked_by_me()) {
+    client->signal_deferred_context_list(batch);
+  } else {
+    std::unique_lock<Client> cl(*client);
+    client->signal_deferred_context_list(batch);
+  }
+}
+
+void ClientCaps::signal_waitfor_commit(Inode *in)
+{
+  signal_waitfor_commit_sync(in);
 }
 
 void ClientCaps::push_waitfor_caps_waiter(Inode *in, Context *c)

@@ -15405,37 +15405,33 @@ int Client::_fsync_with_slot_held(Inode *in, bool syncdataonly)
   if (!cct->_conf->client_oc) {
     // FIXME: this can starve
     while (true) {
+      if (in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
+	break;
+      }
+      ldout(cct, 10) << "ino " << in->ino << " has "
+		       << in->cap_refs[CEPH_CAP_FILE_BUFFER]
+		       << " uncommitted, waiting" << dendl;
       ceph::reentrant_condition_variable cond;
       std::atomic<bool> done{false};
       std::atomic<bool> wake_complete{false};
       int wr = 0;
-      bool need_wait = false;
-      {
-	if (in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
-	  break;
-	}
-	ldout(cct, 10) << "ino " << in->ino << " has "
-		       << in->cap_refs[CEPH_CAP_FILE_BUFFER]
-		       << " uncommitted, waiting" << dendl;
-	need_wait = true;
-	// Register under caps_lock before sleeping: put_cap_ref may drop the
-	// last FILE_BUFFER ref and signal waitfor_commit as soon as the write
-	// completes; signalling an empty list loses the wakeup and hangs fsync.
-	client_caps->push_waitfor_commit_waiter(
-	  in, new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete));
-      }
-      if (!need_wait) {
-	break;
-      }
+      Context *ctx = new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete);
+      // Register under caps_lock while inode_lock is held: put_cap_ref may
+      // drop FILE_BUFFER refs and signal waitfor_commit as soon as a write
+      // completes; signalling an empty list loses the wakeup and hangs fsync.
+      client_caps->push_waitfor_commit_waiter(in, ctx);
       if (in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
-	client_caps->signal_waitfor_commit(in);
+	if (!done.load(std::memory_order_acquire)) {
+	  client_caps->remove_context_waiter(in->waitfor_commit, ctx);
+	}
 	break;
       }
       if (done.load(std::memory_order_acquire)) {
-	break;
+	// Woken early; re-check is_last_cap_ref at loop top.
+	continue;
       }
-      // in_guard still holds inode_lock here; drop full depth before sleeping
-      // on caps_lock so parallel ll_write threads can finish and drop cap refs.
+      // Drop inode_lock before sleeping on caps_lock so parallel ll_write
+      // threads can finish and drop cap refs.
       {
 	ceph::unique_unlock<Inode> in_unlock(*in);
 	client_caps->wait_on_context_cond(cond, done, wake_complete);
