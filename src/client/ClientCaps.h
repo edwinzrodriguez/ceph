@@ -138,6 +138,7 @@ public:
 
   void push_waitfor_commit_waiter(Inode *in, Context *c);
   void signal_waitfor_commit(Inode *in);
+  void signal_waitfor_commit_sync(Inode *in);
   void push_waitfor_caps_waiter(Inode *in, Context *c);
   void remove_context_waiter(std::vector<Context*>& ls, Context *c);
 
