@@ -15408,11 +15408,10 @@ int Client::_fsync_with_slot_held(Inode *in, bool syncdataonly)
     std::atomic<bool> done{false};
     std::atomic<bool> wake_complete{false};
     int wr = 0;
-    std::unique_ptr<Context> ctx(
-      new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete));
+    Context *ctx = new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete);
     // One persistent waiter per fsync: per-iteration stack conds were left on
     // waitfor_commit after continue and corrupted the next iteration's done.
-    client_caps->push_waitfor_fsync_commit_waiter(in, ctx.get());
+    client_caps->push_waitfor_fsync_commit_waiter(in, ctx);
     while (!in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
       ldout(cct, 10) << "ino " << in->ino << " has "
 		       << in->cap_refs[CEPH_CAP_FILE_BUFFER]
@@ -15429,7 +15428,7 @@ int Client::_fsync_with_slot_held(Inode *in, bool syncdataonly)
 	client_caps->wait_on_context_cond(cond, done, wake_complete);
       }
     }
-    client_caps->remove_fsync_commit_waiter(in, ctx.get());
+    client_caps->remove_fsync_commit_waiter(in, ctx);
   }
 
   if (!r) {
