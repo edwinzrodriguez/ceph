@@ -304,6 +304,8 @@ struct Inode : RefCountedObject {
   std::vector<Context*> waitfor_caps;
   std::vector<Context*> waitfor_caps_pending;
   std::vector<Context*> waitfor_commit;
+  // Persistent waiters for _fsync FILE_BUFFER ref drain (one ctx per fsync).
+  std::vector<Context*> waitfor_fsync_commit;
   std::list<ceph::reentrant_condition_variable*> waitfor_deleg;
 
   // Serialize ll_read/ll_write on one file.  inode_lock may be dropped inside

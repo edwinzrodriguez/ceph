@@ -15404,31 +15404,23 @@ int Client::_fsync_with_slot_held(Inode *in, bool syncdataonly)
 
   if (!cct->_conf->client_oc) {
     // FIXME: this can starve
-    while (true) {
-      if (in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
-	break;
-      }
+    ceph::reentrant_condition_variable cond;
+    std::atomic<bool> done{false};
+    std::atomic<bool> wake_complete{false};
+    int wr = 0;
+    std::unique_ptr<Context> ctx(
+      new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete));
+    // One persistent waiter per fsync: per-iteration stack conds were left on
+    // waitfor_commit after continue and corrupted the next iteration's done.
+    client_caps->push_waitfor_fsync_commit_waiter(in, ctx.get());
+    while (!in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
       ldout(cct, 10) << "ino " << in->ino << " has "
 		       << in->cap_refs[CEPH_CAP_FILE_BUFFER]
 		       << " uncommitted, waiting" << dendl;
-      ceph::reentrant_condition_variable cond;
-      std::atomic<bool> done{false};
-      std::atomic<bool> wake_complete{false};
-      int wr = 0;
-      Context *ctx = new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete);
-      // Register under caps_lock while inode_lock is held: put_cap_ref may
-      // drop FILE_BUFFER refs and signal waitfor_commit as soon as a write
-      // completes; signalling an empty list loses the wakeup and hangs fsync.
-      client_caps->push_waitfor_commit_waiter(in, ctx);
+      done.store(false, std::memory_order_relaxed);
+      wake_complete.store(false, std::memory_order_relaxed);
       if (in->is_last_cap_ref(CEPH_CAP_FILE_BUFFER)) {
-	if (!done.load(std::memory_order_acquire)) {
-	  client_caps->remove_context_waiter(in->waitfor_commit, ctx);
-	}
 	break;
-      }
-      if (done.load(std::memory_order_acquire)) {
-	// Woken early; re-check is_last_cap_ref at loop top.
-	continue;
       }
       // Drop inode_lock before sleeping on caps_lock so parallel ll_write
       // threads can finish and drop cap refs.
@@ -15437,6 +15429,7 @@ int Client::_fsync_with_slot_held(Inode *in, bool syncdataonly)
 	client_caps->wait_on_context_cond(cond, done, wake_complete);
       }
     }
+    client_caps->remove_fsync_commit_waiter(in, ctx.get());
   }
 
   if (!r) {
