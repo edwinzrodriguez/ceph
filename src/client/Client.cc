@@ -5589,12 +5589,16 @@ void Client::signal_deferred_context_list(std::vector<Context*>& ls, int r)
   std::vector<Context*> batch;
   batch.swap(ls);
   for (Context *c : batch) {
-    // wait_on_context_list() installs C_TrackedCond waiters that must run
-    // under client_lock so notify_all() sees the mutex held.  Do not block on
-    // client_lock here (e.g. ms_dispatch after cl.unlock()): make_request may
-    // hold it while waiting for this reply.
-    if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr &&
+    // C_ReentrantCond only sets an atomic and notifies a stack condvar; wake
+    // inline even when client_lock is held so cap/fsync waiters are not queued
+    // behind heavy finisher work.
+    if (dynamic_cast<ceph::C_ReentrantCond<>*>(c) != nullptr) {
+      c->complete(r);
+    } else if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr &&
 	is_locked_by_me()) {
+      // C_TrackedCond waiters must run under client_lock so notify_all() sees
+      // the mutex held.  Do not block on client_lock here (e.g. ms_dispatch
+      // after cl.unlock()): make_request may hold it while waiting for reply.
       c->complete(r);
     } else {
       queue_client_finisher(c);

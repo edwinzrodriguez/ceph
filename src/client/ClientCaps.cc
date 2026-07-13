@@ -985,12 +985,14 @@ void ClientCaps::signal_caps_inode_sync(Inode *in)
     signal_context_list(ls);
   };
 
-  if (client->is_locked_by_me()) {
-    for (auto& ls : batches)
-      client->signal_deferred_context_list(ls);
-  } else if (in->is_locked_by_me()) {
+  // Prefer waking under inode_lock (handle_cap_flush_ack drops client_lock
+  // before taking inode_lock).  C_ReentrantCond waiters only notify a condvar.
+  if (in->is_locked_by_me()) {
     for (auto& ls : batches)
       signal_batch(ls);
+  } else if (client->is_locked_by_me()) {
+    for (auto& ls : batches)
+      client->signal_deferred_context_list(ls);
   } else {
     std::unique_lock<Client> cl(*client);
     for (auto& ls : batches)
@@ -1000,9 +1002,6 @@ void ClientCaps::signal_caps_inode_sync(Inode *in)
 
 void ClientCaps::signal_caps_inode(Inode *in)
 {
-  // handle_cap_flush_ack runs on client_finisher with client_lock held.
-  // Waking cap waiters via finish_contexts() runs each fsync advancer inline
-  // and starves C_Write_Finisher::finish_io on the same finisher queue.
   signal_caps_inode_sync(in);
 }
 
