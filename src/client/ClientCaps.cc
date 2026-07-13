@@ -115,6 +115,7 @@ void ClientCaps::put_cap_ref(Inode *in, int cap)
 	  p.second.dirty_data = 0;
 	ldout(cct, 5) << __func__ << " dropped last FILE_BUFFER ref on " << *in << dendl;
 	signal_waitfor_commit_sync(in);
+	signal_waitfor_fsync_commit_sync(in);
         if (!in->is_write_delegated()) {
           ++put_nref;
         }
@@ -143,8 +144,10 @@ void ClientCaps::put_cap_ref(Inode *in, int cap)
       std::scoped_lock l{caps_lock};
       wake = !in->waitfor_commit.empty();
     }
-    if (wake)
+    if (wake) {
       signal_waitfor_commit_sync(in);
+      signal_waitfor_fsync_commit_sync(in);
+    }
   }
 }
 
@@ -968,6 +971,10 @@ void ClientCaps::wait_on_context_cond(
   std::atomic<bool>& wake_complete)
 {
   std::unique_lock l{caps_lock};
+  if (done.load(std::memory_order_acquire)) {
+    ceph::wait_for_reentrant_cond_broadcast(wake_complete);
+    return;
+  }
   cond.wait(l, [&done] {
     return done.load(std::memory_order_acquire);
   });
@@ -1043,6 +1050,37 @@ void ClientCaps::signal_waitfor_commit_sync(Inode *in)
 void ClientCaps::signal_waitfor_commit(Inode *in)
 {
   signal_waitfor_commit_sync(in);
+}
+
+void ClientCaps::push_waitfor_fsync_commit_waiter(Inode *in, Context *c)
+{
+  std::scoped_lock l{caps_lock};
+  in->waitfor_fsync_commit.push_back(c);
+}
+
+void ClientCaps::signal_waitfor_fsync_commit_sync(Inode *in)
+{
+  std::vector<Context*> batch;
+  {
+    std::scoped_lock l{caps_lock};
+    batch = in->waitfor_fsync_commit;
+  }
+  if (batch.empty())
+    return;
+  // Notify in place: _fsync reuses one C_ReentrantCond across loop iterations.
+  if (in->is_locked_by_me()) {
+    signal_context_list(batch);
+  } else if (client->is_locked_by_me()) {
+    client->signal_deferred_context_list(batch);
+  } else {
+    std::unique_lock<Client> cl(*client);
+    client->signal_deferred_context_list(batch);
+  }
+}
+
+void ClientCaps::remove_fsync_commit_waiter(Inode *in, Context *c)
+{
+  remove_context_waiter(in->waitfor_fsync_commit, c);
 }
 
 void ClientCaps::push_waitfor_caps_waiter(Inode *in, Context *c)
