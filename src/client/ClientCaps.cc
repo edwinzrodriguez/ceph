@@ -1066,8 +1066,11 @@ void ClientCaps::signal_waitfor_fsync_commit_sync(Inode *in)
   // list.  Signaling after copying the list released caps_lock and raced
   // finish() against delete.
   std::scoped_lock l{caps_lock};
-  for (Context *c : in->waitfor_fsync_commit)
-    c->complete(0);
+  for (Context *c : in->waitfor_fsync_commit) {
+    auto *rc = dynamic_cast<ceph::C_ReentrantCond<>*>(c);
+    ceph_assert(rc);
+    rc->wake(0);
+  }
 }
 
 void ClientCaps::remove_fsync_commit_waiter(Inode *in, Context *c)
