@@ -556,6 +556,11 @@ public:
       wake_complete->store(true, std::memory_order_release);
     }
   }
+  // Wake a persistent waiter without Context::complete()'s delete this.
+  void wake(int r)
+  {
+    finish(r);
+  }
 };
 
 template <class Mutex>
