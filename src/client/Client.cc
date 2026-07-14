@@ -4468,13 +4468,20 @@ void Client::signal_cond_list(list<ceph::tracked_condition_variable*>& ls)
 
 void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
-  ceph::tracked_condition_variable cond;
-  bool done = false;
+  ceph::reentrant_condition_variable cond;
+  std::atomic<bool> done{false};
+  std::atomic<bool> wake_complete{false};
   int r;
-  ls.push_back(new ceph::C_TrackedCond(cond, &done, &r));
-  std::unique_lock l{client_lock, std::adopt_lock};
-  cond.wait(l, [&done] { return done;});
-  l.release();
+  ls.push_back(new ceph::C_ReentrantCond<>(cond, &done, &r, &wake_complete));
+  flush_cap_releases();
+  ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+  ceph::ReentrantLock wait_lock = ceph::make_reentrant("Client::wait_on_context_list");
+  wait_lock.lock();
+  std::unique_lock<ceph::ReentrantLock> l(wait_lock, std::adopt_lock);
+  cond.wait(l, [&done] {
+    return done.load(std::memory_order_acquire);
+  });
+  ceph::wait_for_reentrant_cond_broadcast(wake_complete);
 }
 
 void Client::signal_deferred_context_list(std::vector<Context*>& ls)
@@ -5607,8 +5614,8 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
   if (check)
     check_caps(in, flags);
 
-  // wake up waiters (including get_caps sleeping on max_size)
-  if (new_caps || max_size_changed) {
+  // wake up waiters (including get_caps sleeping on max_size or revocation)
+  if (new_caps || max_size_changed || revoked) {
     ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
     signal_caps_inode(in);
   }
@@ -10152,14 +10159,18 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
         need |= CEPH_CAP_FILE_RD;
 
       check_caps(in, CHECK_CAPS_NODELAY);
-      Fh fh(in, flags, cmode, fd_gen, perms);
-      result = get_caps(&fh, need, want, &have, -1);
-      if (result < 0) {
-	ldout(cct, 8) << "Unable to get caps after open of inode " << *in <<
-			  " . Denying open: " <<
-			  cpp_strerror(result) << dendl;
-      } else {
+      if (in->caps_issued_mask(need, true)) {
 	put_cap_ref(in.get(), need);
+      } else {
+	Fh fh(in, flags, cmode, fd_gen, perms);
+	result = get_caps(&fh, need, need, &have, -1);
+	if (result < 0) {
+	  ldout(cct, 8) << "Unable to get caps after open of inode " << *in <<
+			    " . Denying open: " <<
+			    cpp_strerror(result) << dendl;
+	} else {
+	  put_cap_ref(in.get(), need);
+	}
       }
     }
   }

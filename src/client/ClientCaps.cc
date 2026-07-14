@@ -230,45 +230,45 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	in->flags &= ~I_CAP_DROPPED;
     }
 
-    if (waitfor_caps) {
+    if (waitfor_caps || waitfor_commit) {
+      auto& wait_list = waitfor_caps ? in->waitfor_caps : in->waitfor_commit;
       ceph::reentrant_condition_variable cond;
       std::atomic<bool> done{false};
       std::atomic<bool> wake_complete{false};
       int wr = 0;
-      // Register before check_caps: a grant may arrive as soon as the MDS
-      // sees our cap update; signaling an empty waitfor_caps leaves the waiter
-      // stuck even after caps are granted.
       {
 	std::scoped_lock l{caps_lock};
-	in->waitfor_caps.push_back(
+	wait_list.push_back(
 	  new ceph::C_ReentrantCond<>(cond, &done, &wr, &wake_complete));
       }
-      if (in->wanted_max_size > in->max_size &&
-	  in->wanted_max_size <= in->requested_max_size) {
-	in->requested_max_size = 0;
-      }
-      check_caps(in, CHECK_CAPS_NODELAY);
-      have = in->caps_issued(&implemented);
-      if ((have & need) == need) {
-	int revoking = implemented & ~have;
-	if ((revoking & want) == 0 &&
-	    (endoff < 0 || endoff <= (loff_t)in->max_size) &&
-	    (in->cap_snaps.empty() ||
-	     !in->cap_snaps.rbegin()->second.writing)) {
-	  std::vector<Context*> batch;
-	  {
-	    std::scoped_lock l{caps_lock};
-	    batch.swap(in->waitfor_caps);
+      if (waitfor_caps) {
+	if (in->wanted_max_size > in->max_size &&
+	    in->wanted_max_size <= in->requested_max_size) {
+	  in->requested_max_size = 0;
+	}
+	check_caps(in, CHECK_CAPS_NODELAY);
+	have = in->caps_issued(&implemented);
+	if ((have & need) == need) {
+	  int revoking = implemented & ~have;
+	  if ((revoking & want) == 0 &&
+	      (endoff < 0 || endoff <= (loff_t)in->max_size) &&
+	      (in->cap_snaps.empty() ||
+	       !in->cap_snaps.rbegin()->second.writing)) {
+	    std::vector<Context*> batch;
+	    {
+	      std::scoped_lock l{caps_lock};
+	      batch.swap(wait_list);
+	    }
+	    signal_context_list(batch);
+	    *phave = need | (have & want);
+	    in->get_cap_ref(need);
+	    client->cap_hit();
+	    return 0;
 	  }
-	  client->signal_context_list(batch);
-	  *phave = need | (have & want);
-	  in->get_cap_ref(need);
-	  client->cap_hit();
-	  return 0;
 	}
       }
       if (!done.load(std::memory_order_acquire)) {
-	// Drop client_lock so ms_dispatch can handle cap grants.
+	client->flush_cap_releases();
 	ceph::unique_unlock<ceph::TrackedLock> cl_drop(client->client_lock);
 	ceph::ReentrantLock wait_lock = ceph::make_reentrant("ClientCaps::get_caps");
 	wait_lock.lock();
@@ -278,8 +278,6 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	});
 	ceph::wait_for_reentrant_cond_broadcast(wake_complete);
       }
-    } else if (waitfor_commit) {
-      client->wait_on_context_list(in->waitfor_commit);
     }
   }
 }
@@ -771,24 +769,25 @@ void ClientCaps::signal_caps_inode_sync(Inode *in)
   // waitfor_caps_pending while we are finishing waitfor_caps.  A single
   // signal/swap can leave those waiters in waitfor_caps without running
   // them until the next cap flush ack (which may never come).
-  std::vector<Context*> batches[2];
-  {
-    std::scoped_lock l{caps_lock};
-    batches[0].swap(in->waitfor_caps);
-    std::swap(in->waitfor_caps, in->waitfor_caps_pending);
-    batches[1].swap(in->waitfor_caps);
-  }
-
-  for (auto& ls : batches) {
-    if (ls.empty())
-      continue;
-    if (client->client_lock.is_locked_by_me()) {
-      client->signal_deferred_context_list(ls);
-    } else {
-      std::scoped_lock cl(client->client_lock);
-      client->signal_deferred_context_list(ls);
+  //
+  // Wake cap waiters via signal_context_list (not signal_deferred_context_list):
+  // get_caps uses C_ReentrantCond and must be completed inline.  Deferring
+  // only C_TrackedCond left C_ReentrantCond waiters stuck in RecalledGetattr.
+  do {
+    std::vector<Context*> batch;
+    {
+      std::scoped_lock l{caps_lock};
+      batch.swap(in->waitfor_caps);
     }
-  }
+    if (!batch.empty())
+      signal_context_list(batch);
+    {
+      std::scoped_lock l{caps_lock};
+      if (in->waitfor_caps_pending.empty())
+        break;
+      std::swap(in->waitfor_caps, in->waitfor_caps_pending);
+    }
+  } while (true);
 }
 
 void ClientCaps::signal_caps_inode(Inode *in)
