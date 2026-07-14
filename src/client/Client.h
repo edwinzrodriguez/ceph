@@ -785,6 +785,9 @@ public:
 	                          const std::set <std::string> &changed) override;
   uint32_t get_deleg_timeout() { return deleg_timeout; }
   int set_deleg_timeout(uint32_t timeout);
+  int get_injected_write_delay_secs() const {
+    return injected_write_delay_secs;
+  }
   int ll_delegation(Fh *fh, unsigned cmd, ceph_deleg_cb_t cb, void *priv);
 
   entity_name_t get_myname() { return messenger->get_myname(); }
