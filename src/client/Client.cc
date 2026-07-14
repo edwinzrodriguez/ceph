@@ -3804,7 +3804,10 @@ void Client::_put_inode(Inode *in, int n)
       return;
   }
 
-  ldout(cct, 10) << __func__ << " on " << *in << " n = " << n << dendl;
+  if (inode_map.count(in->vino()))
+    ldout(cct, 10) << __func__ << " on " << *in << " n = " << n << dendl;
+  else
+    ldout(cct, 10) << __func__ << " on orphan inode " << in << " n = " << n << dendl;
 
   int left = in->get_nref();
   // Deferred puts may race with cap teardown during unmount; clamp rather than
@@ -3906,6 +3909,11 @@ void Client::delay_put_inodes(bool wakeup)
     }
     if (skip)
       continue;
+    if (!inode_map.count(in->vino())) {
+      ldout(cct, 1) << __func__ << " skip orphan inode " << in
+		    << " n=" << cnt << dendl;
+      continue;
+    }
     _put_inode(in, cnt);
   }
 
