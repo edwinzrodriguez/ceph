@@ -3958,6 +3958,13 @@ void Client::dispose_stale_inodes()
       if (in->ll_ref)
 	_ll_put(in, in->ll_ref);
 
+      if (is_unmounting()) {
+	if (in->cap_refs[CEPH_CAP_FILE_BUFFER] || in->cap_refs[CEPH_CAP_FILE_CACHE])
+	  _flushed(in);
+	if (in->cap_refs[CEPH_CAP_FILE_CACHE] > 0)
+	  put_cap_ref(in, CEPH_CAP_FILE_CACHE);
+      }
+
       _put_inode(in, 0);
     }
     delay_put_inodes();
@@ -4154,6 +4161,8 @@ public:
         << ": " << r << "(" << cpp_strerror(r) << ")" << dendl;
       inode->set_async_err(r);
     }
+    if (client->is_unmounting())
+      client->delay_put_inodes(true);
   }
 };
 
@@ -6635,8 +6644,11 @@ void Client::_unmount(bool abort)
 
       if (abort || blocklisted) {
         objectcacher_purge_set(in);
-      } else if (!in->caps.empty()) {
-	_release(in);
+      } else {
+	// Cap revoke can leave dirty data or FILE_BUFFER refs after caps are
+	// already gone; skipping those inodes wedged _unmount in mount_cond.
+	if (!in->caps.empty())
+	  _release(in);
 	_flush(in, new C_Client_FlushComplete(this, in));
       }
     }

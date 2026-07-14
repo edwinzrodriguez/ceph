@@ -137,6 +137,7 @@ static void write_func(bool *stop)
     }
   }
 
+  ceph_close(cmount, fd);
   ceph_shutdown(cmount);
 }
 
@@ -160,6 +161,7 @@ static void setattr_func(bool *stop)
     ASSERT_EQ(ceph_fsetattrx(cmount, fd, &stx, CEPH_SETATTR_SIZE), 0);
   }
 
+  ceph_close(cmount, fd);
   ceph_shutdown(cmount);
 }
 
