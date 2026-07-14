@@ -4487,9 +4487,10 @@ void Client::signal_deferred_context_list(std::vector<Context*>& ls)
   std::vector<Context*> batch;
   batch.swap(ls);
   for (Context *c : batch) {
-    // wait_on_context_list() installs C_TrackedCond waiters that must run
-    // under client_lock so notify_all() sees the mutex held.
-    if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr) {
+    // Cap waiters must run inline so get_caps can proceed; fsync advancers
+    // go to client_finisher to avoid starving C_Write_Finisher::finish_io.
+    if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr ||
+	dynamic_cast<ceph::C_ReentrantCond<>*>(c) != nullptr) {
       c->complete(0);
     } else {
       queue_client_finisher(c);
@@ -5520,10 +5521,12 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
     in->change_attr = m->get_change_attr();
 
   // max_size
+  bool max_size_changed = false;
   if (cap == in->auth_cap &&
       (new_caps & CEPH_CAP_ANY_FILE_WR) &&
       (m->get_max_size() != in->max_size)) {
     ldout(cct, 10) << "max_size " << in->max_size << " -> " << m->get_max_size() << dendl;
+    max_size_changed = true;
     in->max_size = m->get_max_size();
     if (in->max_size > in->wanted_max_size) {
       in->wanted_max_size = 0;
@@ -5604,8 +5607,8 @@ void Client::handle_cap_grant(MetaSession *session, Inode *in, Cap *cap, const M
   if (check)
     check_caps(in, flags);
 
-  // wake up waiters
-  if (new_caps) {
+  // wake up waiters (including get_caps sleeping on max_size)
+  if (new_caps || max_size_changed) {
     ldout(cct, 10) << __func__ << " calling signal_caps_inode" << dendl;
     signal_caps_inode(in);
   }
@@ -10148,6 +10151,7 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
       if (cmode & CEPH_FILE_MODE_RD)
         need |= CEPH_CAP_FILE_RD;
 
+      check_caps(in, CHECK_CAPS_NODELAY);
       Fh fh(in, flags, cmode, fd_gen, perms);
       result = get_caps(&fh, need, want, &have, -1);
       if (result < 0) {
