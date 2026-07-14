@@ -526,7 +526,7 @@ public:
   {
     *done = true;
     *rval = r;
-    cond.notify_all();
+    cond.notify_all_sloppy();
   }
 };
 
