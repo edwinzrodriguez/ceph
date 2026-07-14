@@ -4489,15 +4489,19 @@ void Client::signal_deferred_context_list(std::vector<Context*>& ls)
   if (ls.empty())
     return;
 
-  ceph_assert(ceph_mutex_is_locked_by_me(client_lock));
-
   std::vector<Context*> batch;
   batch.swap(ls);
   for (Context *c : batch) {
-    // Cap waiters must run inline so get_caps can proceed; fsync advancers
-    // go to client_finisher to avoid starving C_Write_Finisher::finish_io.
-    if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr ||
-	dynamic_cast<ceph::C_ReentrantCond<>*>(c) != nullptr) {
+    // C_ReentrantCond only sets an atomic and notifies a condvar; wake inline
+    // even when client_lock is held so cap waiters are not queued behind
+    // heavy finisher work.
+    if (dynamic_cast<ceph::C_ReentrantCond<>*>(c) != nullptr) {
+      c->complete(0);
+    } else if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr &&
+	       client_lock.is_locked_by_me()) {
+      // C_TrackedCond waiters must run under client_lock so notify_all() sees
+      // the mutex held.  Do not block on client_lock here (e.g. ms_dispatch
+      // after get_caps drops it): make_request may hold it while waiting.
       c->complete(0);
     } else {
       queue_client_finisher(c);
@@ -10158,19 +10162,14 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
       if (cmode & CEPH_FILE_MODE_RD)
         need |= CEPH_CAP_FILE_RD;
 
-      check_caps(in, CHECK_CAPS_NODELAY);
-      if (in->caps_issued_mask(need, true)) {
-	put_cap_ref(in.get(), need);
+      Fh fh(in, flags, cmode, fd_gen, perms);
+      result = get_caps(&fh, need, want, &have, -1);
+      if (result < 0) {
+	ldout(cct, 8) << "Unable to get caps after open of inode " << *in <<
+			  " . Denying open: " <<
+			  cpp_strerror(result) << dendl;
       } else {
-	Fh fh(in, flags, cmode, fd_gen, perms);
-	result = get_caps(&fh, need, need, &have, -1);
-	if (result < 0) {
-	  ldout(cct, 8) << "Unable to get caps after open of inode " << *in <<
-			    " . Denying open: " <<
-			    cpp_strerror(result) << dendl;
-	} else {
-	  put_cap_ref(in.get(), need);
-	}
+	put_cap_ref(in.get(), need);
       }
     }
   }

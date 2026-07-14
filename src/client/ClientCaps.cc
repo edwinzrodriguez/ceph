@@ -259,7 +259,7 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	      std::scoped_lock l{caps_lock};
 	      batch.swap(wait_list);
 	    }
-	    signal_context_list(batch);
+	    client->signal_deferred_context_list(batch);
 	    *phave = need | (have & want);
 	    in->get_cap_ref(need);
 	    client->cap_hit();
@@ -770,9 +770,9 @@ void ClientCaps::signal_caps_inode_sync(Inode *in)
   // signal/swap can leave those waiters in waitfor_caps without running
   // them until the next cap flush ack (which may never come).
   //
-  // Wake cap waiters via signal_context_list (not signal_deferred_context_list):
-  // get_caps uses C_ReentrantCond and must be completed inline.  Deferring
-  // only C_TrackedCond left C_ReentrantCond waiters stuck in RecalledGetattr.
+  // Extract waiters under caps_lock (get_caps registers there).  Wake
+  // C_ReentrantCond cap waiters inline via signal_deferred_context_list;
+  // defer fsync advancers so ms_dispatch does not recurse under client_lock.
   do {
     std::vector<Context*> batch;
     {
@@ -780,7 +780,7 @@ void ClientCaps::signal_caps_inode_sync(Inode *in)
       batch.swap(in->waitfor_caps);
     }
     if (!batch.empty())
-      signal_context_list(batch);
+      client->signal_deferred_context_list(batch);
     {
       std::scoped_lock l{caps_lock};
       if (in->waitfor_caps_pending.empty())
