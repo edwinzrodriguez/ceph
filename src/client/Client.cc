@@ -4751,12 +4751,16 @@ void Client::_flushed(Inode *in)
   // ObjectCacher finisher (PR3 no longer nests flush_set_callback under the
   // write completion path).
   //
-  // Do not drop FILE_CACHE here: _read_async and readahead hold their own
-  // FILE_CACHE refs for the duration of an active read.  Releasing them when
-  // the object set becomes clean races with ll_read and trips put_cap_ref().
-  if (in->cap_refs[CEPH_CAP_FILE_BUFFER] > 0) {
-    put_cap_ref(in, CEPH_CAP_FILE_BUFFER);
-  }
+  // Drop FILE_CACHE refs held for buffered writes when the object set is clean.
+  // _read_async/readahead take their own FILE_CACHE refs; put_cap_ref() only
+  // runs check_caps when the last ref drops, so concurrent reads are safe.
+  int drop = 0;
+  if (in->cap_refs[CEPH_CAP_FILE_BUFFER] > 0)
+    drop |= CEPH_CAP_FILE_BUFFER;
+  if (in->cap_refs[CEPH_CAP_FILE_CACHE] > 0)
+    drop |= CEPH_CAP_FILE_CACHE;
+  if (drop)
+    put_cap_ref(in, drop);
 }
 
 
