@@ -2558,7 +2558,7 @@ loff_t ObjectCacher::release_set(ObjectSet *oset)
     unclean += o_unclean;
 
     if (o_unclean)
-      ldout(cct, 10) << "release_set " << oset << " " << *ob
+      ldout(cct, 10) << "release_set ino " << oset->ino << " " << *ob
        << " has " << o_unclean << " bytes left"
        << dendl;
     return true;  // continue iteration

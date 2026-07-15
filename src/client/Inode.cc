@@ -29,7 +29,7 @@ Inode::~Inode()
     snapdir_parent.reset();
   }
 
-  if (!oset.empty()) {
+  if (!oset.invalidated && !oset.empty()) {
     lsubdout(client->cct, client, 0) << __func__ << ": leftover objects on inode 0x"
       << std::hex << ino << std::dec << dendl;
     ceph_assert(oset.empty());
