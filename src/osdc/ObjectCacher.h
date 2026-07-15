@@ -510,6 +510,15 @@ class ObjectCacher {
 	return_enoent(false), truncate_seq(0),
 	truncate_size(0), dirty_or_tx(0) {}
 
+    void print(std::ostream& out) const {
+      out << "objectset[" << ino
+	  << " ts " << truncate_seq << "/" << truncate_size
+	  << " dirty_or_tx " << dirty_or_tx;
+      if (invalidated)
+	out << " invalidated";
+      out << "]";
+    }
+
   private:
 
 
@@ -916,11 +925,8 @@ inline std::ostream& operator<<(std::ostream &out,
 inline std::ostream& operator<<(std::ostream &out,
 				const ObjectCacher::ObjectSet &os)
 {
-  return out << "objectset[" << os.ino
-	     << " ts " << os.truncate_seq << "/" << os.truncate_size
-	     << " objects " << os.size()
-	     << " dirty_or_tx " << os.dirty_or_tx
-	     << "]";
+  os.print(out);
+  return out;
 }
 
 inline std::ostream& operator<<(std::ostream &out,

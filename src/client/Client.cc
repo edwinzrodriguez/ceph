@@ -3849,10 +3849,18 @@ void Client::_put_inode(Inode *in, int n)
         root_parents.erase(root_parents.begin());
     }
 
-    if (is_unmounting()) {
-      objectcacher_purge_set(in);
+    {
+      InodeOsetPin oc(in);
+      ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+      {
+	auto oc_lock = objectcacher->acquire_cache_lock();
+	if (is_unmounting()) {
+	  objectcacher->purge_set(oc.oset);
+	}
+	objectcacher->release_set(oc.oset);
+      }
+      objectcacher->wait_for_flush_callbacks();
     }
-    objectcacher_release_set(in);
     // Drop any put_inode() re-queued while client_lock was released above.
     {
       std::scoped_lock dl(delay_i_lock);
@@ -5106,6 +5114,14 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
   vinodeno_t vino(m->get_ino(), CEPH_NOSNAP);
   if (auto it = inode_map.find(vino); it != inode_map.end()) {
     in = it->second;
+    {
+      std::scoped_lock dl(delay_i_lock);
+      if (deleting_inodes.count(in)) {
+	ldout(cct, 5) << __func__ << " vino " << vino
+		      << " is being deleted, immediately releasing" << dendl;
+	do_cap_release = true;
+      }
+    }
 
     /* MDS maybe waiting for cap release with increased seq */
     switch (m->get_op()) {
