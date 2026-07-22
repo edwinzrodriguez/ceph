@@ -11769,8 +11769,9 @@ int Client::_preadv_pwritev(int fd, const struct iovec *iov, int iovcnt,
     return r;
 }
 
-int64_t Client::_write_success(Fh *f, utime_t start, uint64_t fpos,
-                               int64_t offset, uint64_t size, Inode *in)
+int64_t Client::_write_success(Fh *f, utime_t start, utime_t op_mtime,
+                               uint64_t fpos, int64_t offset, uint64_t size,
+                               Inode *in)
 {
   utime_t lat;
   uint64_t totalwritten;
@@ -11809,7 +11810,7 @@ int64_t Client::_write_success(Fh *f, utime_t start, uint64_t fpos,
   }
 
   // mtime
-  in->mtime = in->ctime = ceph_clock_now();
+  in->mtime = in->ctime = op_mtime;
   in->change_attr++;
   in->mark_caps_dirty(CEPH_CAP_FILE_WR);
 
@@ -11837,7 +11838,7 @@ void Client::C_Write_Finisher::finish_io(int r)
       }
     }
 
-    r = clnt->_write_success(f, start, fpos, offset, size, in);
+    r = clnt->_write_success(f, start, op_mtime, fpos, offset, size, in);
   }
 
   iofinished = true;
@@ -11981,6 +11982,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
 
   // time it.
   utime_t start = ceph_clock_now();
+  utime_t op_mtime = ceph_clock_now();
 
   if (in->inline_version == 0) {
     int r = _getattr(in, CEPH_STAT_CAP_INLINE_DATA, f->actor_perms, true);
@@ -12066,7 +12068,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
                         cct->_conf->client_oc &&
                           (have & (CEPH_CAP_FILE_BUFFER |
                                  CEPH_CAP_FILE_LAZYIO)),
-                        start, f, in, fpos, offset, size,
+                        start, op_mtime, f, in, fpos, offset, size,
                         do_fsync, syncdataonly));
 
     cwf_iofinish->CWF = cwf.get();
@@ -12085,7 +12087,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
     // async, caching, non-blocking.
     r = objectcacher->file_write(&in->oset, &in->layout,
 				 in->snaprealm->get_snap_context(),
-				 offset, size, bl, ceph::real_clock::now(),
+				 offset, size, bl, op_mtime.to_real_time(),
 				 0, iofinish.get(),
 				 onfinish == nullptr
 				   ? objectcacher->CFG_block_writes_upfront()
@@ -12154,7 +12156,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
     get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
 
     filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
-		       offset, size, bl, ceph::real_clock::now(), 0,
+		       offset, size, bl, op_mtime.to_real_time(), 0,
 		       in->truncate_size, in->truncate_seq,
 		       filer_iofinish.get());
 
@@ -12182,7 +12184,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
 success:
 
   // do not get here if non-blocking caller (onfinish != nullptr)
-  r = _write_success(f, start, fpos, offset, size, in);
+  r = _write_success(f, start, op_mtime, fpos, offset, size, in);
 
   if (r >= 0 && do_fsync) {
     int64_t r1;
