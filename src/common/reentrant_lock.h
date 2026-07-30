@@ -536,11 +536,16 @@ class C_ReentrantCond : public Context {
   std::atomic<bool> *done;
   std::atomic<bool> *wake_complete;
   int *rval;
+  // Mutex the waiter holds around cond.wait(pred).  finish() must take it
+  // before setting done and notifying, or a wakeup can be lost between the
+  // waiter's predicate check and cv.wait (private wait_lock pattern).
+  LockType *wait_mutex;
 public:
   C_ReentrantCond(reentrant_condition_variable_impl<LockType> &c,
                   std::atomic<bool> *d, int *r,
-                  std::atomic<bool> *wc = nullptr)
-    : cond(c), done(d), wake_complete(wc), rval(r)
+                  std::atomic<bool> *wc = nullptr,
+                  LockType *wm = nullptr)
+    : cond(c), done(d), wake_complete(wc), rval(r), wait_mutex(wm)
   {
     done->store(false, std::memory_order_relaxed);
     if (wake_complete) {
@@ -550,8 +555,16 @@ public:
   void finish(int r) override
   {
     *rval = r;
-    done->store(true, std::memory_order_release);
-    cond.notify_all_sloppy();
+    if (wait_mutex) {
+      std::lock_guard<LockType> l{*wait_mutex};
+      done->store(true, std::memory_order_release);
+      cond.notify_all();
+    } else {
+      // Legacy path: caller must hold wait_mutex when completing, or accept
+      // a lost-wakeup race.  Prefer passing wait_mutex.
+      done->store(true, std::memory_order_release);
+      cond.notify_all_sloppy();
+    }
     if (wake_complete) {
       wake_complete->store(true, std::memory_order_release);
     }

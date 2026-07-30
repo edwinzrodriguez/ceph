@@ -232,6 +232,9 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 
     if (waitfor_caps || waitfor_commit) {
       auto& wait_list = waitfor_caps ? in->waitfor_caps : in->waitfor_commit;
+      // wait_lock must exist before registration so C_ReentrantCond::finish
+      // can take it and avoid a lost wakeup (see wait_on_context_list).
+      ceph::ReentrantLock wait_lock = ceph::make_reentrant("ClientCaps::get_caps");
       ceph::reentrant_condition_variable cond;
       std::atomic<bool> done{false};
       std::atomic<bool> wake_complete{false};
@@ -239,7 +242,8 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
       {
 	std::scoped_lock l{caps_lock};
 	wait_list.push_back(
-	  new ceph::C_ReentrantCond<>(cond, &done, &wr, &wake_complete));
+	  new ceph::C_ReentrantCond<>(cond, &done, &wr, &wake_complete,
+				      &wait_lock));
       }
       if (waitfor_caps) {
 	if (in->wanted_max_size > in->max_size &&
@@ -270,7 +274,6 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
       if (!done.load(std::memory_order_acquire)) {
 	client->flush_cap_releases();
 	ceph::unique_unlock<ceph::TrackedLock> cl_drop(client->client_lock);
-	ceph::ReentrantLock wait_lock = ceph::make_reentrant("ClientCaps::get_caps");
 	wait_lock.lock();
 	std::unique_lock<ceph::ReentrantLock> l(wait_lock, std::adopt_lock);
 	cond.wait(l, [&done] {
