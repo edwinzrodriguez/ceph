@@ -4486,19 +4486,23 @@ void Client::signal_cond_list(list<ceph::tracked_condition_variable*>& ls)
 
 void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
-  // Wait on client_lock itself (ceph-client-lock2 pattern).  Private wait
-  // mutexes + reentrant_condition_variable / C_ReentrantCond lost wakeups
-  // under Ganesha fsync load; C_TrackedCond is completed under client_lock
-  // so done+notify share the same lock the waiter holds around the pred.
+  // Use C_SaferCond only.  Do NOT use C_ReentrantCond / reentrant_condition_variable
+  // with a private wait lock: under CEPH_LOCKSTAT that path uses Guard +
+  // condition_variable_lockstat on the reentrant lock's native timed_mutex and
+  // has lost wakeups under Ganesha fsync (gdb: flushing_caps==0, waitfor_caps
+  // empty, still blocked in cond.wait).  C_SaferCond is the classic
+  // lock/done/notify/wait pattern used everywhere else in Client.
+  //
+  // Stack-allocated: signal_deferred_context_list must complete these inline
+  // (C_SaferCond::complete does not delete).
   ceph_assert(client_lock.is_locked_by_me());
-  ceph::tracked_condition_variable cond;
-  bool done = false;
-  int r;
-  ls.push_back(new ceph::C_TrackedCond(cond, &done, &r));
+  C_SaferCond cond("Client::wait_on_context_list");
+  ls.push_back(&cond);
   flush_cap_releases();
-  std::unique_lock<ceph::TrackedLock> l{client_lock, std::adopt_lock};
-  cond.wait(l, [&done] { return done; });
-  l.release();
+  {
+    ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
+    cond.wait();
+  }
 }
 
 void Client::signal_deferred_context_list(std::vector<Context*>& ls)
@@ -4509,15 +4513,12 @@ void Client::signal_deferred_context_list(std::vector<Context*>& ls)
   std::vector<Context*> batch;
   batch.swap(ls);
   for (Context *c : batch) {
-    // C_TrackedCond waiters must complete under client_lock (same mutex they
-    // wait on).  Cap/fsync waiters only set done+notify; run them inline so
-    // they are not stuck behind heavy finisher work.
-    if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr) {
-      ceph_assert(client_lock.is_locked_by_me());
-      c->complete(0);
-    } else if (dynamic_cast<C_SaferCond*>(c) != nullptr ||
-	       dynamic_cast<ceph::C_ReentrantCond<>*>(c) != nullptr) {
-      // Private-mutex waiters (if any remain) only need their own lock.
+    // Cap/fsync waiters only set done+notify on a private mutex.  Complete
+    // inline so they are not stuck behind heavy finisher work.  Stack
+    // C_SaferCond *must* run here: the waiter may destroy it after wait().
+    if (dynamic_cast<C_SaferCond*>(c) != nullptr ||
+	dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr ||
+	dynamic_cast<ceph::C_ReentrantCond<>*>(c) != nullptr) {
       c->complete(0);
     } else {
       queue_client_finisher(c);
