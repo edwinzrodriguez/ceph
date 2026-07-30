@@ -4486,23 +4486,19 @@ void Client::signal_cond_list(list<ceph::tracked_condition_variable*>& ls)
 
 void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
-  // wait_lock must outlive registration: finish() takes it before done/notify
-  // so a concurrent signal cannot lose the wakeup between pred check and wait.
-  ceph::ReentrantLock wait_lock = ceph::make_reentrant("Client::wait_on_context_list");
-  ceph::reentrant_condition_variable cond;
-  std::atomic<bool> done{false};
-  std::atomic<bool> wake_complete{false};
+  // Wait on client_lock itself (ceph-client-lock2 pattern).  Private wait
+  // mutexes + reentrant_condition_variable / C_ReentrantCond lost wakeups
+  // under Ganesha fsync load; C_TrackedCond is completed under client_lock
+  // so done+notify share the same lock the waiter holds around the pred.
+  ceph_assert(client_lock.is_locked_by_me());
+  ceph::tracked_condition_variable cond;
+  bool done = false;
   int r;
-  ls.push_back(new ceph::C_ReentrantCond<>(cond, &done, &r, &wake_complete,
-					   &wait_lock));
+  ls.push_back(new ceph::C_TrackedCond(cond, &done, &r));
   flush_cap_releases();
-  ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
-  wait_lock.lock();
-  std::unique_lock<ceph::ReentrantLock> l(wait_lock, std::adopt_lock);
-  cond.wait(l, [&done] {
-    return done.load(std::memory_order_acquire);
-  });
-  ceph::wait_for_reentrant_cond_broadcast(wake_complete);
+  std::unique_lock<ceph::TrackedLock> l{client_lock, std::adopt_lock};
+  cond.wait(l, [&done] { return done; });
+  l.release();
 }
 
 void Client::signal_deferred_context_list(std::vector<Context*>& ls)
@@ -4513,16 +4509,15 @@ void Client::signal_deferred_context_list(std::vector<Context*>& ls)
   std::vector<Context*> batch;
   batch.swap(ls);
   for (Context *c : batch) {
-    // C_ReentrantCond only sets an atomic and notifies a condvar; wake inline
-    // even when client_lock is held so cap waiters are not queued behind
-    // heavy finisher work.
-    if (dynamic_cast<ceph::C_ReentrantCond<>*>(c) != nullptr) {
+    // C_TrackedCond waiters must complete under client_lock (same mutex they
+    // wait on).  Cap/fsync waiters only set done+notify; run them inline so
+    // they are not stuck behind heavy finisher work.
+    if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr) {
+      ceph_assert(client_lock.is_locked_by_me());
       c->complete(0);
-    } else if (dynamic_cast<ceph::C_TrackedCond*>(c) != nullptr &&
-	       client_lock.is_locked_by_me()) {
-      // C_TrackedCond waiters must run under client_lock so notify_all() sees
-      // the mutex held.  Do not block on client_lock here (e.g. ms_dispatch
-      // after get_caps drops it): make_request may hold it while waiting.
+    } else if (dynamic_cast<C_SaferCond*>(c) != nullptr ||
+	       dynamic_cast<ceph::C_ReentrantCond<>*>(c) != nullptr) {
+      // Private-mutex waiters (if any remain) only need their own lock.
       c->complete(0);
     } else {
       queue_client_finisher(c);

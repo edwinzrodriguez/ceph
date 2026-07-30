@@ -230,57 +230,29 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
 	in->flags &= ~I_CAP_DROPPED;
     }
 
-    if (waitfor_caps || waitfor_commit) {
-      auto& wait_list = waitfor_caps ? in->waitfor_caps : in->waitfor_commit;
-      // wait_lock must exist before registration so C_ReentrantCond::finish
-      // can take it and avoid a lost wakeup (see wait_on_context_list).
-      ceph::ReentrantLock wait_lock = ceph::make_reentrant("ClientCaps::get_caps");
-      ceph::reentrant_condition_variable cond;
-      std::atomic<bool> done{false};
-      std::atomic<bool> wake_complete{false};
-      int wr = 0;
-      {
-	std::scoped_lock l{caps_lock};
-	wait_list.push_back(
-	  new ceph::C_ReentrantCond<>(cond, &done, &wr, &wake_complete,
-				      &wait_lock));
+    if (waitfor_caps) {
+      if (in->wanted_max_size > in->max_size &&
+	  in->wanted_max_size <= in->requested_max_size) {
+	in->requested_max_size = 0;
       }
-      if (waitfor_caps) {
-	if (in->wanted_max_size > in->max_size &&
-	    in->wanted_max_size <= in->requested_max_size) {
-	  in->requested_max_size = 0;
-	}
-	check_caps(in, CHECK_CAPS_NODELAY);
-	have = in->caps_issued(&implemented);
-	if ((have & need) == need) {
-	  int revoking = implemented & ~have;
-	  if ((revoking & want) == 0 &&
-	      (endoff < 0 || endoff <= (loff_t)in->max_size) &&
-	      (in->cap_snaps.empty() ||
-	       !in->cap_snaps.rbegin()->second.writing)) {
-	    std::vector<Context*> batch;
-	    {
-	      std::scoped_lock l{caps_lock};
-	      batch.swap(wait_list);
-	    }
-	    client->signal_deferred_context_list(batch);
-	    *phave = need | (have & want);
-	    in->get_cap_ref(need);
-	    client->cap_hit();
-	    return 0;
-	  }
+      check_caps(in, CHECK_CAPS_NODELAY);
+      have = in->caps_issued(&implemented);
+      if ((have & need) == need) {
+	int revoking = implemented & ~have;
+	if ((revoking & want) == 0 &&
+	    (endoff < 0 || endoff <= (loff_t)in->max_size) &&
+	    (in->cap_snaps.empty() ||
+	     !in->cap_snaps.rbegin()->second.writing)) {
+	  *phave = need | (have & want);
+	  in->get_cap_ref(need);
+	  client->cap_hit();
+	  return 0;
 	}
       }
-      if (!done.load(std::memory_order_acquire)) {
-	client->flush_cap_releases();
-	ceph::unique_unlock<ceph::TrackedLock> cl_drop(client->client_lock);
-	wait_lock.lock();
-	std::unique_lock<ceph::ReentrantLock> l(wait_lock, std::adopt_lock);
-	cond.wait(l, [&done] {
-	  return done.load(std::memory_order_acquire);
-	});
-	ceph::wait_for_reentrant_cond_broadcast(wake_complete);
-      }
+      // Register+wait under client_lock (see Client::wait_on_context_list).
+      client->wait_on_context_list(in->waitfor_caps);
+    } else if (waitfor_commit) {
+      client->wait_on_context_list(in->waitfor_commit);
     }
   }
 }
@@ -773,9 +745,9 @@ void ClientCaps::signal_caps_inode_sync(Inode *in)
   // signal/swap can leave those waiters in waitfor_caps without running
   // them until the next cap flush ack (which may never come).
   //
-  // Extract waiters under caps_lock (get_caps registers there).  Wake
-  // C_ReentrantCond cap waiters inline via signal_deferred_context_list;
-  // defer fsync advancers so ms_dispatch does not recurse under client_lock.
+  // Extract waiters under caps_lock.  Wake C_TrackedCond waiters inline via
+  // signal_deferred_context_list under client_lock; defer fsync advancers so
+  // ms_dispatch does not recurse under client_lock.
   do {
     std::vector<Context*> batch;
     {
