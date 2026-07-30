@@ -4486,14 +4486,17 @@ void Client::signal_cond_list(list<ceph::tracked_condition_variable*>& ls)
 
 void Client::wait_on_context_list(std::vector<Context*>& ls)
 {
+  // wait_lock must outlive registration: finish() takes it before done/notify
+  // so a concurrent signal cannot lose the wakeup between pred check and wait.
+  ceph::ReentrantLock wait_lock = ceph::make_reentrant("Client::wait_on_context_list");
   ceph::reentrant_condition_variable cond;
   std::atomic<bool> done{false};
   std::atomic<bool> wake_complete{false};
   int r;
-  ls.push_back(new ceph::C_ReentrantCond<>(cond, &done, &r, &wake_complete));
+  ls.push_back(new ceph::C_ReentrantCond<>(cond, &done, &r, &wake_complete,
+					   &wait_lock));
   flush_cap_releases();
   ceph::unique_unlock<ceph::TrackedLock> cl_drop(client_lock);
-  ceph::ReentrantLock wait_lock = ceph::make_reentrant("Client::wait_on_context_list");
   wait_lock.lock();
   std::unique_lock<ceph::ReentrantLock> l(wait_lock, std::adopt_lock);
   cond.wait(l, [&done] {

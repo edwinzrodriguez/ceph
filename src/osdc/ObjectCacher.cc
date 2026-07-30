@@ -2054,7 +2054,8 @@ int ObjectCacher::_wait_for_write(OSDWrite *wr, uint64_t len, ObjectSet *oset,
     std::atomic<bool> done{false};
     std::atomic<bool> wake_complete{false};
     Context *fin = block_writes_upfront ?
-      new C_ReentrantCond(cond, &done, &ret, &wake_complete) : onfreespace;
+      new C_ReentrantCond(cond, &done, &ret, &wake_complete, &cache_lock)
+      : onfreespace;
     ceph_assert(fin);
     bool flushed = flush_set(oset, wr->extents, trace, fin);
     ceph_assert(!flushed);   // we just dirtied it, and didn't drop our lock!
