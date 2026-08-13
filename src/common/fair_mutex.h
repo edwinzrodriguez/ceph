@@ -12,8 +12,49 @@
 #endif
 
 #include <string>
+#include <thread>
+#include <vector>
+
+#if defined(_SC_NPROCESSORS_ONLN)
+#include <unistd.h>
+#endif
 
 namespace ceph {
+namespace fair_mutex_detail {
+inline unsigned cpu_count()
+{
+#if defined(_SC_NPROCESSORS_ONLN)
+  const long online = ::sysconf(_SC_NPROCESSORS_ONLN);
+  if (online > 0) {
+    return static_cast<unsigned>(online);
+  }
+#endif
+  const unsigned hw = std::thread::hardware_concurrency();
+  return hw > 0 ? hw : 256;
+}
+
+constexpr unsigned round_up_power_of_2(unsigned n)
+{
+  if (n <= 1) {
+    return 1;
+  }
+  --n;
+  n |= n >> 1;
+  n |= n >> 2;
+  n |= n >> 4;
+  n |= n >> 8;
+  n |= n >> 16;
+  return n + 1;
+}
+
+inline unsigned slot_count()
+{
+  const unsigned cpus = cpu_count();
+  const unsigned max_waiters = cpus > 0 ? cpus - 1 : 0;
+  return round_up_power_of_2(std::max(max_waiters, 1u));
+}
+} // namespace fair_mutex_detail
+
 /// a FIFO mutex
 class fair_mutex
 #ifdef CEPH_LOCKSTAT
@@ -25,6 +66,8 @@ public:
 #ifdef CEPH_LOCKSTAT
     lockstat_detail::LockStat(ceph::mutex::LockType, LOCKSTAT("fair_" + name)),
 #endif
+  slots(fair_mutex_detail::slot_count()),
+  slot_mask(slots.size() - 1),
   mutex{ceph::make_mutex(name)}
   {}
   ~fair_mutex() = default;
@@ -41,9 +84,12 @@ public:
 #endif
     std::unique_lock lock(mutex);
     const unsigned my_id = next_id++;
-    cond.wait(lock, [&] {
-      return my_id == unblock_id;
-    });
+    if (my_id != unblock_id) {
+      ceph_assert(next_id - unblock_id <= slots.size());
+      slots[my_id & slot_mask].cv.wait(lock, [&] {
+        return my_id == unblock_id;
+      });
+    }
     _set_locked_by();
 #ifdef CEPH_LOCKSTAT
     if (unlikely(wait_start_clock != lockstat_detail::lockstat_clock::zero())) {
@@ -93,7 +139,9 @@ public:
     std::lock_guard lock(mutex);
     ++unblock_id;
     _reset_locked_by();
-    cond.notify_all();
+    if (next_id != unblock_id) {
+      slots[unblock_id & slot_mask].cv.notify_one();
+    }
   }
 
   bool is_locked() const
@@ -113,14 +161,20 @@ private:
     locked_by = {};
   }
 #else
+private:
   void _set_locked_by() {}
   void _reset_locked_by() {}
 #endif
 
 private:
+  struct waiter {
+    ceph::condition_variable cv;
+  };
+
   unsigned next_id = 0;
   unsigned unblock_id = 0;
-  ceph::condition_variable cond;
+  std::vector<waiter> slots;
+  const unsigned slot_mask;
   ceph::mutex mutex;
 #ifdef CEPH_DEBUG_MUTEX
   std::thread::id locked_by = {};
