@@ -609,6 +609,5 @@ options:
   default: false
   services:
   - mds_client
-  with_legacy: true
   flags:
   - runtime

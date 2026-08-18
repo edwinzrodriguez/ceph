@@ -50,7 +50,9 @@ namespace ceph {
 #define CEPHFS_FEATURE_HAS_OWNER_UIDGID     20
 #define CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK  21
 #define CEPHFS_FEATURE_CHARMAP              22
-#define CEPHFS_FEATURE_MAX                  22
+#define CEPHFS_FEATURE_BLOCKDIFF            23
+#define CEPHFS_FEATURE_RADOS_FSYNC          24
+#define CEPHFS_FEATURE_MAX                  24
 
 #define CEPHFS_FEATURES_ALL {		\
   0, 1, 2, 3, 4,			\
@@ -73,7 +75,9 @@ namespace ceph {
   CEPHFS_FEATURE_NEW_SNAPREALM_INFO,    \
   CEPHFS_FEATURE_HAS_OWNER_UIDGID,      \
   CEPHFS_FEATURE_MDS_AUTH_CAPS_CHECK,   \
-  CEPHFS_FEATURE_CHARMAP,      \
+  CEPHFS_FEATURE_CHARMAP,               \
+  CEPHFS_FEATURE_BLOCKDIFF,             \
+  CEPHFS_FEATURE_RADOS_FSYNC,           \
 }
 
 #define CEPHFS_METRIC_FEATURES_ALL {		\
