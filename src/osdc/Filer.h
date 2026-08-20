@@ -33,6 +33,8 @@
 
 #include "common/ceph_time.h"
 
+#include "include/ceph_fs.h"
+
 #include "Objecter.h"
 #include "Striper.h"
 
@@ -182,12 +184,23 @@ class Filer {
 		  uint64_t truncate_size,
 		  __u32 truncate_seq,
 		  Context *oncommit,
-		  int op_flags = 0) {
+		  int op_flags = 0,
+		  uint64_t change_attr = 0) {
     std::vector<ObjectExtent> extents;
     Striper::file_to_extents(cct, ino, layout, offset, len, truncate_size,
 			     extents);
-    objecter->sg_write_trunc(extents, snapc, bl, mtime, flags,
-		       truncate_size, truncate_seq, oncommit, op_flags);
+    if (change_attr) {
+      ObjectOperation change_op;
+      bufferlist cbl;
+      encode(change_attr, cbl);
+      change_op.setxattr(CHANGE_ATTR_NAME, cbl);
+      objecter->sg_write_trunc(extents, snapc, bl, mtime, flags,
+			       truncate_size, truncate_seq, oncommit, op_flags,
+			       &change_op);
+    } else {
+      objecter->sg_write_trunc(extents, snapc, bl, mtime, flags,
+			       truncate_size, truncate_seq, oncommit, op_flags);
+    }
   }
 
   void truncate(inodeno_t ino,

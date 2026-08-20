@@ -12161,7 +12161,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
     filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
 		       offset, size, bl, op_mtime.to_real_time(), 0,
 		       in->truncate_size, in->truncate_seq,
-		       filer_iofinish.get());
+		       filer_iofinish.get(), 0, in->change_attr);
 
     if (onfinish) {
       // handle non-blocking caller (onfinish != nullptr), we can now safely
