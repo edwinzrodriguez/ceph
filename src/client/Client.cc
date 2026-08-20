@@ -12094,7 +12094,7 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
 				 0, iofinish.get(),
 				 onfinish == nullptr
 				   ? objectcacher->CFG_block_writes_upfront()
-				   : false);
+				   : false, in->change_attr);
 
     if (onfinish) {
       // handle non-blocking caller (onfinish != nullptr), we can now safely
