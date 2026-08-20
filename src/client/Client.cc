@@ -12094,7 +12094,8 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
 				 0, iofinish.get(),
 				 onfinish == nullptr
 				   ? objectcacher->CFG_block_writes_upfront()
-				   : false, in->change_attr);
+				   : false,
+				 do_rados_fsync ? in->change_attr : 0);
 
     if (onfinish) {
       // handle non-blocking caller (onfinish != nullptr), we can now safely
@@ -12161,7 +12162,8 @@ int64_t Client::_write(Fh *f, int64_t offset, uint64_t size, const char *buf,
     filer->write_trunc(in->ino, &in->layout, in->snaprealm->get_snap_context(),
 		       offset, size, bl, op_mtime.to_real_time(), 0,
 		       in->truncate_size, in->truncate_seq,
-		       filer_iofinish.get(), 0, in->change_attr);
+		       filer_iofinish.get(), 0,
+		       do_rados_fsync ? in->change_attr : 0);
 
     if (onfinish) {
       // handle non-blocking caller (onfinish != nullptr), we can now safely
