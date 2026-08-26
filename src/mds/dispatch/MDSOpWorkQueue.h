@@ -56,6 +56,9 @@ public:
 
   bool has_work_for_consumer();
 
+  /// Items waiting in all lane banks (producer and consumer sides).
+  size_t count();
+
   void wake();
   void shutdown();
 
