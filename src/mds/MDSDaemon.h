@@ -67,6 +67,8 @@ class MDSDaemon : public Dispatcher {
    */
   bool is_clean_shutdown();
 
+  Dispatcher::dispatch_result_t dispatch_inbound_locked(const ref_t<Message>& m);
+
   /* Global MDS lock: every time someone takes this, they must
    * also check the `stopping` flag.  If stopping is true, you
    * must either do nothing and immediately drop the lock, or
