@@ -27,6 +27,7 @@
 
 #include <boost/intrusive/list.hpp>
 
+#include "common/ceph_time.h"
 #include "msg/Message.h"
 
 class MDSIOContextBase;
@@ -60,8 +61,12 @@ struct OpWorkItem
   int rval = 0;
   std::function<void()>* callable = nullptr;
 
+  /// Set when the item enters MDSOpWorkQueue (reactor perf counters).
+  ceph::coarse_mono_time enqueued_at{};
+
   static OpWorkItem* create_inbound(const ref_t<Message>& m, DispatchLane lane);
   static OpWorkItem* create_io(MDSIOContextBase* ctx, int r);
   static OpWorkItem* create_callable(DispatchLane lane, std::function<void()> fn);
+  void note_enqueued();
   void destroy();
 };

@@ -53,11 +53,18 @@ public:
 
 private:
   void op_thread_main();
+  void enqueue_item(OpWorkItem* item, DispatchLane lane);
   void execute_item(OpWorkItem* item);
   void execute_io_completion(MDSIOContextBase* ioctx, int r);
+  void record_wait_metrics(const OpWorkItem& item);
+  void record_execute_metrics(
+      DispatchLane lane,
+      ceph::coarse_mono_time exec_start);
+  void update_queue_depth_metrics();
 
   MDSDispatchContext ctx;
   MDSOpWorkQueue queue;
   std::thread op_thread;
   std::atomic<bool> stop{false};
+  std::atomic<uint64_t> queue_len_max{0};
 };
