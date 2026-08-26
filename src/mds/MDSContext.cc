@@ -101,7 +101,8 @@ void MDSIOContextBase::complete(int r) {
   dout(10) << "MDSIOContextBase::complete: " << typeid(*this).name() << dendl;
   ceph_assert(mds != NULL);
 
-  if (auto* engine = mds->get_dispatch_engine()) {
+  if (auto* engine = mds->get_dispatch_engine();
+      engine && engine->is_reactor()) {
     engine->submit_io_completion(this, r);
     return;
   }
@@ -151,7 +152,8 @@ void C_IO_Wrapper::complete(int r)
     MDSRank* mds = get_mds();
     if (auto* engine = mds->get_dispatch_engine();
         engine && engine->is_reactor()) {
-      engine->submit_io_completion(this, r);
+      // Reactor: enqueue for the op thread; do not use the finisher.
+      MDSIOContextBase::complete(r);
       return;
     }
     mds->finisher->queue(this, r);
