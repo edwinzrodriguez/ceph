@@ -14,10 +14,13 @@
  */
 
 #include "MDSContext.h"
-#include "MDSRank.h"
-#include "MDLog.h"
 
 #include "common/debug.h"
+
+#include "dispatch/MDSDispatchEngine.h"
+
+#include "MDLog.h"
+#include "MDSRank.h"
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 
@@ -97,6 +100,12 @@ void MDSIOContextBase::complete(int r) {
 
   dout(10) << "MDSIOContextBase::complete: " << typeid(*this).name() << dendl;
   ceph_assert(mds != NULL);
+
+  if (auto* engine = mds->get_dispatch_engine()) {
+    engine->submit_io_completion(this, r);
+    return;
+  }
+
   // Note, MDSIOContext is passed outside the MDS and, strangely, we grab the
   // lock here when MDSContext::complete would otherwise assume the lock is
   // already acquired.
