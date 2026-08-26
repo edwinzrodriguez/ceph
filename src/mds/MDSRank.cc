@@ -34,6 +34,7 @@
 #include "common/likely.h"
 #include "dispatch/MDSDispatchContext.h"
 #include "dispatch/MDSDispatchEngine.h"
+#include "dispatch/OpWorkItem.h"
 #include "events/ELid.h"
 #include "events/ESubtreeMap.h"
 #include "log/Log.h"
@@ -3799,6 +3800,88 @@ void MDSRank::create_logger()
                     "Inodes with capabilities");
     mds_plb.add_u64(l_mds_subtrees, "subtrees", "Subtrees");
     mds_plb.add_u64(l_mds_load_cent, "load_cent", "Load per cent");
+    {
+      PerfHistogramCommon::axis_config_d dispatch_latency_x{
+          "Latency (usec)", PerfHistogramCommon::SCALE_LOG2, 0, 100, 32,
+      };
+      PerfHistogramCommon::axis_config_d dispatch_lane_y{
+          "Dispatch lane",
+          PerfHistogramCommon::SCALE_LINEAR,
+          0,
+          1,
+          static_cast<int32_t>(DispatchLane::Count),
+      };
+      mds_plb.add_u64(
+          l_mds_reactor_dispatch_queue_len, "dispatch_queue_len",
+          "Reactor dispatch op queue depth", "rdql",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_dispatch_queue_len_max, "dispatch_queue_len_max",
+          "Reactor dispatch op queue high water mark", "rdqm",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64_counter(
+          l_mds_dispatch_io_completions, "dispatch_io_completions",
+          "IO completions executed on reactor op thread", "dioc",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64_counter(
+          l_mds_dispatch_inbound, "dispatch_inbound",
+          "Inbound messages executed on reactor op thread", "dinb",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_enqueue_usec, "dispatch_enqueue_usec",
+          "Reactor dispatch queue wait time", "deq",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_execute_usec, "dispatch_execute_usec",
+          "Reactor dispatch op execution time", "dex",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_enqueue_usec_control, "dispatch_enqueue_usec_control",
+          "Reactor dispatch queue wait (control lane)", "deqc",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_enqueue_usec_io, "dispatch_enqueue_usec_io",
+          "Reactor dispatch queue wait (io lane)", "deqi",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_enqueue_usec_client, "dispatch_enqueue_usec_client",
+          "Reactor dispatch queue wait (client lane)", "deql",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_enqueue_usec_maintenance,
+          "dispatch_enqueue_usec_maintenance",
+          "Reactor dispatch queue wait (maintenance lane)", "deqm",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_execute_usec_control, "dispatch_execute_usec_control",
+          "Reactor dispatch execute time (control lane)", "dexc",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_execute_usec_io, "dispatch_execute_usec_io",
+          "Reactor dispatch execute time (io lane)", "dexi",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_execute_usec_client, "dispatch_execute_usec_client",
+          "Reactor dispatch execute time (client lane)", "dexl",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_execute_usec_maintenance,
+          "dispatch_execute_usec_maintenance",
+          "Reactor dispatch execute time (maintenance lane)", "dexm",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64_counter_histogram(
+          l_mds_dispatch_enqueue_hist, "dispatch_enqueue_hist",
+          dispatch_latency_x, dispatch_lane_y,
+          "Reactor dispatch queue wait histogram by lane (use perf histogram "
+          "dump)",
+          "deqh", PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64_counter_histogram(
+          l_mds_dispatch_execute_hist, "dispatch_execute_hist",
+          dispatch_latency_x, dispatch_lane_y,
+          "Reactor dispatch execute histogram by lane (use perf histogram "
+          "dump)",
+          "dexh", PerfCountersBuilder::PRIO_USEFUL);
+    }
     mds_plb.add_u64_counter(l_mds_openino_dir_fetch, "openino_dir_fetch",
                             "OpenIno incomplete directory fetchings");
 
