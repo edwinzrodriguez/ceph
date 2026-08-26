@@ -17,16 +17,108 @@
 
 #include "common/debug.h"
 
+#include "common/perf_counters.h"
 #include "include/compat.h"
-
-#include "MDSContext.h"
-#include "MDSDaemon.h"
-#include "MDSRank.h"
-#include "OpWorkItem.h"
-#include "classify.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
+
+static int64_t
+dispatch_usec_since(ceph::coarse_mono_time t)
+{
+  if (t == ceph::coarse_mono_time{}) {
+    return 0;
+  }
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             ceph::coarse_mono_clock::now() - t)
+      .count();
+}
+
+static int
+dispatch_enqueue_usec_lane_counter(DispatchLane lane)
+{
+  static const int counters[] = {
+      l_mds_dispatch_enqueue_usec_control,
+      l_mds_dispatch_enqueue_usec_io,
+      l_mds_dispatch_enqueue_usec_client,
+      l_mds_dispatch_enqueue_usec_maintenance,
+  };
+  return counters[static_cast<size_t>(lane)];
+}
+
+static int
+dispatch_execute_usec_lane_counter(DispatchLane lane)
+{
+  static const int counters[] = {
+      l_mds_dispatch_execute_usec_control,
+      l_mds_dispatch_execute_usec_io,
+      l_mds_dispatch_execute_usec_client,
+      l_mds_dispatch_execute_usec_maintenance,
+  };
+  return counters[static_cast<size_t>(lane)];
+}
+
+void
+ReactorDispatchEngine::update_queue_depth_metrics()
+{
+  if (!ctx.rank || !ctx.rank->logger) {
+    return;
+  }
+
+  const size_t depth = queue.count();
+  PerfCounters* logger = ctx.rank->logger;
+
+  logger->set(l_mds_reactor_dispatch_queue_len, depth);
+
+  uint64_t max = queue_len_max.load(std::memory_order_relaxed);
+  while (depth > max && !queue_len_max.compare_exchange_weak(
+                            max, depth, std::memory_order_relaxed)) {
+  }
+  logger->set(l_mds_dispatch_queue_len_max, queue_len_max.load());
+}
+
+void
+ReactorDispatchEngine::enqueue_item(OpWorkItem* item, DispatchLane lane)
+{
+  queue.enqueue(item, lane);
+  update_queue_depth_metrics();
+}
+
+void
+ReactorDispatchEngine::record_wait_metrics(const OpWorkItem& item)
+{
+  if (!ctx.rank || !ctx.rank->logger) {
+    return;
+  }
+
+  PerfCounters* logger = ctx.rank->logger;
+  const int64_t wait_usec = dispatch_usec_since(item.enqueued_at);
+  const auto wait = std::chrono::microseconds(wait_usec);
+
+  logger->tinc(l_mds_dispatch_enqueue_usec, wait);
+  logger->tinc(dispatch_enqueue_usec_lane_counter(item.lane), wait);
+  logger->hinc(
+      l_mds_dispatch_enqueue_hist, wait_usec, static_cast<int64_t>(item.lane));
+}
+
+void
+ReactorDispatchEngine::record_execute_metrics(
+    DispatchLane lane,
+    ceph::coarse_mono_time exec_start)
+{
+  if (!ctx.rank || !ctx.rank->logger) {
+    return;
+  }
+
+  PerfCounters* logger = ctx.rank->logger;
+  const int64_t exec_usec = dispatch_usec_since(exec_start);
+  const auto exec = std::chrono::microseconds(exec_usec);
+
+  logger->tinc(l_mds_dispatch_execute_usec, exec);
+  logger->tinc(dispatch_execute_usec_lane_counter(lane), exec);
+  logger->hinc(
+      l_mds_dispatch_execute_hist, exec_usec, static_cast<int64_t>(lane));
+}
 
 ReactorDispatchEngine::ReactorDispatchEngine(const MDSDispatchContext& ctx_) :
   ctx(ctx_)
@@ -55,6 +147,12 @@ ReactorDispatchEngine::shutdown()
   }
 
   queue.flush_and_clear();
+
+  queue_len_max.store(0, std::memory_order_relaxed);
+  if (ctx.rank && ctx.rank->logger) {
+    ctx.rank->logger->set(l_mds_reactor_dispatch_queue_len, 0);
+    ctx.rank->logger->set(l_mds_dispatch_queue_len_max, 0);
+  }
 }
 
 Dispatcher::dispatch_result_t
@@ -68,7 +166,7 @@ ReactorDispatchEngine::submit_inbound(const ref_t<Message>& m)
 
   const DispatchLane lane = classify_inbound_message(*m);
   OpWorkItem* item = OpWorkItem::create_inbound(m, lane);
-  queue.enqueue(item, lane);
+  enqueue_item(item, lane);
   return true;
 }
 
@@ -76,7 +174,7 @@ void
 ReactorDispatchEngine::submit_io_completion(MDSIOContextBase* ioctx, int r)
 {
   OpWorkItem* item = OpWorkItem::create_io(ioctx, r);
-  queue.enqueue(item, DispatchLane::IOComplete);
+  enqueue_item(item, DispatchLane::IOComplete);
 }
 
 void
@@ -97,7 +195,7 @@ ReactorDispatchEngine::submit_callable(
     std::function<void()> fn)
 {
   OpWorkItem* item = OpWorkItem::create_callable(lane, std::move(fn));
-  queue.enqueue(item, lane);
+  enqueue_item(item, lane);
 }
 
 void
@@ -136,29 +234,43 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
   ceph_assert(item != nullptr);
   ceph_assert(ctx.mds_lock != nullptr);
 
-  std::lock_guard lock(*ctx.mds_lock);
+  record_wait_metrics(*item);
 
-  switch (item->kind) {
-  case WorkKind::InboundMessage:
-    if (ctx.daemon && !ctx.daemon->stopping) {
-      (void)ctx.daemon->dispatch_inbound_locked(item->msg);
+  const auto exec_start = ceph::coarse_mono_clock::now();
+  const DispatchLane lane = item->lane;
+
+  {
+    std::lock_guard lock(*ctx.mds_lock);
+
+    switch (item->kind) {
+    case WorkKind::InboundMessage:
+      if (ctx.rank && ctx.rank->logger) {
+        ctx.rank->logger->inc(l_mds_dispatch_inbound);
+      }
+      if (ctx.daemon && !ctx.daemon->stopping) {
+        (void)ctx.daemon->dispatch_inbound_locked(item->msg);
+      }
+      break;
+
+    case WorkKind::IOCompletion:
+      if (ctx.rank && ctx.rank->logger) {
+        ctx.rank->logger->inc(l_mds_dispatch_io_completions);
+      }
+      execute_io_completion(item->io_ctx, item->rval);
+      break;
+
+    case WorkKind::Callable:
+      if (item->callable && *item->callable) {
+        (*item->callable)();
+      }
+      break;
+
+    case WorkKind::TrimQuantum:
+      break;
     }
-    break;
-
-  case WorkKind::IOCompletion:
-    execute_io_completion(item->io_ctx, item->rval);
-    break;
-
-  case WorkKind::Callable:
-    if (item->callable && *item->callable) {
-      (*item->callable)();
-    }
-    break;
-
-  case WorkKind::TrimQuantum:
-    break;
   }
 
+  record_execute_metrics(lane, exec_start);
   item->destroy();
 }
 
@@ -169,6 +281,7 @@ ReactorDispatchEngine::op_thread_main()
 
   while (!stop.load()) {
     if (OpWorkItem* item = queue.dequeue()) {
+      update_queue_depth_metrics();
       execute_item(item);
       continue;
     }
