@@ -17,19 +17,18 @@
  * MDSDispatchEngine.cc
  *
  * Factory for rank-local dispatch engines. Reads mds_dispatch_engine once at
- * rank construction; unknown values and reactor (not yet implemented) fall
- * back to ClassicDispatchEngine with a log message.
+ * rank construction; selects ClassicDispatchEngine or ReactorDispatchEngine.
  */
 
 #include "MDSDispatchEngine.h"
 
-#include "common/debug.h"
-
 #include "common/ceph_context.h"
 #include "common/config.h"
+#include "common/debug.h"
 
 #include "ClassicDispatchEngine.h"
 #include "MDSDispatchContext.h"
+#include "ReactorDispatchEngine.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -42,9 +41,9 @@ MDSDispatchEngine::create(const MDSDispatchContext& ctx)
   const std::string engine =
       ctx.cct->_conf.get_val<std::string>("mds_dispatch_engine");
   if (engine == "reactor") {
-    derr << "mds_dispatch_engine=reactor is not implemented yet; "
-         << "using classic" << dendl;
-  } else if (engine != "classic") {
+    return std::make_unique<ReactorDispatchEngine>(ctx);
+  }
+  if (engine != "classic") {
     derr << "unknown mds_dispatch_engine '" << engine << "'; using classic"
          << dendl;
   }
