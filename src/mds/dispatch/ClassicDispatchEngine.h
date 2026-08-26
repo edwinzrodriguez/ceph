@@ -17,8 +17,9 @@
  * ClassicDispatchEngine.h
  *
  * Default dispatch backend (mds_dispatch_engine=classic). Preserves legacy
- * behavior: each submit_* acquires mds_lock and runs the same code paths as
- * original (ms_dispatch2 body, MDSIOContextBase::complete, etc.).
+ * behavior: submit_inbound acquires mds_lock and runs dispatch_inbound_locked().
+ * IO completions still use the legacy MDSIOContextBase::complete inline path;
+ * submit_io_completion() exists for interface symmetry but is not used in classic.
  *
  * Used as the next phase pluggability wrapper and as the operational fallback
  * when reactor mode is unavailable. start/shutdown and queue-related submit_*
