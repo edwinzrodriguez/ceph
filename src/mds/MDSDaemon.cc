@@ -17,59 +17,49 @@
 
 #include <unistd.h>
 
-#include "include/compat.h"
-#include "include/Context.h"
-#include "include/types.h"
-#include "include/str_list.h"
-#include "include/util.h"
+#include "common/debug.h"
 
+#include "auth/AuthAuthorizeHandler.h"
+#include "auth/KeyRing.h"
+#include "auth/RotatingKeyRing.h"
 #include "common/Clock.h"
 #include "common/HeartbeatMap.h"
 #include "common/Timer.h"
 #include "common/ceph_argparse.h"
 #include "common/config.h"
-#include "common/debug.h"
 #include "common/entity_name.h"
 #include "common/errno.h"
 #include "common/perf_counters.h"
 #include "common/signal.h"
 #include "common/version.h"
-
+#include "dispatch/MDSDispatchEngine.h"
+#include "events/ESession.h"
+#include "events/ESubtreeMap.h"
 #include "global/signal_handler.h"
+#include "include/Context.h"
+#include "include/compat.h"
+#include "include/str_list.h"
+#include "include/types.h"
+#include "include/util.h"
 #include "log/Log.h"
-
 #include "messages/MCommand.h"
 #include "messages/MCommandReply.h"
 #include "messages/MGenericMessage.h"
 #include "messages/MMDSMap.h"
 #include "messages/MMonCommand.h"
 #include "messages/MRemoveSnaps.h"
-
-#include "msg/Messenger.h"
 #include "mon/MonClient.h"
-
+#include "msg/Messenger.h"
 #include "osdc/Objecter.h"
-
-#include "MDSMap.h"
-#include "MDSRank.h"
-
-#include "Server.h"
-#include "Locker.h"
-
-#include "SnapServer.h"
-#include "SnapClient.h"
-
-#include "events/ESession.h"
-#include "events/ESubtreeMap.h"
-
-#include "auth/AuthAuthorizeHandler.h"
-#include "auth/RotatingKeyRing.h"
-#include "auth/KeyRing.h"
-
-#include "messages/MRemoveSnaps.h"
-
 #include "perfglue/cpu_profiler.h"
 #include "perfglue/heap_profiler.h"
+
+#include "Locker.h"
+#include "MDSMap.h"
+#include "MDSRank.h"
+#include "Server.h"
+#include "SnapClient.h"
+#include "SnapServer.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -915,11 +905,10 @@ void MDSDaemon::handle_mds_map(const cref_t<MMDSMap> &m)
 
     // Did I previously not hold a rank?  Initialize!
     if (mds_rank == NULL) {
-      mds_rank = new MDSRankDispatcher(whoami, mds_lock, clog,
-          timer, beacon, mdsmap, messenger, monc, &mgrc,
-          new LambdaContext([this](int r){respawn();}),
-          new LambdaContext([this](int r){suicide();}),
-	  ioctx);
+      mds_rank = new MDSRankDispatcher(
+          whoami, this, mds_lock, clog, timer, beacon, mdsmap, messenger, monc,
+          &mgrc, new LambdaContext([this](int r) { respawn(); }),
+          new LambdaContext([this](int r) { suicide(); }), ioctx);
       dout(10) <<  __func__ << ": initializing MDS rank "
                << mds_rank->get_nodeid() << dendl;
       mds_rank->init();
@@ -1066,7 +1055,18 @@ void MDSDaemon::respawn()
 Dispatcher::dispatch_result_t MDSDaemon::ms_dispatch2(const ref_t<Message> &m)
 {
   dout(25) << __func__ << ": processing " << m << dendl;
+
+  if (mds_rank && mds_rank->get_dispatch_engine()) {
+    return mds_rank->get_dispatch_engine()->submit_inbound(m);
+  }
+
   std::lock_guard l(mds_lock);
+  return dispatch_inbound_locked(m);
+}
+
+Dispatcher::dispatch_result_t
+MDSDaemon::dispatch_inbound_locked(const ref_t<Message>& m)
+{
   if (stopping) {
     return false;
   }
