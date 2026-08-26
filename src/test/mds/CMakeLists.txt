@@ -31,3 +31,12 @@ add_executable(unittest_mds_quiesce_agent
 )
 add_ceph_unittest(unittest_mds_quiesce_agent)
 target_link_libraries(unittest_mds_quiesce_agent ceph-common global)
+
+# unittest_mds_dispatch
+add_executable(unittest_mds_dispatch
+  TestDispatchClassify.cc
+  TestMDSOpWorkQueue.cc
+  $<TARGET_OBJECTS:unit-main>
+  )
+add_ceph_unittest(unittest_mds_dispatch)
+target_link_libraries(unittest_mds_dispatch mds global ${BLKID_LIBRARIES})
