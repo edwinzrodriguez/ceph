@@ -74,6 +74,21 @@ options:
   - mds
   flags:
   - runtime
+- name: mds_dispatch_engine
+  type: str
+  level: dev
+  desc: MDS request dispatch engine (classic preserves legacy threading)
+  long_desc: Select how inbound work is scheduled on an MDS rank. ``classic``
+    preserves the existing multi-threaded ``mds_lock`` handoff behavior.
+    ``reactor`` (future) uses a single op thread with prioritized lanes.
+  default: classic
+  services:
+  - mds
+  enum_values:
+  - classic
+  - reactor
+  flags:
+  - startup
 - name: mds_cache_quiesce_delay
   type: millisecs
   level: dev

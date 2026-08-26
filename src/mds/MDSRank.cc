@@ -14,50 +14,57 @@
  */
 
 #include "MDSRank.h"
-#include "osdc/Journaler.h"
 
-#include <typeinfo>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <typeinfo>
 #include <vector>
-#include <cstdlib>
-#include "common/DecayCounter.h"
+
 #include "common/debug.h"
-#include "common/errno.h"
-#include "common/fair_mutex.h"
+
+#include "common/DecayCounter.h"
+#include "common/HeartbeatMap.h"
 #include "common/JSONFormatterFile.h"
-#include "common/likely.h"
 #include "common/Timer.h"
 #include "common/async/blocked_completion.h"
 #include "common/cmdparse.h"
+#include "common/errno.h"
+#include "common/fair_mutex.h"
+#include "common/likely.h"
+#include "dispatch/MDSDispatchContext.h"
+#include "dispatch/MDSDispatchEngine.h"
+#include "events/ELid.h"
+#include "events/ESubtreeMap.h"
 #include "log/Log.h"
-
 #include "messages/MClientRequest.h"
 #include "messages/MClientRequestForward.h"
 #include "messages/MMDSLoadTargets.h"
 #include "messages/MMDSMap.h"
-#include "messages/MMDSTableRequest.h"
 #include "messages/MMDSMetrics.h"
-
+#include "messages/MMDSTableRequest.h"
 #include "mgr/MgrClient.h"
+#include "mon/MonClient.h"
+#include "osdc/Journaler.h"
+#include "osdc/Objecter.h"
 
 #include "Beacon.h"
+#include "InoTable.h"
+#include "Locker.h"
+#include "MDBalancer.h"
 #include "MDCache.h"
 #include "MDLog.h"
 #include "MDSDaemon.h"
 #include "MDSMap.h"
 #include "MetricAggregator.h"
+#include "Migrator.h"
+#include "Mutation.h"
+#include "QuiesceAgent.h"
+#include "QuiesceDbManager.h"
+#include "ScrubStack.h"
 #include "Server.h"
 #include "SnapClient.h"
 #include "SnapServer.h"
-#include "MDBalancer.h"
-#include "Migrator.h"
-#include "Locker.h"
-#include "InoTable.h"
-#include "mon/MonClient.h"
-#include "osdc/Objecter.h"
-#include "common/HeartbeatMap.h"
-#include "ScrubStack.h"
 
 #ifdef CEPH_LOCKSTAT
 #include "common/lockstat.h"
@@ -469,40 +476,53 @@ private:
 
 MDSRank::MDSRank(
     mds_rank_t whoami_,
-    ceph::fair_mutex &mds_lock_,
-    LogChannelRef &clog_,
-    CommonSafeTimer<ceph::fair_mutex> &timer_,
-    Beacon &beacon_,
+    MDSDaemon* daemon_,
+    ceph::fair_mutex& mds_lock_,
+    LogChannelRef& clog_,
+    CommonSafeTimer<ceph::fair_mutex>& timer_,
+    Beacon& beacon_,
     std::unique_ptr<MDSMap>& mdsmap_,
-    Messenger *msgr,
-    MonClient *monc_,
-    MgrClient *mgrc,
-    Context *respawn_hook_,
-    Context *suicide_hook_,
+    Messenger* msgr,
+    MonClient* monc_,
+    MgrClient* mgrc,
+    Context* respawn_hook_,
+    Context* suicide_hook_,
     boost::asio::io_context& ioc) :
-    cct(msgr->cct), mds_lock(mds_lock_), clog(clog_),
-    timer(timer_), mdsmap(mdsmap_),
-    objecter(new Objecter(g_ceph_context, msgr, monc_, ioc)),
-    damage_table(whoami_), sessionmap(this),
-    op_tracker(g_ceph_context, g_conf()->mds_enable_op_tracker,
-               g_conf()->osd_num_op_tracker_shard),
-    progress_thread(this), whoami(whoami_),
-    purge_queue(g_ceph_context, whoami_,
-      mdsmap_->get_metadata_pool(), objecter,
+  cct(msgr->cct),
+  daemon(daemon_),
+  mds_lock(mds_lock_),
+  clog(clog_),
+  timer(timer_),
+  mdsmap(mdsmap_),
+  objecter(new Objecter(g_ceph_context, msgr, monc_, ioc)),
+  damage_table(whoami_),
+  sessionmap(this),
+  op_tracker(
+      g_ceph_context,
+      g_conf()->mds_enable_op_tracker,
+      g_conf()->osd_num_op_tracker_shard),
+  progress_thread(this),
+  whoami(whoami_),
+  purge_queue(
+      g_ceph_context,
+      whoami_,
+      mdsmap_->get_metadata_pool(),
+      objecter,
       new LambdaContext([this](int r) {
-	  std::lock_guard l(mds_lock);
-	  handle_write_error(r);
-	}
-      )
-    ),
-    metrics_handler(cct, this),
-    beacon(beacon_),
-    messenger(msgr), monc(monc_), mgrc(mgrc),
-    respawn_hook(respawn_hook_),
-    suicide_hook(suicide_hook_),
-    inject_journal_corrupt_dentry_first(g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first")),
-    starttime(mono_clock::now()),
-    ioc(ioc)
+        std::lock_guard l(mds_lock);
+        handle_write_error(r);
+      })),
+  metrics_handler(cct, this),
+  beacon(beacon_),
+  messenger(msgr),
+  monc(monc_),
+  mgrc(mgrc),
+  respawn_hook(respawn_hook_),
+  suicide_hook(suicide_hook_),
+  inject_journal_corrupt_dentry_first(
+      g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first")),
+  starttime(mono_clock::now()),
+  ioc(ioc)
 {
   hb = g_ceph_context->get_heartbeat_map()->add_worker("MDSRank", pthread_self());
 
@@ -544,11 +564,16 @@ MDSRank::MDSRank(
   op_tracker.set_history_slow_op_size_and_threshold(cct->_conf->mds_op_history_slow_op_size,
                                                     cct->_conf->mds_op_history_slow_op_threshold);
 
+  MDSDispatchContext dispatch_ctx{daemon, this, &mds_lock, cct};
+  dispatch_engine = MDSDispatchEngine::create(dispatch_ctx);
+
   schedule_update_timer_task();
 }
 
 MDSRank::~MDSRank()
 {
+  dispatch_engine.reset();
+
   if (hb) {
     g_ceph_context->get_heartbeat_map()->remove_worker(hb);
     hb = nullptr;
@@ -592,6 +617,10 @@ MDSRank::~MDSRank()
 
 void MDSRankDispatcher::init()
 {
+  if (dispatch_engine) {
+    dispatch_engine->start();
+  }
+
   objecter->init();
   messenger->add_dispatcher_tail(objecter); // the default priority
 
@@ -834,6 +863,10 @@ void MDSRankDispatcher::shutdown()
   // shutdown metric aggergator
   if (metric_aggregator != nullptr) {
     metric_aggregator->shutdown();
+  }
+
+  if (dispatch_engine) {
+    dispatch_engine->shutdown();
   }
 
   mds_lock.unlock();
@@ -4069,19 +4102,32 @@ bool MDSRank::evict_client(int64_t session_id,
 
 MDSRankDispatcher::MDSRankDispatcher(
     mds_rank_t whoami_,
-    ceph::fair_mutex &mds_lock_,
-    LogChannelRef &clog_,
-    CommonSafeTimer<ceph::fair_mutex> &timer_,
-    Beacon &beacon_,
-    std::unique_ptr<MDSMap> &mdsmap_,
-    Messenger *msgr,
-    MonClient *monc_,
-    MgrClient *mgrc,
-    Context *respawn_hook_,
-    Context *suicide_hook_,
-    boost::asio::io_context& ioc)
-  : MDSRank(whoami_, mds_lock_, clog_, timer_, beacon_, mdsmap_,
-            msgr, monc_, mgrc, respawn_hook_, suicide_hook_, ioc)
+    MDSDaemon* daemon_,
+    ceph::fair_mutex& mds_lock_,
+    LogChannelRef& clog_,
+    CommonSafeTimer<ceph::fair_mutex>& timer_,
+    Beacon& beacon_,
+    std::unique_ptr<MDSMap>& mdsmap_,
+    Messenger* msgr,
+    MonClient* monc_,
+    MgrClient* mgrc,
+    Context* respawn_hook_,
+    Context* suicide_hook_,
+    boost::asio::io_context& ioc) :
+  MDSRank(
+      whoami_,
+      daemon_,
+      mds_lock_,
+      clog_,
+      timer_,
+      beacon_,
+      mdsmap_,
+      msgr,
+      monc_,
+      mgrc,
+      respawn_hook_,
+      suicide_hook_,
+      ioc)
 {
     g_conf().add_observer(this);
 }

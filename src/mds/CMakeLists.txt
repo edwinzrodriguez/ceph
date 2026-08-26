@@ -3,6 +3,8 @@ set(mds_srcs
   Capability.cc
   MDSDaemon.cc
   MDSRank.cc
+  dispatch/ClassicDispatchEngine.cc
+  dispatch/MDSDispatchEngine.cc
   Beacon.cc
   flock.cc
   locks.c
@@ -51,6 +53,9 @@ set(mds_srcs
   ${CMAKE_SOURCE_DIR}/src/osdc/Journaler.cc
   ${CMAKE_SOURCE_DIR}/src/mgr/MDSPerfMetricTypes.cc)
 add_library(mds STATIC ${mds_srcs})
+target_include_directories(mds PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  "${LUA_INCLUDE_DIR}")
 target_link_libraries(mds PRIVATE
   legacy-option-headers Boost::url
   heap_profiler cpu_profiler osdc ${LUA_LIBRARIES}
