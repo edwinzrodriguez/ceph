@@ -40,6 +40,8 @@
 #include <boost/intrusive_ptr.hpp>
 
 class DecayCounter;
+class MDSDaemon;
+class MDSDispatchEngine;
 class MDSContext;
 class MDSMetaRequest;
 class MMDSMap;
@@ -178,17 +180,18 @@ class MDSRank {
 
     MDSRank(
         mds_rank_t whoami_,
-        ceph::fair_mutex &mds_lock_,
-        LogChannelRef &clog_,
-        CommonSafeTimer<ceph::fair_mutex> &timer_,
-        Beacon &beacon_,
-        std::unique_ptr<MDSMap> & mdsmap_,
-        Messenger *msgr,
-        MonClient *monc_,
-        MgrClient *mgrc,
-        Context *respawn_hook_,
-        Context *suicide_hook_,
-	boost::asio::io_context& ioc);
+        MDSDaemon* daemon_,
+        ceph::fair_mutex& mds_lock_,
+        LogChannelRef& clog_,
+        CommonSafeTimer<ceph::fair_mutex>& timer_,
+        Beacon& beacon_,
+        std::unique_ptr<MDSMap>& mdsmap_,
+        Messenger* msgr,
+        MonClient* monc_,
+        MgrClient* mgrc,
+        Context* respawn_hook_,
+        Context* suicide_hook_,
+        boost::asio::io_context& ioc);
 
     mds_rank_t get_nodeid() const { return whoami; }
     int64_t get_metadata_pool() const
@@ -205,6 +208,21 @@ class MDSRank {
     }
 
     bool is_daemon_stopping() const;
+
+    MDSDispatchEngine*
+    get_dispatch_engine()
+    {
+      return dispatch_engine.get();
+    }
+
+    const MDSDispatchEngine*
+    get_dispatch_engine() const
+    {
+      return dispatch_engine.get();
+    }
+
+    // Reference to outer daemon for dispatch engine and lifecycle hooks.
+    MDSDaemon* const daemon;
 
     MDSTableClient *get_table_client(int t);
     MDSTableServer *get_table_server(int t);
@@ -451,6 +469,8 @@ class MDSRank {
     std::shared_ptr<QuiesceAgent> quiesce_agent;
 
     Finisher *finisher;
+    std::unique_ptr<MDSDispatchEngine> dispatch_engine;
+
   protected:
     typedef enum {
       // The MDSMap is available, configure default layouts and structures
@@ -692,16 +712,17 @@ class MDSRankDispatcher : public MDSRank, public md_config_obs_t
 public:
   MDSRankDispatcher(
       mds_rank_t whoami_,
-      ceph::fair_mutex &mds_lock_,
-      LogChannelRef &clog_,
-      CommonSafeTimer<ceph::fair_mutex> &timer_,
-      Beacon &beacon_,
-      std::unique_ptr<MDSMap> &mdsmap_,
-      Messenger *msgr,
-      MonClient *monc_,
-      MgrClient *mgrc,
-      Context *respawn_hook_,
-      Context *suicide_hook_,
+      MDSDaemon* daemon_,
+      ceph::fair_mutex& mds_lock_,
+      LogChannelRef& clog_,
+      CommonSafeTimer<ceph::fair_mutex>& timer_,
+      Beacon& beacon_,
+      std::unique_ptr<MDSMap>& mdsmap_,
+      Messenger* msgr,
+      MonClient* monc_,
+      MgrClient* mgrc,
+      Context* respawn_hook_,
+      Context* suicide_hook_,
       boost::asio::io_context& ioc);
 
   void init();
