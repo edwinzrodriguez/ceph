@@ -68,7 +68,7 @@ public:
   /// Hint that finished_queue has new continuations (reactor).
   virtual void note_finished_queued() = 0;
 
-  /// Factory: reads mds_dispatch_engine; currently always returns classic.
+  /// Factory: reads mds_dispatch_engine (classic | reactor).
   static std::unique_ptr<MDSDispatchEngine> create(
       const MDSDispatchContext& ctx);
 };
