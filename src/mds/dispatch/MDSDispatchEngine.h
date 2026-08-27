@@ -27,7 +27,7 @@
  *   - MDSDaemon::ms_dispatch2        -> submit_inbound()
  *   - MDSIOContextBase::complete     -> submit_io_completion() (reactor only)
  *   - C_IO_Wrapper::complete         -> finisher (classic) or submit_io (reactor)
- *   - MDCache upkeep (future)        -> submit_trim_tick()
+ *   - MDCache upkeep                  -> submit_trim_tick() (reactor)
  *   - MDSRank finished_queue (future)-> note_finished_queued()
  *
  * Owned by MDSRank; started in MDSRankDispatcher::init(), stopped in shutdown().

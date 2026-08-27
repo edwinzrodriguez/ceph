@@ -809,6 +809,9 @@ private:
 
   // trimming
   std::pair<bool, uint64_t> trim(uint64_t count=0);
+  /// One bounded cache-trim slice; caller must hold mds_lock.
+  /// @return true if the cache was trimmable and trim work ran
+  bool trim_quantum();
 
   bool trim_non_auth_subtree(CDir *directory);
   void standby_trim_segment(LogSegmentRef const& ls);

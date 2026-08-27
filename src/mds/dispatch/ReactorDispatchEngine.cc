@@ -20,6 +20,13 @@
 #include "common/perf_counters.h"
 #include "include/compat.h"
 
+#include "MDCache.h"
+#include "MDSContext.h"
+#include "MDSDaemon.h"
+#include "MDSRank.h"
+#include "OpWorkItem.h"
+#include "classify.h"
+
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 
@@ -186,7 +193,8 @@ ReactorDispatchEngine::submit_advance_queues()
 void
 ReactorDispatchEngine::submit_trim_tick()
 {
-  queue.wake();
+  OpWorkItem* item = OpWorkItem::create_trim();
+  enqueue_item(item, DispatchLane::Maintenance);
 }
 
 void
@@ -266,6 +274,9 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
       break;
 
     case WorkKind::TrimQuantum:
+      if (ctx.rank && ctx.rank->mdcache) {
+        ctx.rank->mdcache->trim_quantum();
+      }
       break;
     }
   }
