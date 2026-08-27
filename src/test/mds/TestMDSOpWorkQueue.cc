@@ -89,6 +89,19 @@ TEST(MDSOpWorkQueue, IOCompletionLane)
   item->destroy();
 }
 
+TEST(MDSOpWorkQueue, TrimQuantumLane)
+{
+  MDSOpWorkQueue queue;
+
+  queue.enqueue(OpWorkItem::create_trim(), DispatchLane::Maintenance);
+
+  OpWorkItem* item = queue.dequeue();
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->kind, WorkKind::TrimQuantum);
+  EXPECT_EQ(item->lane, DispatchLane::Maintenance);
+  item->destroy();
+}
+
 TEST(MDSOpWorkQueue, PerLaneBankSwap)
 {
   MDSOpWorkQueue queue;

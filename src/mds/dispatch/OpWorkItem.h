@@ -66,6 +66,7 @@ struct OpWorkItem
 
   static OpWorkItem* create_inbound(const ref_t<Message>& m, DispatchLane lane);
   static OpWorkItem* create_io(MDSIOContextBase* ctx, int r);
+  static OpWorkItem* create_trim();
   static OpWorkItem* create_callable(DispatchLane lane, std::function<void()> fn);
   void note_enqueued();
   void destroy();
