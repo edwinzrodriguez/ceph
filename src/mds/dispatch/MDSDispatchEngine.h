@@ -28,7 +28,7 @@
  *   - MDSIOContextBase::complete     -> submit_io_completion() (reactor only)
  *   - C_IO_Wrapper::complete         -> finisher (classic) or submit_io (reactor)
  *   - MDCache upkeep                  -> submit_trim_tick() (reactor)
- *   - MDSRank finished_queue (future)-> note_finished_queued()
+ *   - MDSRank finished_queue           -> note_finished_queued() (reactor)
  *
  * Owned by MDSRank; started in MDSRankDispatcher::init(), stopped in shutdown().
  */

@@ -89,6 +89,19 @@ TEST(MDSOpWorkQueue, IOCompletionLane)
   item->destroy();
 }
 
+TEST(MDSOpWorkQueue, AdvanceQueuesLane)
+{
+  MDSOpWorkQueue queue;
+
+  queue.enqueue(OpWorkItem::create_advance(), DispatchLane::Control);
+
+  OpWorkItem* item = queue.dequeue();
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->kind, WorkKind::AdvanceQueues);
+  EXPECT_EQ(item->lane, DispatchLane::Control);
+  item->destroy();
+}
+
 TEST(MDSOpWorkQueue, TrimQuantumLane)
 {
   MDSOpWorkQueue queue;
