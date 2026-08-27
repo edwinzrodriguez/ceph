@@ -37,6 +37,15 @@ OpWorkItem::create_io(MDSIOContextBase* ctx, int r)
 }
 
 OpWorkItem*
+OpWorkItem::create_advance()
+{
+  auto* item = new OpWorkItem;
+  item->kind = WorkKind::AdvanceQueues;
+  item->lane = DispatchLane::Control;
+  return item;
+}
+
+OpWorkItem*
 OpWorkItem::create_trim()
 {
   auto* item = new OpWorkItem;

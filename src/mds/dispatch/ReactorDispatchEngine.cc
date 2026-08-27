@@ -187,7 +187,8 @@ ReactorDispatchEngine::submit_io_completion(MDSIOContextBase* ioctx, int r)
 void
 ReactorDispatchEngine::submit_advance_queues()
 {
-  queue.wake();
+  OpWorkItem* item = OpWorkItem::create_advance();
+  enqueue_item(item, DispatchLane::Control);
 }
 
 void
@@ -209,7 +210,7 @@ ReactorDispatchEngine::submit_callable(
 void
 ReactorDispatchEngine::note_finished_queued()
 {
-  queue.wake();
+  submit_advance_queues();
 }
 
 void
@@ -265,6 +266,12 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
         ctx.rank->logger->inc(l_mds_dispatch_io_completions);
       }
       execute_io_completion(item->io_ctx, item->rval);
+      break;
+
+    case WorkKind::AdvanceQueues:
+      if (ctx.rank) {
+        ctx.rank->_advance_queues();
+      }
       break;
 
     case WorkKind::Callable:
