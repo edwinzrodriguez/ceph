@@ -103,6 +103,14 @@ class MDSDaemon : public Dispatcher {
     const bufferlist &inbl,
     asok_finisher on_finish);
 
+  bool use_reactor_dispatch() const;
+  void do_asok_command(
+      std::string_view command,
+      const cmdmap_t& cmdmap,
+      Formatter* f,
+      const bufferlist& inbl,
+      asok_finisher on_finish);
+
   void dump_status(Formatter *f);
 
   /**

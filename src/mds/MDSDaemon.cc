@@ -33,6 +33,7 @@
 #include "common/signal.h"
 #include "common/version.h"
 #include "dispatch/MDSDispatchEngine.h"
+#include "dispatch/OpWorkItem.h"
 #include "events/ESession.h"
 #include "events/ESubtreeMap.h"
 #include "global/signal_handler.h"
@@ -69,6 +70,25 @@
 using std::string;
 using std::vector;
 using TOPNSPC::common::cmd_getval;
+
+static bool
+mds_asok_command_mutates(std::string_view command)
+{
+  return command == "lockup" || command == "exit" || command == "respawn" ||
+         command == "op kill" || command == "osdmap barrier" ||
+         command == "session evict" || command == "client evict" ||
+         command == "session kill" || command == "session config" ||
+         command == "client config" || command == "scrub start" ||
+         command == "scrub_start" || command == "scrub abort" ||
+         command == "scrub pause" || command == "scrub resume" ||
+         command == "tag path" || command == "flush_path" ||
+         command == "flush journal" || command == "export dir" ||
+         command == "cache drop" || command == "quiesce path" ||
+         command == "lock path" || command == "force_readonly" ||
+         command == "dirfrag split" || command == "dirfrag merge" ||
+         command == "damage rm" || command == "quiesce db" ||
+         command == "qos set" || command == "qos rm";
+}
 
 // cons/des
 MDSDaemon::MDSDaemon(std::string_view n, Messenger *m, MonClient *mc,
@@ -144,6 +164,27 @@ void MDSDaemon::asok_command(
   Formatter *f,
   const bufferlist& inbl,
   asok_finisher on_finish)
+{
+  if (use_reactor_dispatch() && mds_asok_command_mutates(command)) {
+    MDSDispatchEngine* engine = mds_rank->get_dispatch_engine();
+    engine->submit_callable(
+        DispatchLane::Control,
+        [this, command = std::string(command), cmdmap, f, inbl, on_finish]() {
+          do_asok_command(command, cmdmap, f, inbl, on_finish);
+        });
+    return;
+  }
+
+  do_asok_command(command, cmdmap, f, inbl, on_finish);
+}
+
+void
+MDSDaemon::do_asok_command(
+    std::string_view command,
+    const cmdmap_t& cmdmap,
+    Formatter* f,
+    const bufferlist& inbl,
+    asok_finisher on_finish)
 {
   dout(1) << "asok_command: " << command << " " << cmdmap
 	  << " (starting...)" << dendl;
@@ -229,6 +270,13 @@ void MDSDaemon::asok_command(
     }
   }
   on_finish(r, ss.str(), outbl);
+}
+
+bool
+MDSDaemon::use_reactor_dispatch() const
+{
+  return mds_rank && mds_rank->get_dispatch_engine() &&
+         mds_rank->get_dispatch_engine()->is_reactor();
 }
 
 void MDSDaemon::dump_status(Formatter *f)
@@ -729,10 +777,14 @@ void MDSDaemon::reset_tick()
 
   // schedule
   tick_event = timer.add_event_after(
-    g_conf()->mds_tick_interval,
-    new LambdaContext([this](int) {
-	ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
-	tick();
+      g_conf()->mds_tick_interval, new LambdaContext([this](int) {
+        if (use_reactor_dispatch()) {
+          mds_rank->get_dispatch_engine()->submit_callable(
+              DispatchLane::Control, [this]() { tick(); });
+          return;
+        }
+        ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+        tick();
       }));
 }
 
