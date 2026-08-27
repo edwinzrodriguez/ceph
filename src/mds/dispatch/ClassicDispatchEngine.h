@@ -23,7 +23,8 @@
  *
  * Used as the next phase pluggability wrapper and as the operational fallback
  * when reactor mode is unavailable. start/shutdown and queue-related submit_*
- * methods are no-ops; ProgressThread and MDCache upkeep remain unchanged.
+ * methods are no-ops; ProgressThread remains unchanged. MDCache upkeep runs
+ * trim_quantum() inline under mds_lock (reactor mode posts submit_trim_tick()).
  */
 
 #pragma once

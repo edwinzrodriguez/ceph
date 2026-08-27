@@ -37,6 +37,15 @@ OpWorkItem::create_io(MDSIOContextBase* ctx, int r)
 }
 
 OpWorkItem*
+OpWorkItem::create_trim()
+{
+  auto* item = new OpWorkItem;
+  item->kind = WorkKind::TrimQuantum;
+  item->lane = DispatchLane::Maintenance;
+  return item;
+}
+
+OpWorkItem*
 OpWorkItem::create_callable(DispatchLane lane, std::function<void()> fn)
 {
   auto* item = new OpWorkItem;
