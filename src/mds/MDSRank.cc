@@ -624,7 +624,9 @@ void MDSRankDispatcher::init()
   // who is interested in it.
   handle_osd_map();
 
-  progress_thread.create("mds-rank-progr");
+  if (!dispatch_engine || !dispatch_engine->is_reactor()) {
+    progress_thread.create("mds-rank-progr");
+  }
 
   purge_queue.init();
 
@@ -741,9 +743,13 @@ void MDSRankDispatcher::tick()
 
   check_ops_in_flight();
 
-  // Wake up thread in case we use to be laggy and have waiting_for_nolaggy
+  // Wake up progress in case we used to be laggy and have waiting_for_nolaggy
   // messages to progress.
-  progress_thread.signal();
+  if (auto* engine = get_dispatch_engine(); engine && engine->is_reactor()) {
+    engine->submit_advance_queues();
+  } else {
+    progress_thread.signal();
+  }
 
   // make sure mds log flushes, trims periodically
   mdlog->flush();
@@ -871,7 +877,9 @@ void MDSRankDispatcher::shutdown()
 
   op_tracker.on_shutdown();
 
-  progress_thread.shutdown();
+  if (progress_thread.is_started()) {
+    progress_thread.shutdown();
+  }
 
   // release mds_lock for finisher/messenger threads (e.g.
   // MDSDaemon::ms_handle_reset called from Messenger).
@@ -1338,6 +1346,16 @@ void MDSRank::handle_message(const cref_t<Message> &m)
     default:
       derr << "unrecognized message " << *m << dendl;
     }
+  }
+}
+
+void
+MDSRank::notify_finished_queue()
+{
+  if (auto* engine = dispatch_engine.get(); engine && engine->is_reactor()) {
+    engine->note_finished_queued();
+  } else {
+    progress_thread.signal();
   }
 }
 

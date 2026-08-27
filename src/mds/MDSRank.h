@@ -42,6 +42,7 @@
 class DecayCounter;
 class MDSDaemon;
 class MDSDispatchEngine;
+class ReactorDispatchEngine;
 class MDSContext;
 class MDSMetaRequest;
 class MMDSMap;
@@ -281,23 +282,23 @@ class MDSRank {
 
     void queue_waiter(MDSContext *c) {
       finished_queue.push_back(c);
-      progress_thread.signal();
+      notify_finished_queue();
     }
     void queue_waiter_front(MDSContext *c) {
       finished_queue.push_front(c);
-      progress_thread.signal();
+      notify_finished_queue();
     }
     void queue_waiters(std::vector<MDSContext*>& ls) {
       std::vector<MDSContext*> v;
       v.swap(ls);
       std::copy(v.begin(), v.end(), std::back_inserter(finished_queue));
-      progress_thread.signal();
+      notify_finished_queue();
     }
     void queue_waiters_front(std::vector<MDSContext*>& ls) {
       std::vector<MDSContext*> v;
       v.swap(ls);
       std::copy(v.rbegin(), v.rend(), std::front_inserter(finished_queue));
-      progress_thread.signal();
+      notify_finished_queue();
     }
 
     uint64_t get_global_id() const;
@@ -518,6 +519,7 @@ class MDSRank {
     friend class C_MDS_BootStart;
     friend class C_MDS_InternalBootStart;
     friend class C_MDS_MonCommand;
+    friend class ReactorDispatchEngine;
 
     const mds_rank_t whoami;
 
@@ -528,6 +530,7 @@ class MDSRank {
     void retry_dispatch(const cref_t<Message> &m);
     bool is_valid_message(const cref_t<Message> &m);
     void handle_message(const cref_t<Message> &m);
+    void notify_finished_queue();
     void _advance_queues();
     bool _dispatch(const cref_t<Message> &m, bool new_msg);
     bool is_stale_message(const cref_t<Message> &m) const;
