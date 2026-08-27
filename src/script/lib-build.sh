@@ -64,8 +64,7 @@ function get_processors() {
 # and uses the same BUILD_DIR environment variable. It checks for the
 # directory relative to the current working directory.
 function has_build_dir() {
-    [[ -d "${BUILD_DIR:=build}" ]] &&
-        ( cd "${BUILD_DIR}" && [[ -f build.ninja || -f Makefile ]] )
+    ( cd "${BUILD_DIR:=build}" && [[ -f build.ninja || -f Makefile ]] )
 }
 
 # discover_compiler takes one argument, purpose, which may be used
