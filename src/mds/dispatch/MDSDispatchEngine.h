@@ -29,6 +29,7 @@
  *   - C_IO_Wrapper::complete         -> finisher (classic) or submit_io (reactor)
  *   - MDCache upkeep                  -> submit_trim_tick() (reactor)
  *   - MDSRank finished_queue           -> note_finished_queued() (reactor)
+ *   - MDSDaemon timer / mutating asok -> submit_callable(Control) (reactor)
  *
  * Owned by MDSRank; started in MDSRankDispatcher::init(), stopped in shutdown().
  */
