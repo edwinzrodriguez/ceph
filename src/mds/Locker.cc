@@ -14,33 +14,36 @@
  */
 
 #include "Locker.h"
-#include "MDCache.h"
-#include "CDir.h"
-#include "CDentry.h"
-#include "CInode.h"
-#include "common/config.h"
+
 #include "common/debug.h"
+#include "mds_lock_debug.h"
+
+#include "common/config.h"
 #include "events/EOpen.h"
 #include "events/EUpdate.h"
+#include "messages/MClientCapRelease.h"
+#include "messages/MClientCaps.h"
+#include "messages/MClientLease.h"
+#include "messages/MClientReply.h"
+#include "messages/MInodeFileCaps.h"
+#include "messages/MLock.h"
+#include "messages/MMDSPeerRequest.h"
+#include "msg/Messenger.h"
+#include "osdc/Objecter.h"
+
+#include "CDentry.h"
+#include "CDir.h"
+#include "CInode.h"
 #include "MDBalancer.h"
 #include "MDCache.h"
 #include "MDLog.h"
-#include "MDSRank.h"
 #include "MDSMap.h"
+#include "MDSRank.h"
+#include "Migrator.h"
 #include "RetryMessage.h"
 #include "RetryRequest.h"
 #include "SimpleLock.h"
 #include "SnapRealm.h"
-#include "messages/MClientCaps.h"
-#include "messages/MClientCapRelease.h"
-#include "messages/MClientLease.h"
-#include "messages/MClientReply.h"
-#include "messages/MLock.h"
-#include "messages/MInodeFileCaps.h"
-#include "messages/MMDSPeerRequest.h"
-#include "Migrator.h"
-#include "msg/Messenger.h"
-#include "osdc/Objecter.h"
 
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
@@ -1565,7 +1568,7 @@ public:
   C_Locker_Eval(Locker *l, MDSCacheObject *pp, int m) : LockerContext(l), p(pp), mask(m) {
     // We are used as an MDSCacheObject waiter, so should
     // only be invoked by someone already holding the big lock.
-    ceph_assert(ceph_mutex_is_locked_by_me(locker->mds->mds_lock));
+    MDS_ASSERT_MDS_LOCK(locker->mds->mds_lock);
     p->get(MDSCacheObject::PIN_PTRWAITER);    
   }
   void finish(int r) override {

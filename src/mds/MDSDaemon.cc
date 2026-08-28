@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "common/debug.h"
+#include "mds_lock_debug.h"
 
 #include "auth/AuthAuthorizeHandler.h"
 #include "auth/KeyRing.h"
@@ -783,7 +784,7 @@ void MDSDaemon::reset_tick()
               DispatchLane::Control, [this]() { tick(); });
           return;
         }
-        ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+        MDS_ASSERT_MDS_LOCK(mds_lock);
         tick();
       }));
 }
