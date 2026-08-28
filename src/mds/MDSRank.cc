@@ -67,6 +67,16 @@
 #include "SnapClient.h"
 #include "SnapServer.h"
 
+#ifdef CEPH_LOCKSTAT
+#include "common/lockstat.h"
+#endif
+#include "events/ELid.h"
+#include "events/ESubtreeMap.h"
+
+#include "Mutation.h"
+#include "QuiesceAgent.h"
+#include "QuiesceDbManager.h"
+
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
