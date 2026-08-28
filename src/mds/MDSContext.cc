@@ -16,6 +16,7 @@
 #include "MDSContext.h"
 
 #include "common/debug.h"
+#include "mds_lock_debug.h"
 
 #include "dispatch/MDSDispatchEngine.h"
 
@@ -27,7 +28,7 @@
 void MDSContext::complete(int r) {
   MDSRank *mds = get_mds();
   ceph_assert(mds != nullptr);
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
   dout(10) << "MDSContext::complete: " << typeid(*this).name() << dendl;
   mds->heartbeat_reset();
   return Context::complete(r);

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "common/debug.h"
+#include "mds_lock_debug.h"
 
 #include "common/Cond.h"
 #include "common/DecayCounter.h"
@@ -1059,6 +1060,9 @@ void *MDSRank::ProgressThread::entry()
       break;
     }
 
+#ifdef CEPH_DEBUG_MUTEX
+    mds::MdsLockToken lock_token{mds->mds_lock, "classic:progress"};
+#endif
     mds->_advance_queues();
   }
 

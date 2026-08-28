@@ -3,6 +3,7 @@ set(mds_srcs
   Capability.cc
   MDSDaemon.cc
   MDSRank.cc
+  mds_lock_debug.cc
   dispatch/ClassicDispatchEngine.cc
   dispatch/MDSDispatchEngine.cc
   dispatch/OpWorkItem.cc
