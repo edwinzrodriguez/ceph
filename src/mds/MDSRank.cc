@@ -67,6 +67,16 @@
 #include "SnapClient.h"
 #include "SnapServer.h"
 
+#ifdef CEPH_LOCKSTAT
+#include "common/lockstat.h"
+#endif
+#include "events/ELid.h"
+#include "events/ESubtreeMap.h"
+
+#include "Mutation.h"
+#include "QuiesceAgent.h"
+#include "QuiesceDbManager.h"
+
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
@@ -1033,6 +1043,9 @@ void MDSRank::handle_write_error_with_lock(int err)
 
 void *MDSRank::ProgressThread::entry()
 {
+#ifdef CEPH_LOCKSTAT
+  ceph::lockstat_detail::LockStat::set_thread_iopath(true);
+#endif
   std::unique_lock l(mds->mds_lock);
   while (true) {
     cond.wait(l, [this] {
