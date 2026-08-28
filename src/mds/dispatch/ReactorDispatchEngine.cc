@@ -296,6 +296,9 @@ void
 ReactorDispatchEngine::op_thread_main()
 {
   ceph_pthread_setname("mds-rank-op");
+#ifdef CEPH_LOCKSTAT
+  lockstat_detail::LockStat::set_thread_iopath(true);
+#endif
 
   while (!stop.load()) {
     if (OpWorkItem* item = queue.dequeue()) {
