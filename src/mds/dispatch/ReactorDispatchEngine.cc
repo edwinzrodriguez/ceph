@@ -16,6 +16,7 @@
 #include "ReactorDispatchEngine.h"
 
 #include "common/debug.h"
+#include "mds_lock_debug.h"
 
 #include "common/perf_counters.h"
 #include "include/compat.h"
@@ -222,6 +223,7 @@ ReactorDispatchEngine::execute_io_completion(MDSIOContextBase* ioctx, int r)
   MDSRank* mds = ctx.rank;
 
   dout(10) << "MDSIOContextBase::complete: " << typeid(*ioctx).name() << dendl;
+  MDS_ASSERT_MDS_LOCK(*ctx.mds_lock);
 
   if (mds->is_daemon_stopping()) {
     dout(4) << "MDSIOContextBase::complete: dropping for stopping "
@@ -248,44 +250,43 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
   const auto exec_start = ceph::coarse_mono_clock::now();
   const DispatchLane lane = item->lane;
 
-  {
-    std::lock_guard lock(*ctx.mds_lock);
+  mds::MdsLockGuard mds_lock_guard{
+      *ctx.mds_lock, mds::work_kind_owner_token(item->kind)};
 
-    switch (item->kind) {
-    case WorkKind::InboundMessage:
-      if (ctx.rank && ctx.rank->logger) {
-        ctx.rank->logger->inc(l_mds_dispatch_inbound);
-      }
-      if (ctx.daemon && !ctx.daemon->stopping) {
-        (void)ctx.daemon->dispatch_inbound_locked(item->msg);
-      }
-      break;
-
-    case WorkKind::IOCompletion:
-      if (ctx.rank && ctx.rank->logger) {
-        ctx.rank->logger->inc(l_mds_dispatch_io_completions);
-      }
-      execute_io_completion(item->io_ctx, item->rval);
-      break;
-
-    case WorkKind::AdvanceQueues:
-      if (ctx.rank) {
-        ctx.rank->_advance_queues();
-      }
-      break;
-
-    case WorkKind::Callable:
-      if (item->callable && *item->callable) {
-        (*item->callable)();
-      }
-      break;
-
-    case WorkKind::TrimQuantum:
-      if (ctx.rank && ctx.rank->mdcache) {
-        ctx.rank->mdcache->trim_quantum();
-      }
-      break;
+  switch (item->kind) {
+  case WorkKind::InboundMessage:
+    if (ctx.rank && ctx.rank->logger) {
+      ctx.rank->logger->inc(l_mds_dispatch_inbound);
     }
+    if (ctx.daemon && !ctx.daemon->stopping) {
+      (void)ctx.daemon->dispatch_inbound_locked(item->msg);
+    }
+    break;
+
+  case WorkKind::IOCompletion:
+    if (ctx.rank && ctx.rank->logger) {
+      ctx.rank->logger->inc(l_mds_dispatch_io_completions);
+    }
+    execute_io_completion(item->io_ctx, item->rval);
+    break;
+
+  case WorkKind::AdvanceQueues:
+    if (ctx.rank) {
+      ctx.rank->_advance_queues();
+    }
+    break;
+
+  case WorkKind::Callable:
+    if (item->callable && *item->callable) {
+      (*item->callable)();
+    }
+    break;
+
+  case WorkKind::TrimQuantum:
+    if (ctx.rank && ctx.rank->mdcache) {
+      ctx.rank->mdcache->trim_quantum();
+    }
+    break;
   }
 
   record_execute_metrics(lane, exec_start);
@@ -298,6 +299,9 @@ ReactorDispatchEngine::op_thread_main()
   ceph_pthread_setname("mds-rank-op");
 #ifdef CEPH_LOCKSTAT
   lockstat_detail::LockStat::set_thread_iopath(true);
+#endif
+#ifdef CEPH_DEBUG_MUTEX
+  mds::reactor_register_op_thread();
 #endif
 
   while (!stop.load()) {
@@ -312,4 +316,8 @@ ReactorDispatchEngine::op_thread_main()
       return stop.load() || queue.has_work_for_consumer();
     });
   }
+
+#ifdef CEPH_DEBUG_MUTEX
+  mds::reactor_deregister_op_thread();
+#endif
 }

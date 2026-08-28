@@ -27,6 +27,7 @@
 #include "ClassicDispatchEngine.h"
 
 #include "common/debug.h"
+#include "mds_lock_debug.h"
 
 #include "MDSContext.h"
 #include "MDSDaemon.h"
@@ -55,7 +56,8 @@ ClassicDispatchEngine::submit_inbound(const ref_t<Message>& m)
   ceph_assert(ctx.daemon != nullptr);
   ceph_assert(ctx.mds_lock != nullptr);
 
-  std::lock_guard l(*ctx.mds_lock);
+  mds::MdsLockGuard mds_lock_guard{
+      *ctx.mds_lock, mds::dispatch_lane_owner_token(DispatchLane::Client)};
   if (ctx.daemon->stopping) {
     return false;
   }
@@ -72,7 +74,8 @@ ClassicDispatchEngine::submit_io_completion(MDSIOContextBase* ioctx, int r)
   MDSRank* mds = ctx.rank;
 
   dout(10) << "MDSIOContextBase::complete: " << typeid(*ioctx).name() << dendl;
-  std::lock_guard l(*ctx.mds_lock);
+  mds::MdsLockGuard mds_lock_guard{
+      *ctx.mds_lock, mds::dispatch_lane_owner_token(DispatchLane::IOComplete)};
 
   if (mds->is_daemon_stopping()) {
     dout(4) << "MDSIOContextBase::complete: dropping for stopping "
@@ -103,7 +106,8 @@ ClassicDispatchEngine::submit_callable(
 {
   (void)lane;
   ceph_assert(ctx.mds_lock != nullptr);
-  std::lock_guard l(*ctx.mds_lock);
+  mds::MdsLockGuard mds_lock_guard{
+      *ctx.mds_lock, mds::dispatch_lane_owner_token(lane)};
   fn();
 }
 

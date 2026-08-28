@@ -109,12 +109,26 @@ public:
   bool is_locked_by_me() const {
     return is_locked() && locked_by == std::this_thread::get_id();
   }
+
+  void
+  debug_set_owner_token(const char* token)
+  {
+    debug_owner_token = token;
+  }
+
+  const char*
+  debug_get_owner_token() const
+  {
+    return debug_owner_token;
+  }
+
 private:
   void _set_locked_by() {
     locked_by = std::this_thread::get_id();
   }
   void _reset_locked_by() {
     locked_by = {};
+    debug_owner_token = nullptr;
   }
 #else
   void _set_locked_by() {}
@@ -128,6 +142,7 @@ private:
   ceph::mutex mutex;
 #ifdef CEPH_DEBUG_MUTEX
   std::thread::id locked_by = {};
+  const char* debug_owner_token = nullptr;
 #endif
 #ifdef CEPH_LOCKSTAT
   lockstat_detail::lockstat_clock::time_point m_hold_start{
