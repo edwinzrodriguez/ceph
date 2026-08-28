@@ -10,21 +10,23 @@
  *
  */
 
-#include "MDSRank.h"
-#include "MDCache.h"
-#include "mon/MonClient.h"
+#include <algorithm>
+#include <chrono>
+#include <queue>
+#include <ranges>
 
-#include "QuiesceDbManager.h"
-#include "QuiesceAgent.h"
-
-#include "messages/MMDSQuiesceDbListing.h"
-#include "messages/MMDSQuiesceDbAck.h"
+#include "mds_lock_debug.h"
 
 #include <boost/url.hpp>
-#include <chrono>
-#include <ranges>
-#include <algorithm>
-#include <queue>
+
+#include "messages/MMDSQuiesceDbAck.h"
+#include "messages/MMDSQuiesceDbListing.h"
+#include "mon/MonClient.h"
+
+#include "MDCache.h"
+#include "MDSRank.h"
+#include "QuiesceAgent.h"
+#include "QuiesceDbManager.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds_quiesce
@@ -557,7 +559,7 @@ void MDSRank::quiesce_agent_setup() {
 
         auto quiesce_task = new LambdaContext([dummy_requests, req_id, do_fail, this](int) {
           // the mds lock should be held by the timer
-          ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+          MDS_ASSERT_MDS_LOCK(mds_lock);
           dout(20) << "quiesce_task: callback by the timer" << dendl;
           auto it = std::ranges::find(*dummy_requests, req_id, [](auto x) { return x.second.first; });
           if (it != dummy_requests->end() && it->second.second != nullptr) {
