@@ -14,28 +14,28 @@
  */
 
 #include "Beacon.h"
-#include "BatchOp.h"
-#include "Server.h"
+
+#include <chrono>
 
 #include "common/debug.h"
-#include "common/likely.h"
-#include "common/HeartbeatMap.h"
+#include "mds_lock_debug.h"
 
+#include "common/HeartbeatMap.h"
+#include "common/likely.h"
 #include "include/compat.h" // for ceph_pthread_setname()
 #include "include/stringify.h"
 #include "include/util.h"
-
-#include "mon/MonClient.h"
+#include "mds/Locker.h"
 #include "mds/MDCache.h"
 #include "mds/MDLog.h"
 #include "mds/MDSRank.h"
-#include "mds/Locker.h"
 #include "mds/mdstypes.h"
+#include "messages/MMDSBeacon.h"
+#include "mon/MonClient.h"
 #include "osdc/Objecter.h"
 
-#include "messages/MMDSBeacon.h"
-
-#include <chrono>
+#include "BatchOp.h"
+#include "Server.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -308,7 +308,7 @@ void Beacon::notify_health(MDSRank const *mds)
   }
 
   // I'm going to touch this MDS, so it must be locked
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
 
   health.metrics.clear();
 

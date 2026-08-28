@@ -14,73 +14,69 @@
  */
 
 #include "Server.h"
-#include "RetryMessage.h"
-#include "RetryRequest.h"
-#include "BatchOp.h"
 
-#include <boost/lexical_cast.hpp>
-#include "include/ceph_assert.h"  // lexical_cast includes system assert.h
-#include "include/cephfs/metrics/Types.h"
-#include "include/cephfs/keys_and_values.h"
-#include "include/random.h" // for ceph::util::generate_random_number()
+#include <functional>
+#include <list>
+#include <regex>
+#include <string_view>
+
+#include "common/debug.h"
+#include "mds_lock_debug.h"
 
 #include <boost/config/warning_disable.hpp>
 #include <boost/fusion/include/std_pair.hpp>
+#include <boost/lexical_cast.hpp>
 #include <boost/range/adaptor/reversed.hpp>
 
-#include "MDSRank.h"
-#include "Locker.h"
-#include "MDCache.h"
-#include "MDLog.h"
-#include "Migrator.h"
-#include "MDBalancer.h"
-#include "InoTable.h"
-#include "SnapClient.h"
-#include "SnapRealm.h"
-#include "Mutation.h"
-#include "MetricsHandler.h"
-#include "cephfs_features.h"
-#include "MDSContext.h"
-
+#include "common/Timer.h"
+#include "common/ceph_json.h"
+#include "common/config.h"
+#include "common/perf_counters.h"
+#include "common/strescape.h"
+#include "events/ECommitted.h"
+#include "events/EOpen.h"
+#include "events/EPeerUpdate.h"
+#include "events/EPurged.h"
+#include "events/ESession.h"
+#include "events/EUpdate.h"
+#include "include/ceph_assert.h" // lexical_cast includes system assert.h
+#include "include/cephfs/keys_and_values.h"
+#include "include/cephfs/metrics/Types.h"
+#include "include/compat.h"
+#include "include/filepath.h"
+#include "include/random.h" // for ceph::util::generate_random_number()
+#include "include/stringify.h"
+#include "messages/MClientReclaim.h"
+#include "messages/MClientReclaimReply.h"
 #include "messages/MClientReconnect.h"
 #include "messages/MClientReply.h"
 #include "messages/MClientRequest.h"
 #include "messages/MClientSession.h"
 #include "messages/MClientSnap.h"
-#include "messages/MClientReclaim.h"
-#include "messages/MClientReclaimReply.h"
 #include "messages/MLock.h"
 #include "messages/MMDSPeerRequest.h"
+#include "msg/Message.h"
 #include "msg/Messenger.h"
-
+#include "osd/OSDMap.h"
 #include "osdc/Objecter.h"
 
-#include "events/EUpdate.h"
-#include "events/EPeerUpdate.h"
-#include "events/ESession.h"
-#include "events/EOpen.h"
-#include "events/ECommitted.h"
-#include "events/EPurged.h"
-
-#include "include/stringify.h"
-#include "include/filepath.h"
-#include "common/strescape.h"
-#include "common/ceph_json.h"
-#include "common/debug.h"
-#include "common/Timer.h"
-#include "common/perf_counters.h"
-#include "include/compat.h"
-#include "osd/OSDMap.h"
+#include "BatchOp.h"
+#include "InoTable.h"
+#include "Locker.h"
+#include "MDBalancer.h"
+#include "MDCache.h"
+#include "MDLog.h"
+#include "MDSContext.h"
+#include "MDSRank.h"
+#include "MetricsHandler.h"
+#include "Migrator.h"
+#include "Mutation.h"
+#include "RetryMessage.h"
+#include "RetryRequest.h"
+#include "SnapClient.h"
+#include "SnapRealm.h"
+#include "cephfs_features.h"
 #include "fscrypt.h"
-
-#include <list>
-#include <regex>
-#include <string_view>
-#include <functional>
-
-#include "common/config.h"
-
-#include "msg/Message.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -528,15 +524,18 @@ void Server::finish_reclaim_session(Session *session, const ref_t<MClientReclaim
     if (reply) {
       int64_t session_id = session->get_client().v;
       send_reply = new LambdaContext([this, session_id, reply](int r) {
-	    ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
-	    Session *session = mds->sessionmap.get_session(entity_name_t::CLIENT(session_id));
-	    if (!session) {
-	      return;
-	    }
-	    auto epoch = mds->objecter->with_osdmap([](const OSDMap &map){ return map.get_epoch(); });
-	    reply->set_epoch(epoch);
-	    mds->send_message_client(reply, session);
-	  });
+        MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+        Session* session =
+            mds->sessionmap.get_session(entity_name_t::CLIENT(session_id));
+        if (!session) {
+          return;
+        }
+        auto epoch = mds->objecter->with_osdmap([](const OSDMap& map) {
+          return map.get_epoch();
+        });
+        reply->set_epoch(epoch);
+        mds->send_message_client(reply, session);
+      });
     } else {
       send_reply = nullptr;
     }
@@ -1469,7 +1468,7 @@ void Server::handle_conf_change(const std::set<std::string>& changed) {
  */
 void Server::kill_session(Session *session, Context *on_safe)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
 
   if ((session->is_opening() ||
        session->is_open() ||

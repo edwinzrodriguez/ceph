@@ -26,6 +26,7 @@
 #include <string_view>
 
 #include "common/debug.h"
+#include "mds_lock_debug.h"
 
 #include "common/Timer.h"
 #include "common/config.h"
@@ -33,17 +34,6 @@
 #include "common/perf_counters.h"
 #include "common/safe_io.h"
 #include "dispatch/MDSDispatchEngine.h"
-#include "events/ECommitted.h"
-#include "events/EFragment.h"
-#include "events/EImportFinish.h"
-#include "events/ELid.h"
-#include "events/EMetaBlob.h"
-#include "events/EPeerUpdate.h"
-#include "events/EPurged.h"
-#include "events/ESessions.h"
-#include "events/ESubtreeMap.h"
-#include "events/EUpdate.h"
-#include "include/ceph_assert.h"
 #include "include/ceph_fs.h"
 #include "include/filepath.h"
 #include "include/util.h"
@@ -14523,7 +14513,7 @@ bool MDCache::is_ready_to_trim_cache(void)
 bool
 MDCache::trim_quantum()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
 
   check_memory_usage();
   if (!mds->is_cache_trimmable()) {
