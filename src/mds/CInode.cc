@@ -17,44 +17,38 @@
 
 #include <string>
 
-#include "CDir.h"
-#include "CDentry.h"
-#include "BatchOp.h"
-#include "SnapRealm.h"
-
-#include "MDSRank.h"
-#include "MDCache.h"
-#include "MDLog.h"
-#include "Locker.h"
-#include "Mutation.h"
-#include "MDBalancer.h"
-
-#include "events/EUpdate.h"
-
-#include "osdc/Objecter.h"
-
-#include "snap.h"
-
-#include "LogSegment.h"
+#include "common/debug.h"
 
 #include "common/Clock.h"
 #include "common/ceph_json.h"
 #include "common/config.h"
-#include "common/debug.h"
 #include "common/errno.h"
+#include "events/EUpdate.h"
 #include "global/global_context.h"
-#include "include/denc.h"
 #include "include/ceph_assert.h"
 #include "include/cephfs/json.h"
+#include "include/denc.h"
 #include "include/int_types.h"
 #include "include/random.h" // for ceph::util::generate_random_number()
-
-#include "mds/MDSContinuation.h"
 #include "mds/InoTable.h"
-#include "osdc/Objecter.h"
-
+#include "mds/MDSContinuation.h"
 #include "messages/MClientCaps.h"
 #include "messages/MClientReply.h" // for struct InodeStat
+#include "osdc/Objecter.h"
+
+#include "BatchOp.h"
+#include "CDentry.h"
+#include "CDir.h"
+#include "Locker.h"
+#include "LogSegment.h"
+#include "MDBalancer.h"
+#include "MDCache.h"
+#include "MDLog.h"
+#include "MDSContext.h"
+#include "MDSRank.h"
+#include "Mutation.h"
+#include "SnapRealm.h"
+#include "snap.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -1281,9 +1275,8 @@ void CInode::store(MDSContext *fin)
   object_t oid = CInode::get_object_name(ino(), frag_t(), ".inode");
   object_locator_t oloc(mdcache->mds->get_metadata_pool());
 
-  Context *newfin =
-    new C_OnFinisher(new C_IO_Inode_Stored(this, get_version(), fin),
-		     mdcache->mds->finisher);
+  Context* newfin = mds_wrap_finisher(
+      mdcache->mds, new C_IO_Inode_Stored(this, get_version(), fin));
   mdcache->mds->objecter->mutate(oid, oloc, m, snapc,
 				 ceph::real_clock::now(), 0,
 				 newfin);
@@ -1351,7 +1344,7 @@ void CInode::fetch(MDSContext *fin)
   dout(10) << __func__  << dendl;
 
   C_IO_Inode_Fetched *c = new C_IO_Inode_Fetched(this, fin);
-  C_GatherBuilder gather(g_ceph_context, new C_OnFinisher(c, mdcache->mds->finisher));
+  C_GatherBuilder gather(g_ceph_context, mds_wrap_finisher(mdcache->mds, c));
 
   object_t oid = CInode::get_object_name(ino(), frag_t(), "");
   object_locator_t oloc(mdcache->mds->get_metadata_pool());
@@ -1512,10 +1505,10 @@ void CInode::store_backtrace(MDSContext *fin, int op_prio)
 
   _store_backtrace(ops_vec, bt, op_prio, false);
 
-  C_GatherBuilder gather(g_ceph_context,
-			 new C_OnFinisher(
-			   new C_IO_Inode_StoredBacktrace(this, version, fin),
-			   mdcache->mds->finisher));
+  C_GatherBuilder gather(
+      g_ceph_context,
+      mds_wrap_finisher(
+          mdcache->mds, new C_IO_Inode_StoredBacktrace(this, version, fin)));
   _commit_ops(0, gather, ops_vec, bt);
   ceph_assert(gather.has_subs());
   gather.activate();
@@ -4922,8 +4915,8 @@ void CInode::validate_disk_state(CInode::validated_data *results,
 	  << dendl;
       }
 
-      C_OnFinisher *conf = new C_OnFinisher(get_io_callback(BACKTRACE),
-					    in->mdcache->mds->finisher);
+      Context* conf =
+          mds_wrap_finisher(in->mdcache->mds, get_io_callback(BACKTRACE));
 
       std::string_view tag = in->scrub_infop->header->get_tag();
       bool is_internal = in->scrub_infop->header->is_internal_tag();

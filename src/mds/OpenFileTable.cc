@@ -14,18 +14,21 @@
  */
 
 #include "OpenFileTable.h"
-#include "acconfig.h"
-#include "mds/Anchor.h"
-#include "mds/CInode.h"
-#include "mds/CDir.h"
-#include "mds/inode_backtrace.h" // for inode_backpointer_t
-#include "mds/MDSRank.h"
-#include "mds/MDCache.h"
-#include "osdc/Objecter.h"
+
+#include "common/debug.h"
 
 #include "common/config.h"
-#include "common/debug.h"
 #include "common/errno.h"
+#include "mds/Anchor.h"
+#include "mds/CDir.h"
+#include "mds/CInode.h"
+#include "mds/MDCache.h"
+#include "mds/MDSRank.h"
+#include "mds/inode_backtrace.h" // for inode_backpointer_t
+#include "osdc/Objecter.h"
+
+#include "MDSContext.h"
+#include "acconfig.h"
 
 enum {
   l_oft_first = 1000000,
@@ -337,9 +340,9 @@ void OpenFileTable::_journal_finish(int r, uint64_t log_seq, MDSContext *c,
     return;
   }
 
-  C_GatherBuilder gather(g_ceph_context,
-			 new C_OnFinisher(new C_IO_OFT_Save(this, log_seq, c),
-			 mds->finisher));
+  C_GatherBuilder gather(
+      g_ceph_context,
+      mds_wrap_finisher(mds, new C_IO_OFT_Save(this, log_seq, c)));
   SnapContext snapc;
   object_locator_t oloc(mds->get_metadata_pool());
   for (auto& [idx, vops] : ops_map) {
@@ -468,8 +471,8 @@ void OpenFileTable::commit(MDSContext *c, uint64_t log_seq, int op_prio)
   };
 
   auto submit_ops_func = [&]() {
-    gather.set_finisher(new C_OnFinisher(new C_IO_OFT_Save(this, log_seq, c),
-					 mds->finisher));
+    gather.set_finisher(
+        mds_wrap_finisher(mds, new C_IO_OFT_Save(this, log_seq, c)));
     for (auto& [idx, vops] : ops_map) {
       object_t oid = get_object_name(idx);
       for (auto& op : vops) {
@@ -683,8 +686,8 @@ void OpenFileTable::commit(MDSContext *c, uint64_t log_seq, int op_prio)
 
   ceph_assert(!ops_map.empty());
   if (journal_state == JOURNAL_FINISH) {
-    gather.set_finisher(new C_OnFinisher(new C_IO_OFT_Journal(this, log_seq, c, ops_map),
-					 mds->finisher));
+    gather.set_finisher(mds_wrap_finisher(
+        mds, new C_IO_OFT_Journal(this, log_seq, c, ops_map)));
     gather.activate();
   } else {
     submit_ops_func();
@@ -760,8 +763,8 @@ void OpenFileTable::_read_omap_values(const std::string& key, unsigned idx,
       op.omap_get_header(&c->header_bl, &c->header_r);
     op.omap_get_vals(key, "", uint64_t(-1),
 		     &c->values, &c->more, &c->values_r);
-    mds->objecter->read(oid, oloc, op, CEPH_NOSNAP, nullptr, 0,
-			new C_OnFinisher(c, mds->finisher));
+    mds->objecter->read(
+        oid, oloc, op, CEPH_NOSNAP, nullptr, 0, mds_wrap_finisher(mds, c));
 }
 
 void OpenFileTable::_load_finish(int op_r, int header_r, int values_r,
@@ -889,9 +892,8 @@ void OpenFileTable::_load_finish(int op_r, int header_r, int values_r,
   if (loaded_journals.size() > 0) {
     dout(10) << __func__ << ": recover journal" << dendl;
 
-    C_GatherBuilder gather(g_ceph_context,
-			   new C_OnFinisher(new C_IO_OFT_Recover(this),
-					    mds->finisher));
+    C_GatherBuilder gather(
+        g_ceph_context, mds_wrap_finisher(mds, new C_IO_OFT_Recover(this)));
     object_locator_t oloc(mds->get_metadata_pool());
     SnapContext snapc;
 

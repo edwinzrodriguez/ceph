@@ -13,55 +13,48 @@
  * 
  */
 
-#include "common/config.h"
 #include "common/debug.h"
-#include "osdc/Journaler.h"
-#include "events/ESubtreeMap.h"
+
+#include "common/config.h"
+#include "events/ECommitted.h"
+#include "events/EExport.h"
+#include "events/EFragment.h"
+#include "events/EImportFinish.h"
+#include "events/EImportStart.h"
+#include "events/ELid.h"
+#include "events/EMetaBlob.h"
+#include "events/ENoOp.h"
+#include "events/EOpen.h"
+#include "events/EPeerUpdate.h"
+#include "events/EPurged.h"
+#include "events/EResetJournal.h"
+#include "events/ESegment.h"
 #include "events/ESession.h"
 #include "events/ESessions.h"
-
-#include "events/EMetaBlob.h"
-#include "events/EResetJournal.h"
-#include "events/ENoOp.h"
-
-#include "events/EUpdate.h"
-#include "events/EPeerUpdate.h"
-#include "events/EOpen.h"
-#include "events/ECommitted.h"
-#include "events/EPurged.h"
-
-#include "events/EExport.h"
-#include "events/EImportStart.h"
-#include "events/EImportFinish.h"
-#include "events/EFragment.h"
-
+#include "events/ESubtreeMap.h"
 #include "events/ETableClient.h"
 #include "events/ETableServer.h"
-#include "events/ESegment.h"
-#include "events/ELid.h"
-
+#include "events/EUpdate.h"
 #include "include/denc.h"
 #include "include/random.h" // for ceph::util::generate_random_number()
 #include "include/stringify.h"
-
 #include "messages/MMDSTableRequest.h"
-
-#include "LogSegment.h"
-
-#include "MDSRank.h"
-#include "MDLog.h"
-#include "MDCache.h"
-#include "Server.h"
-#include "Migrator.h"
-#include "Mutation.h"
-#include "SnapRealm.h"
+#include "osdc/Journaler.h"
 
 #include "InoTable.h"
+#include "Locker.h"
+#include "LogSegment.h"
+#include "LogSegmentRef.h"
+#include "MDCache.h"
+#include "MDLog.h"
+#include "MDSContext.h"
+#include "MDSRank.h"
 #include "MDSTableClient.h"
 #include "MDSTableServer.h"
-
-#include "Locker.h"
-#include "LogSegmentRef.h"
+#include "Migrator.h"
+#include "Mutation.h"
+#include "Server.h"
+#include "SnapRealm.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -115,9 +108,8 @@ struct BatchCommitBacktrace : public Context {
       op.bt.clear();
     }
     ceph_assert(gather.has_subs());
-    gather.set_finisher(new C_OnFinisher(
-			  new BatchStoredBacktrace(mds, fin, std::move(ops_vec)),
-			  mds->finisher));
+    gather.set_finisher(mds_wrap_finisher(
+        mds, new BatchStoredBacktrace(mds, fin, std::move(ops_vec))));
     gather.activate();
   }
 };

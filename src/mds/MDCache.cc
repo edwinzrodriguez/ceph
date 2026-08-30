@@ -67,6 +67,18 @@
 #include "osdc/Striper.h"
 #include "perfglue/heap_profiler.h"
 
+#include "events/ECommitted.h"
+#include "events/EFragment.h"
+#include "events/EImportFinish.h"
+#include "events/ELid.h"
+#include "events/EMetaBlob.h"
+#include "events/EPeerUpdate.h"
+#include "events/EPurged.h"
+#include "events/ESessions.h"
+#include "events/ESubtreeMap.h"
+#include "events/EUpdate.h"
+#include "include/ceph_assert.h"
+
 #include "BatchOp.h"
 #include "CDir.h"
 #include "CInode.h"
@@ -6612,11 +6624,12 @@ void MDCache::_truncate_inode(CInode *in, LogSegmentRef const& ls)
     dout(10) << "_truncate_inode write on inode " << *in << " change_attr: "
              << header.change_attr << " offset: " << header.file_offset << " blen: "
 	     << header.block_size << dendl;
-    filer.write(in->ino(), &layout, *snapc, header.file_offset, header.block_size,
-                data, ceph::real_clock::zero(), 0,
-                new C_OnFinisher(new C_IO_MDC_TruncateWriteFinish(this, in, ls,
-                                                                  header.block_size),
-                                 mds->finisher));
+    filer.write(
+        in->ino(), &layout, *snapc, header.file_offset, header.block_size, data,
+        ceph::real_clock::zero(), 0,
+        mds_wrap_finisher(
+            mds,
+            new C_IO_MDC_TruncateWriteFinish(this, in, ls, header.block_size)));
   } else { // located in file hole.
     uint64_t length = pi->truncate_from - pi->truncate_size;
 
@@ -6633,10 +6646,10 @@ void MDCache::_truncate_inode(CInode *in, LogSegmentRef const& ls)
     ceph_assert(length);
 
     dout(10) << "_truncate_inode truncate on inode " << *in << dendl;
-    filer.truncate(in->ino(), &layout, *snapc, pi->truncate_size, length,
-                   pi->truncate_seq, ceph::real_clock::zero(), 0,
-                   new C_OnFinisher(new C_IO_MDC_TruncateFinish(this, in, ls),
-                                    mds->finisher));
+    filer.truncate(
+        in->ino(), &layout, *snapc, pi->truncate_size, length, pi->truncate_seq,
+        ceph::real_clock::zero(), 0,
+        mds_wrap_finisher(mds, new C_IO_MDC_TruncateFinish(this, in, ls)));
   }
 
 }
@@ -6689,10 +6702,10 @@ void MDCache::truncate_inode_write_finish(CInode *in, LogSegmentRef const& ls,
    * OSD won't miss truncating the last object.
    */
   uint64_t length = pi->truncate_from - pi->truncate_size + block_size;
-  filer.truncate(in->ino(), &layout, *snapc, pi->truncate_size, length,
-                 pi->truncate_seq, ceph::real_clock::zero(), 0,
-                 new C_OnFinisher(new C_IO_MDC_TruncateFinish(this, in, ls),
-                                  mds->finisher));
+  filer.truncate(
+      in->ino(), &layout, *snapc, pi->truncate_size, length, pi->truncate_seq,
+      ceph::real_clock::zero(), 0,
+      mds_wrap_finisher(mds, new C_IO_MDC_TruncateFinish(this, in, ls)));
 }
 
 void MDCache::truncate_inode_finish(CInode *in, LogSegmentRef const& ls)
@@ -6831,9 +6844,9 @@ void MDCache::purge_inodes(const interval_set<inodeno_t>& inos, LogSegmentRef co
 				     new C_MDS_purge_completed_finish(this, inos, ls, piv));
       mds->mdlog->flush();
     });
-  
-  C_GatherBuilder gather(g_ceph_context,
-			  new C_OnFinisher(new MDSIOContextWrapper(mds, cb), mds->finisher));
+
+  C_GatherBuilder gather(
+      g_ceph_context, mds_wrap_finisher(mds, new MDSIOContextWrapper(mds, cb)));
   SnapContext nullsnapc;
   for (const auto& [start, len] : inos) {
     for (auto i = start; i < start + len ; i += 1) {
@@ -9060,8 +9073,7 @@ void MDCache::_open_ino_backtrace_fetched(inodeno_t ino, bufferlist& bl, int err
       info.pool = backtrace.pool;
       C_IO_MDC_OpenInoBacktraceFetched *fin =
 	new C_IO_MDC_OpenInoBacktraceFetched(this, ino);
-      fetch_backtrace(ino, info.pool, fin->bl,
-		      new C_OnFinisher(fin, mds->finisher));
+      fetch_backtrace(ino, info.pool, fin->bl, mds_wrap_finisher(mds, fin));
       return;
     }
   } else if (err == -ENOENT) {
@@ -9072,8 +9084,7 @@ void MDCache::_open_ino_backtrace_fetched(inodeno_t ino, bufferlist& bl, int err
       info.pool = meta_pool;
       C_IO_MDC_OpenInoBacktraceFetched *fin =
 	new C_IO_MDC_OpenInoBacktraceFetched(this, ino);
-      fetch_backtrace(ino, info.pool, fin->bl,
-		      new C_OnFinisher(fin, mds->finisher));
+      fetch_backtrace(ino, info.pool, fin->bl, mds_wrap_finisher(mds, fin));
       return;
     }
     err = 0; // backtrace.ancestors.empty() is checked below
@@ -9318,8 +9329,7 @@ void MDCache::do_open_ino(inodeno_t ino, open_ino_info_t& info, int err)
     info.checked.clear();
     C_IO_MDC_OpenInoBacktraceFetched *fin =
       new C_IO_MDC_OpenInoBacktraceFetched(this, ino);
-    fetch_backtrace(ino, info.pool, fin->bl,
-		    new C_OnFinisher(fin, mds->finisher));
+    fetch_backtrace(ino, info.pool, fin->bl, mds_wrap_finisher(mds, fin));
   } else {
     ceph_assert(!info.ancestors.empty());
     info.checking = mds->get_nodeid();
@@ -12438,10 +12448,9 @@ void MDCache::_fragment_committed(dirfrag_t basedirfrag, const MDRequestRef& mdr
 
   // remove old frags
   C_GatherBuilder gather(
-    g_ceph_context,
-    new C_OnFinisher(
-      new C_IO_MDC_FragmentPurgeOld(this, basedirfrag, uf.bits, mdr),
-      mds->finisher));
+      g_ceph_context,
+      mds_wrap_finisher(
+          mds, new C_IO_MDC_FragmentPurgeOld(this, basedirfrag, uf.bits, mdr)));
 
   SnapContext nullsnapc;
   object_locator_t oloc(mds->get_metadata_pool());

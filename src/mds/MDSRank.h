@@ -238,6 +238,9 @@ class MDSRank {
       return dispatch_engine.get();
     }
 
+    /// Queue a completion for execution under mds_lock (finisher or reactor).
+    void queue_completion(Context* c, int r = 0);
+
     // Reference to outer daemon for dispatch engine and lifecycle hooks.
     MDSDaemon* const daemon;
 
