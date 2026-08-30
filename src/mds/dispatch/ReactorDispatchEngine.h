@@ -63,6 +63,8 @@ private:
   void note_enqueued();
   void publish_queue_depth_metrics();
 
+  static constexpr unsigned dequeue_batch_size = 32;
+
   MDSDispatchContext ctx;
   MDSOpWorkQueue queue;
   std::thread op_thread;

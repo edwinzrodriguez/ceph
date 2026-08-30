@@ -310,9 +310,18 @@ ReactorDispatchEngine::op_thread_main()
 #endif
 
   while (!stop.load()) {
-    if (OpWorkItem* item = queue.dequeue()) {
-      publish_queue_depth_metrics();
+    unsigned processed = 0;
+    while (processed < dequeue_batch_size) {
+      OpWorkItem* item = queue.dequeue();
+      if (!item) {
+        break;
+      }
       execute_item(item);
+      ++processed;
+    }
+
+    if (processed > 0) {
+      publish_queue_depth_metrics();
       continue;
     }
 
