@@ -169,11 +169,14 @@ public:
 
 class Journaler::C_ReProbe : public Context {
   Journaler *ls;
-  C_OnFinisher *onfinish;
+  Context* onfinish;
+
 public:
   uint64_t end;
-  C_ReProbe(Journaler *l, C_OnFinisher *onfinish_) :
-    ls(l), onfinish(onfinish_), end(0) {}
+
+  C_ReProbe(Journaler* l, Context* onfinish_) :
+    ls(l), onfinish(onfinish_), end(0)
+  {}
   void finish(int r) override {
     ls->_finish_reprobe(r, end, onfinish);
   }
@@ -351,7 +354,8 @@ void Journaler::_probe(Context *finish, uint64_t *end)
 	      write_pos, end, true, 0, wrap_finisher(finish));
 }
 
-void Journaler::_reprobe(C_OnFinisher *finish)
+void
+Journaler::_reprobe(Context* finish)
 {
   ldout(cct, 10) << "reprobe" << dendl;
   ceph_assert(state == STATE_ACTIVE);
@@ -361,9 +365,8 @@ void Journaler::_reprobe(C_OnFinisher *finish)
   _probe(fin, &fin->end);
 }
 
-
-void Journaler::_finish_reprobe(int r, uint64_t new_end,
-				C_OnFinisher *onfinish)
+void
+Journaler::_finish_reprobe(int r, uint64_t new_end, Context* onfinish)
 {
   lock_guard l(lock);
   if (state == STATE_STOPPING) {
@@ -416,10 +419,12 @@ out:
 class Journaler::C_RereadHeadProbe : public Context
 {
   Journaler *ls;
-  C_OnFinisher *final_finish;
+  Context* final_finish;
+
 public:
-  C_RereadHeadProbe(Journaler *l, C_OnFinisher *finish) :
-    ls(l), final_finish(finish) {}
+  C_RereadHeadProbe(Journaler* l, Context* finish) :
+    ls(l), final_finish(finish)
+  {}
   void finish(int r) override {
     ls->_finish_reread_head_and_probe(r, final_finish);
   }
@@ -433,7 +438,8 @@ void Journaler::reread_head_and_probe(Context *onfinish)
   _reread_head(new C_RereadHeadProbe(this, wrap_finisher(onfinish)));
 }
 
-void Journaler::_finish_reread_head_and_probe(int r, C_OnFinisher *onfinish)
+void
+Journaler::_finish_reread_head_and_probe(int r, Context* onfinish)
 {
   // Expect to be called back from finish_reread_head, which already takes lock
   // lock is locked
@@ -460,9 +466,11 @@ class Journaler::C_WriteHead : public Context {
 public:
   Journaler *ls;
   Header h;
-  C_OnFinisher *oncommit;
-  C_WriteHead(Journaler *l, Header& h_, C_OnFinisher *c) : ls(l), h(h_),
-							   oncommit(c) {}
+  Context* oncommit;
+
+  C_WriteHead(Journaler* l, Header& h_, Context* c) :
+    ls(l), h(h_), oncommit(c)
+  {}
   void finish(int r) override {
     ls->_finish_write_head(r, h, oncommit);
   }
@@ -505,8 +513,8 @@ void Journaler::_write_head(Context *oncommit)
 		       0, 0, write_iohint);
 }
 
-void Journaler::_finish_write_head(int r, Header &wrote,
-				   C_OnFinisher *oncommit)
+void
+Journaler::_finish_write_head(int r, Header& wrote, Context* oncommit)
 {
   lock_guard l(lock);
 
@@ -762,7 +770,7 @@ void Journaler::_wait_for_flush(Context *onsafe)
       "pointers at " << "(" << prezeroing_pos << "/" << prezero_pos << ")/"
       << write_pos << "/" << flush_pos << "/" << safe_pos << dendl;
     if (onsafe) {
-      finisher->queue(onsafe, 0);
+      dispatch_completion(onsafe, 0);
     }
     return;
   }
@@ -784,7 +792,8 @@ void Journaler::flush(Context *onsafe)
   _flush(wrap_finisher(onsafe));
 }
 
-void Journaler::_flush(C_OnFinisher *onsafe)
+void
+Journaler::_flush(Context* onsafe)
 {
   ceph_assert(!readonly);
 
@@ -919,7 +928,7 @@ void Journaler::wait_for_prezero(Context *onfinish)
   lock_guard l(lock);
 
   if (prezero_pos == prezeroing_pos) {
-    finisher->queue(onfinish, 0);
+    dispatch_completion(onfinish, 0);
     return;
   }
   waitfor_prezero.push_back(wrap_finisher(onfinish));
@@ -973,7 +982,7 @@ void Journaler::_finish_read(int r, uint64_t offset, uint64_t length,
 
   if (error) {
     if (on_readable) {
-      C_OnFinisher *f = on_readable;
+      Context* f = on_readable;
       on_readable = 0;
       f->complete(error);
     }
@@ -988,7 +997,7 @@ void Journaler::_finish_read(int r, uint64_t offset, uint64_t length,
     lderr(cct) << "_decode error from assimilate_prefetch" << dendl;
     error = -EINVAL;
     if (on_readable) {
-      C_OnFinisher *f = on_readable;
+      Context* f = on_readable;
       on_readable = 0;
       f->complete(error);
     }
@@ -1038,7 +1047,7 @@ void Journaler::_assimilate_prefetch()
                    << readable << " read_pos=" << read_pos << " write_pos="
                    << write_pos << dendl;
     if (on_readable) {
-      C_OnFinisher *f = on_readable;
+      Context* f = on_readable;
       on_readable = 0;
       f->complete(0);
     }
@@ -1222,9 +1231,12 @@ bool Journaler::_is_readable()
 
 class Journaler::C_EraseFinish : public Context {
   Journaler *journaler;
-  C_OnFinisher *completion;
-  public:
-  C_EraseFinish(Journaler *j, C_OnFinisher *c) : journaler(j), completion(c) {}
+  Context* completion;
+
+public:
+  C_EraseFinish(Journaler* j, Context* c) :
+    journaler(j), completion(c)
+  {}
   void finish(int r) override {
     journaler->_finish_erase(r, completion);
   }
@@ -1252,7 +1264,8 @@ void Journaler::erase(Context *completion)
   // header thereby lose our reference to the data.
 }
 
-void Journaler::_finish_erase(int data_result, C_OnFinisher *completion)
+void
+Journaler::_finish_erase(int data_result, Context* completion)
 {
   lock_guard l(lock);
   if (state == STATE_STOPPING) {
@@ -1334,7 +1347,7 @@ void Journaler::wait_for_readable(Context *onreadable)
 void Journaler::_wait_for_readable(Context *onreadable)
 {
   if (state == STATE_STOPPING) {
-    finisher->queue(onreadable, -EAGAIN);
+    dispatch_completion(onreadable, -EAGAIN);
     return;
   }
 
@@ -1345,7 +1358,7 @@ void Journaler::_wait_for_readable(Context *onreadable)
     on_readable = wrap_finisher(onreadable);
   } else {
     // race with OSD reply
-    finisher->queue(onreadable, 0);
+    dispatch_completion(onreadable, 0);
   }
 }
 
@@ -1609,16 +1622,58 @@ void Journaler::set_write_error_handler(Context *c) {
   called_write_error = false;
 }
 
-
 /**
- * Wrap a context in a C_OnFinisher, if it is non-NULL
- *
- * Utility function to avoid lots of error-prone and verbose
- * NULL checking on contexts passed in.
+ * Wrap a context for deferred completion, if it is non-NULL.
  */
-C_OnFinisher *Journaler::wrap_finisher(Context *c)
+class Journaler::C_JournalerCompletionRelay : public Context {
+  Journaler* journaler;
+  Context* inner;
+
+public:
+  C_JournalerCompletionRelay(Journaler* j, Context* c) :
+    journaler(j), inner(c)
+  {
+    ceph_assert(journaler != nullptr);
+    ceph_assert(inner != nullptr);
+  }
+
+  ~C_JournalerCompletionRelay() override
+  {
+    if (inner != nullptr) {
+      delete inner;
+      inner = nullptr;
+    }
+  }
+
+  void
+  finish(int r) override
+  {
+    Context* c = inner;
+    inner = nullptr;
+    journaler->dispatch_completion(c, r);
+  }
+};
+
+void
+Journaler::dispatch_completion(Context* c, int r)
+{
+  if (c == nullptr) {
+    return;
+  }
+  if (completion_callback) {
+    completion_callback(c, r);
+  } else {
+    finisher->queue(c, r);
+  }
+}
+
+Context*
+Journaler::wrap_finisher(Context* c)
 {
   if (c != NULL) {
+    if (completion_callback) {
+      return new C_JournalerCompletionRelay(this, c);
+    }
     return new C_OnFinisher(c, finisher);
   } else {
     return NULL;
@@ -1637,7 +1692,7 @@ void Journaler::shutdown()
   // Kick out anyone reading from journal
   error = -EAGAIN;
   if (on_readable) {
-    C_OnFinisher *f = on_readable;
+    Context* f = on_readable;
     on_readable = 0;
     f->complete(-EAGAIN);
   }
