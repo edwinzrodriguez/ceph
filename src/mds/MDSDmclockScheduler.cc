@@ -12,11 +12,15 @@
  * 
  */
 
+#include "MDSDmclockScheduler.h"
+
+#include "common/debug.h"
+
+#include "dispatch/MDSDispatchEngine.h"
+#include "mds/MDSMap.h"
+
 #include "Server.h"
 #include "SessionMap.h"
-#include "MDSDmclockScheduler.h"
-#include "mds/MDSMap.h"
-#include "common/debug.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -101,7 +105,18 @@ void MDSDmclockScheduler::submit_request_to_mds(const VolumeId& vid, std::unique
 
   hit_volume_throttle(vid, request->time);
 
-  const MDSReqRef& req = request->mds_req_ref;
+  const MDSReqRef req = request->mds_req_ref;
+  const VolumeId volume_id = request->get_volume_id();
+  request.reset();
+
+  if (auto* engine = mds->get_dispatch_engine();
+      engine && engine->is_reactor()) {
+    engine->submit_callable(DispatchLane::Client, [this, req, volume_id]() {
+      mds->server->handle_client_request(req);
+      decrease_inflight_request(volume_id);
+    });
+    return;
+  }
 
   mds_lock();
 
@@ -109,7 +124,7 @@ void MDSDmclockScheduler::submit_request_to_mds(const VolumeId& vid, std::unique
 
   mds_unlock();
 
-  decrease_inflight_request(request->get_volume_id());
+  decrease_inflight_request(volume_id);
 }
 
 void MDSDmclockScheduler::shutdown()
