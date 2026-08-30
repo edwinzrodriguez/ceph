@@ -56,6 +56,7 @@
 #include "MDBalancer.h"
 #include "MDCache.h"
 #include "MDLog.h"
+#include "MDSContext.h"
 #include "MDSDaemon.h"
 #include "MDSMap.h"
 #include "MetricAggregator.h"
@@ -187,12 +188,13 @@ private:
     /* Because this context may be finished with the MDLog::submit_mutex held,
      * complete it in the MDS finisher thread.
      */
-    Context *ctx = new C_OnFinisher(new LambdaContext([this,mds=mds](int r) {
-        ceph_assert(r == 0); // MDLog is not allowed to raise errors via
-                             // wait_for_expiry
-        std::lock_guard locker(mds->mds_lock);
-        trim_expired_segments();
-      }), mds->finisher);
+    Context* ctx = mds_wrap_finisher(
+        mds, new LambdaContext([this, mds = mds](int r) {
+          ceph_assert(r == 0); // MDLog is not allowed to raise errors via
+          // wait_for_expiry
+          std::lock_guard locker(mds->mds_lock);
+          trim_expired_segments();
+        }));
     expiry_gather.set_finisher(new MDSInternalContextWrapper(mds, ctx));
     expiry_gather.activate();
   }
@@ -1655,6 +1657,27 @@ void MDSRank::retry_dispatch(const cref_t<Message> &m)
 double MDSRank::get_dispatch_queue_max_age(utime_t now) const
 {
   return messenger->get_dispatch_queue_max_age(now);
+}
+
+void
+MDSRank::queue_completion(Context* c, int r)
+{
+  if (c == nullptr) {
+    return;
+  }
+
+  if (auto* engine = get_dispatch_engine(); engine && engine->is_reactor()) {
+    if (auto* io = dynamic_cast<MDSIOContextBase*>(c)) {
+      io->complete(r);
+      return;
+    }
+    engine->submit_callable(DispatchLane::IOComplete, [c, r]() {
+      c->complete(r);
+    });
+    return;
+  }
+
+  finisher->queue(c, r);
 }
 
 bool MDSRank::is_daemon_stopping() const
@@ -4154,20 +4177,18 @@ bool MDSRank::evict_client(int64_t session_id,
   auto apply_blocklist = [this, &cmd](std::function<void()> fn) {
     MDS_ASSERT_MDS_LOCK(mds_lock);
 
-    Context *on_blocklist_done = new LambdaContext([this, fn](int r) {
-      objecter->wait_for_latest_osdmap(
-      lambdafy((new C_OnFinisher(
-         new LambdaContext([this, fn](int r) {
-              std::lock_guard l(mds_lock);
-              auto epoch = objecter->with_osdmap([](const OSDMap &o){
-                  return o.get_epoch();
-              });
+    Context* on_blocklist_done = new LambdaContext([this, fn](int r) {
+      objecter->wait_for_latest_osdmap(lambdafy(mds_wrap_finisher(
+          this, new LambdaContext([this, fn](int r) {
+            std::lock_guard l(mds_lock);
+            auto epoch = objecter->with_osdmap([](const OSDMap& o) {
+              return o.get_epoch();
+            });
 
-              set_osd_epoch_barrier(epoch);
+            set_osd_epoch_barrier(epoch);
 
-              fn();
-            }), finisher)
-      )));
+            fn();
+          }))));
     });
 
     dout(4) << "Sending mon blocklist command: " << cmd[0] << dendl;

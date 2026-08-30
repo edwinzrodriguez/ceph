@@ -13,40 +13,38 @@
  * 
  */
 
-#include <string_view>
-#include <algorithm>
-
-#include "include/types.h"
-
 #include "CDir.h"
-#include "CDentry.h"
-#include "CInode.h"
-#include "Mutation.h"
 
-#include "MDSMap.h"
-#include "MDSRank.h"
-#include "MDCache.h"
-#include "Locker.h"
-#include "MDLog.h"
-#include "LogSegment.h"
-#include "MDBalancer.h"
-#include "SnapClient.h"
-#include "SnapRealm.h"
-#include "events/EMetaBlob.h"
+#include <algorithm>
+#include <string_view>
 
-#include "common/bloom_filter.hpp"
 #include "common/debug.h"
-#include "common/likely.h"
-#include "include/Context.h"
+
 #include "common/Clock.h"
-
-#include "osdc/Objecter.h"
-
+#include "common/bloom_filter.hpp"
 #include "common/config.h"
+#include "common/likely.h"
+#include "events/EMetaBlob.h"
+#include "include/Context.h"
 #include "include/ceph_assert.h"
 #include "include/compat.h"
-
+#include "include/types.h"
 #include "messages/MClientReply.h" // for struct DirStat
+#include "osdc/Objecter.h"
+
+#include "CDentry.h"
+#include "CInode.h"
+#include "Locker.h"
+#include "LogSegment.h"
+#include "MDBalancer.h"
+#include "MDCache.h"
+#include "MDLog.h"
+#include "MDSContext.h"
+#include "MDSMap.h"
+#include "MDSRank.h"
+#include "Mutation.h"
+#include "SnapClient.h"
+#include "SnapRealm.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -1802,8 +1800,8 @@ void CDir::_omap_fetch(std::set<string> *keys, MDSContext *c)
     fin->ret3 = -ECANCELED;
   }
 
-  mdcache->mds->objecter->read(oid, oloc, rd, CEPH_NOSNAP, NULL, 0,
-			     new C_OnFinisher(fin, mdcache->mds->finisher));
+  mdcache->mds->objecter->read(
+      oid, oloc, rd, CEPH_NOSNAP, NULL, 0, mds_wrap_finisher(mdcache->mds, fin));
 }
 
 void CDir::_omap_fetch_more(version_t omap_version, bufferlist& hdrbl,
@@ -1822,8 +1820,8 @@ void CDir::_omap_fetch_more(version_t omap_version, bufferlist& hdrbl,
 		   &fin->omap_more,
 		   &fin->more,
 		   &fin->ret);
-  mdcache->mds->objecter->read(oid, oloc, rd, CEPH_NOSNAP, NULL, 0,
-			     new C_OnFinisher(fin, mdcache->mds->finisher));
+  mdcache->mds->objecter->read(
+      oid, oloc, rd, CEPH_NOSNAP, NULL, 0, mds_wrap_finisher(mdcache->mds, fin));
 }
 
 CDentry *CDir::_load_dentry(
@@ -2459,9 +2457,9 @@ void CDir::_omap_commit_ops(int r, int op_prio, int64_t metapool, version_t vers
     return;
   }
 
-  C_GatherBuilder gather(g_ceph_context,
-                         new C_OnFinisher(new C_IO_Dir_Committed(this, version),
-			 mdcache->mds->finisher));
+  C_GatherBuilder gather(
+      g_ceph_context,
+      mds_wrap_finisher(mdcache->mds, new C_IO_Dir_Committed(this, version)));
 
   SnapContext snapc;
   object_t oid = get_ondisk_object();
