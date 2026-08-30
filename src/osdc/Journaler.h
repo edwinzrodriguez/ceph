@@ -58,13 +58,14 @@
 #ifndef CEPH_JOURNALER_H
 #define CEPH_JOURNALER_H
 
+#include <functional>
 #include <list>
 #include <map>
 
-#include "Filer.h"
-
 #include "common/Throttle.h"
 #include "include/common_fwd.h"
+
+#include "Filer.h"
 
 class Context;
 class Objecter;
@@ -276,7 +277,7 @@ private:
 
   // header
   ceph::real_time last_wrote_head;
-  void _finish_write_head(int r, Header &wrote, C_OnFinisher *oncommit);
+  void _finish_write_head(int r, Header& wrote, Context* oncommit);
   class C_WriteHead;
   friend class C_WriteHead;
 
@@ -288,9 +289,9 @@ private:
   void _finish_reread_head(int r, bufferlist& bl, Context *finish);
   void _probe(Context *finish, uint64_t *end);
   void _finish_probe_end(int r, uint64_t end);
-  void _reprobe(C_OnFinisher *onfinish);
-  void _finish_reprobe(int r, uint64_t end, C_OnFinisher *onfinish);
-  void _finish_reread_head_and_probe(int r, C_OnFinisher *onfinish);
+  void _reprobe(Context* onfinish);
+  void _finish_reprobe(int r, uint64_t end, Context* onfinish);
+  void _finish_reread_head_and_probe(int r, Context* onfinish);
   class C_ReadHead;
   friend class C_ReadHead;
   class C_ProbeEnd;
@@ -330,7 +331,7 @@ private:
   // when safe through given offset
   std::map<uint64_t, std::list<Context*> > waitfor_safe;
 
-  void _flush(C_OnFinisher *onsafe);
+  void _flush(Context* onsafe);
   void _do_flush(unsigned amount=0);
   void _finish_flush(int r, uint64_t start, ceph::real_time stamp);
   class C_Flush;
@@ -349,8 +350,8 @@ private:
   uint64_t temp_fetch_len;
 
   // for wait_for_readable()
-  C_OnFinisher *on_readable;
-  C_OnFinisher *on_write_error;
+  Context* on_readable;
+  Context* on_write_error;
   bool called_write_error;
 
   // read completion callback
@@ -398,11 +399,16 @@ private:
 
   bool _have_next_entry();
 
-  void _finish_erase(int data_result, C_OnFinisher *completion);
+  void _finish_erase(int data_result, Context* completion);
   class C_EraseFinish;
   friend class C_EraseFinish;
+  class C_JournalerCompletionRelay;
+  friend class C_JournalerCompletionRelay;
 
-  C_OnFinisher *wrap_finisher(Context *c);
+  using CompletionCallback = std::function<void(Context*, int)>;
+  CompletionCallback completion_callback;
+  void dispatch_completion(Context* c, int r);
+  Context* wrap_finisher(Context* c);
 
   uint32_t write_iohint; // the fadvise flags for write op, see
 			 // CEPH_OSD_OP_FADIVSE_*
@@ -574,6 +580,15 @@ public:
     return journal_stream.get_envelope_size(); 
   }
   void check_isreadable();
+
+  using completion_callback_t = CompletionCallback;
+
+  void
+  set_completion_callback(completion_callback_t cb)
+  {
+    lock_guard l(lock);
+    completion_callback = std::move(cb);
+  }
 };
 WRITE_CLASS_ENCODER(Journaler::Header)
 

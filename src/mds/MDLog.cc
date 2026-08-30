@@ -15,24 +15,30 @@
 
 #include "MDLog.h"
 
-#include "common/debug.h"
+#include "LogEvent.h"
+#include "MDCache.h"
+#include "MDSContext.h"
+#include "MDSRank.h"
+#include "mds/JournalPointer.h"
 #include "mds_lock_debug.h"
+#include "osdc/Journaler.h"
+
+static void mdlog_bind_journaler_completion(Journaler* journaler, MDSRank* mds)
+{
+  journaler->set_completion_callback([mds](Context* c, int r) {
+    mds->queue_completion(c, r);
+  });
+}
 
 #include "common/Cond.h"
 #include "common/ceph_time.h"
 #include "common/config.h"
+#include "common/debug.h"
 #include "common/entity_name.h"
 #include "common/perf_counters.h"
 #include "events/ELid.h"
 #include "events/ESegment.h"
 #include "events/ESubtreeMap.h"
-#include "mds/JournalPointer.h"
-#include "osdc/Journaler.h"
-
-#include "LogEvent.h"
-#include "MDCache.h"
-#include "MDSContext.h"
-#include "MDSRank.h"
 
 #ifdef CEPH_LOCKSTAT
 #include "common/lockstat.h"
@@ -287,6 +293,7 @@ void MDLog::create(MDSContext *c)
   journaler = new Journaler("mdlog", ino, mds->get_metadata_pool(),
                             CEPH_FS_ONDISK_MAGIC, mds->objecter, logger,
                             l_mdl_jlat, mds->finisher);
+  mdlog_bind_journaler_completion(journaler, mds);
   ceph_assert(journaler->is_readonly());
   journaler->set_write_error_handler(new C_MDL_WriteError(this));
   journaler->set_writeable();
@@ -1180,6 +1187,7 @@ void MDLog::_recovery_thread(MDSContext *completion)
   Journaler *front_journal = new Journaler("mdlog", jp.front,
       mds->get_metadata_pool(), CEPH_FS_ONDISK_MAGIC, mds->objecter,
       logger, l_mdl_jlat, mds->finisher);
+  mdlog_bind_journaler_completion(front_journal, mds);
 
   // Assign to ::journaler so that we can be aborted by ::shutdown while
   // waiting for journaler recovery
@@ -1266,6 +1274,7 @@ void MDLog::_reformat_journal(JournalPointer const &jp_in, Journaler *old_journa
   /* Create the new Journaler file */
   Journaler *new_journal = new Journaler("mdlog", jp.back,
       mds->get_metadata_pool(), CEPH_FS_ONDISK_MAGIC, mds->objecter, logger, l_mdl_jlat, mds->finisher);
+  mdlog_bind_journaler_completion(new_journal, mds);
   dout(4) << "Writing new journal header " << jp.back << dendl;
   file_layout_t new_layout = old_journal->get_layout();
   new_journal->set_writeable();
