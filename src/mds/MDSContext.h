@@ -206,6 +206,22 @@ public:
   }
 };
 
+/**
+ * Routes a completion to the reactor queue or finisher without an extra
+ * finisher hop when mds_dispatch_engine=reactor.
+ */
+class MDSCompletionRelay : public Context {
+  MDSRank* mds;
+  Context* inner;
+  void finish(int r) override;
+
+public:
+  MDSCompletionRelay(MDSRank* mds_, Context* c);
+  ~MDSCompletionRelay() override;
+};
+
+Context* mds_wrap_finisher(MDSRank* mds, Context* c);
+
 using MDSGather = C_GatherBase<MDSContext, C_MDSInternalNoop>;
 using MDSGatherBuilder = C_GatherBuilderBase<MDSContext, MDSGather>;
 

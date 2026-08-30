@@ -18,6 +18,7 @@
 #include "common/debug.h"
 #include "mds_lock_debug.h"
 
+#include "common/Finisher.h"
 #include "dispatch/MDSDispatchEngine.h"
 
 #include "MDLog.h"
@@ -162,4 +163,39 @@ void C_IO_Wrapper::complete(int r)
     dout(20) << "C_IO_Wrapper::complete " << r << " sync" << dendl;
     MDSIOContext::complete(r);
   }
+}
+
+MDSCompletionRelay::MDSCompletionRelay(MDSRank* mds_, Context* c) :
+  mds(mds_), inner(c)
+{
+  ceph_assert(mds != nullptr);
+  ceph_assert(inner != nullptr);
+}
+
+MDSCompletionRelay::~MDSCompletionRelay()
+{
+  if (inner != nullptr) {
+    delete inner;
+    inner = nullptr;
+  }
+}
+
+void
+MDSCompletionRelay::finish(int r)
+{
+  Context* c = inner;
+  inner = nullptr;
+  mds->queue_completion(c, r);
+}
+
+Context*
+mds_wrap_finisher(MDSRank* mds, Context* c)
+{
+  if (c == nullptr) {
+    return nullptr;
+  }
+  if (mds->get_dispatch_engine() && mds->get_dispatch_engine()->is_reactor()) {
+    return new MDSCompletionRelay(mds, c);
+  }
+  return new C_OnFinisher(c, mds->finisher);
 }
