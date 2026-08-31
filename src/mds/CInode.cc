@@ -3955,15 +3955,25 @@ void CInode::clear_clientwriteable()
 
 // =============================================
 
-int CInode::encode_inodestat(bufferlist& bl, Session *session,
-			     SnapRealm *dir_realm,
-			     snapid_t snapid,
-			     unsigned max_bytes,
-			     int getattr_caps)
+int
+CInode::encode_inodestat(
+    bufferlist& bl,
+    Session* session,
+    SnapRealm* dir_realm,
+    snapid_t snapid,
+    unsigned max_bytes,
+    int getattr_caps,
+    bool for_readdir)
 {
   client_t client = session->get_client();
   ceph_assert(snapid);
-  
+
+  if (mdcache->mds->logger) {
+    mdcache->mds->logger->inc(l_mds_encode_inodestat);
+    if (for_readdir)
+      mdcache->mds->logger->inc(l_mds_encode_inodestat_readdir);
+  }
+
   bool valid = true;
 
   // pick a version!
@@ -4121,6 +4131,8 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
 
     auto* csp = get_charmap();
     if (csp) {
+      if (mdcache->mds->logger)
+        mdcache->mds->logger->inc(l_mds_encode_inodestat_charmap);
       dout(25) << *csp << dendl;
       auto& opt = optmetadata.get_or_create_opt(kind_t::CHARMAP);
       auto& cs = opt.template get_meta< charmap_md_t >();
@@ -4230,6 +4242,8 @@ int CInode::encode_inodestat(bufferlist& bl, Session *session,
     }
 
     if (issue) {
+      if (mdcache->mds->logger)
+        mdcache->mds->logger->inc(l_mds_encode_inodestat_cap_issue);
       cap->set_last_issue();
       cap->set_last_issue_stamp(ceph_clock_now());
       ecap.caps = issue;
