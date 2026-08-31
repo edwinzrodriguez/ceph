@@ -51,6 +51,22 @@
 
 using namespace std;
 
+void
+Session::link_cap(Capability* cap)
+{
+  session_cache_liveness.hit(1.0);
+  auto [it, inserted] = caps_by_ino.emplace(cap->get_inode()->ino(), cap);
+  ceph_assert(inserted);
+  caps.push_back(&cap->item_session_caps);
+}
+
+void
+Session::unlink_cap(Capability* cap)
+{
+  caps_by_ino.erase(cap->get_inode()->ino());
+  cap->item_session_caps.remove_myself();
+}
+
 void Session::touch_cap(Capability *cap) {
   session_cache_liveness.hit(1.0);
   caps.push_front(&cap->item_session_caps);
@@ -64,10 +80,8 @@ void Session::touch_cap_bottom(Capability *cap) {
 Capability*
 Session::find_cap(inodeno_t ino) const
 {
-  auto it = std::find_if(caps.begin(), caps.end(), [ino](Capability* cap) {
-    return cap->get_inode()->ino() == ino;
-  });
-  return it != caps.end() ? *it : nullptr;
+  auto it = caps_by_ino.find(ino);
+  return it != caps_by_ino.end() ? it->second : nullptr;
 }
 
 void Session::touch_lease(ClientLease *r) {
