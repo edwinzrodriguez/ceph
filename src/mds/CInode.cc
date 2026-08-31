@@ -3344,6 +3344,16 @@ SnapRealm *CInode::find_snaprealm() const
   return cur->snaprealm;
 }
 
+SnapRealm*
+CInode::resolve_snaprealm(SnapRealm* dir_realm, bool under_dir_realm) const
+{
+  if (snaprealm)
+    return snaprealm;
+  if (dir_realm && under_dir_realm)
+    return dir_realm;
+  return find_snaprealm();
+}
+
 void CInode::encode_snap_blob(bufferlist &snapbl)
 {
   if (snaprealm) {
@@ -3910,7 +3920,8 @@ CInode::encode_inodestat(
     snapid_t snapid,
     unsigned max_bytes,
     int getattr_caps,
-    bool for_readdir)
+    bool for_readdir,
+    bool under_dir_realm)
 {
   client_t client = session->get_client();
   ceph_assert(snapid);
@@ -3964,7 +3975,7 @@ CInode::encode_inodestat(
 
   utime_t snap_btime;
   std::map<std::string, std::string> snap_metadata;
-  SnapRealm *realm = find_snaprealm();
+  SnapRealm* realm = resolve_snaprealm(dir_realm, under_dir_realm);
   if (snapid != CEPH_NOSNAP && realm) {
     // add snapshot timestamp vxattr
     map<snapid_t,const SnapInfo*> infomap;
@@ -3999,14 +4010,15 @@ CInode::encode_inodestat(
   version_t version = (oi->version * 2) + is_projected();
 
   Capability *cap = get_client_cap(client);
-  bool pfile = filelock.is_xlocked_by_client(client) || get_loner() == client;
+  client_t loner = get_loner();
+  bool pfile = filelock.is_xlocked_by_client(client) || loner == client;
   //(cap && (cap->issued() & CEPH_CAP_FILE_EXCL));
-  bool pauth = authlock.is_xlocked_by_client(client) || get_loner() == client;
-  bool plink = linklock.is_xlocked_by_client(client) || get_loner() == client;
-  bool pxattr = xattrlock.is_xlocked_by_client(client) || get_loner() == client;
+  bool pauth = authlock.is_xlocked_by_client(client) || loner == client;
+  bool plink = linklock.is_xlocked_by_client(client) || loner == client;
+  bool pxattr = xattrlock.is_xlocked_by_client(client) || loner == client;
 
   bool plocal = versionlock.get_last_wrlock_client() == client;
-  bool ppolicy = policylock.is_xlocked_by_client(client) || get_loner()==client;
+  bool ppolicy = policylock.is_xlocked_by_client(client) || loner == client;
 
   const mempool_inode *any_i = (pfile|pauth|plink|pxattr|plocal) ? pi : oi;
 

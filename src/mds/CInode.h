@@ -830,7 +830,8 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
       snapid_t snapid = CEPH_NOSNAP,
       unsigned max_bytes = 0,
       int getattr_wants = 0,
-      bool for_readdir = false);
+      bool for_readdir = false,
+      bool under_dir_realm = false);
   void encode_cap_message(const ceph::ref_t<MClientCaps> &m, Capability *cap);
 
   SimpleLock* get_lock(int type) override;
@@ -874,6 +875,7 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   void open_snaprealm(bool no_split=false);
   void close_snaprealm(bool no_join=false);
   SnapRealm *find_snaprealm() const;
+  SnapRealm* resolve_snaprealm(SnapRealm* dir_realm, bool under_dir_realm) const;
   void encode_snap(ceph::buffer::list& bl);
   void decode_snap(ceph::buffer::list::const_iterator& p);
 
