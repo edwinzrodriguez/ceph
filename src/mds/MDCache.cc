@@ -8490,10 +8490,7 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
     const std::string_view name = path[depth];
     __u32 name_hash = cur->hash_dentry_name(name);
     frag_t fg = cur->pick_dirfrag(name, name_hash);
-    CDir *curdir = cur->get_dirfrag(fg);
-    if (pdir) {
-      *pdir = curdir;
-    }
+    CDir* curdir = cur->get_dirfrag(fg);
     if (!curdir) {
       if (cur->is_auth()) {
         // parent dir frozen_dir?
@@ -8520,12 +8517,15 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
     }
     ceph_assert(curdir);
 
-    if (mds->logger)
-      mds->logger->inc(l_mds_traverse_damage_check);
-    if (mds->damage_table.is_dirfrag_damaged(curdir)) {
-      dout(4) << "traverse: stopped lookup at dirfrag "
-              << *curdir << "/" << path[depth] << " snap=" << snapid << dendl;
-      return -EIO;
+    const bool check_damage = !mds->damage_table.empty();
+    if (check_damage) {
+      if (mds->logger)
+        mds->logger->inc(l_mds_traverse_damage_check);
+      if (mds->damage_table.is_dirfrag_damaged(curdir)) {
+        dout(4) << "traverse: stopped lookup at dirfrag " << *curdir << "/"
+                << path[depth] << " snap=" << snapid << dendl;
+        return -EIO;
+      }
     }
 
     if (pdir) {
@@ -8557,12 +8557,14 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
 
     // Before doing dirfrag->dn lookup, compare with DamageTable's
     // record of which dentries were unreadable
-    if (mds->logger)
-      mds->logger->inc(l_mds_traverse_damage_check);
-    if (mds->damage_table.is_dentry_damaged(curdir, path[depth], snapid)) {
-      dout(4) << "traverse: stopped lookup at damaged dentry "
-              << *curdir << "/" << path[depth] << " snap=" << snapid << dendl;
-      return -EIO;
+    if (check_damage) {
+      if (mds->logger)
+        mds->logger->inc(l_mds_traverse_damage_check);
+      if (mds->damage_table.is_dentry_damaged(curdir, path[depth], snapid)) {
+        dout(4) << "traverse: stopped lookup at damaged dentry " << *curdir
+                << "/" << path[depth] << " snap=" << snapid << dendl;
+        return -EIO;
+      }
     }
 
     // dentry
@@ -8669,7 +8671,8 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
 	} else {
           dout(7) << "remote link to " << dnl->get_remote_ino() << ", which we don't have" << dendl;
 	  ceph_assert(mdr);  // we shouldn't hit non-primary dentries doing a non-mdr traversal!
-          if (mds->damage_table.is_remote_damaged(dnl->get_remote_ino())) {
+          if (check_damage &&
+              mds->damage_table.is_remote_damaged(dnl->get_remote_ino())) {
             dout(4) << "traverse: remote dentry points to damaged ino "
                     << *dn << dendl;
             return -EIO;
@@ -8774,13 +8777,13 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
 
         // Check DamageTable for missing fragments before trying to fetch
         // this
-        if (mds->damage_table.is_dirfrag_damaged(curdir)) {
+        if (check_damage && mds->damage_table.is_dirfrag_damaged(curdir)) {
           dout(4) << "traverse: damaged dirfrag " << *curdir
                   << ", blocking fetch" << dendl;
           return -EIO;
         }
 
-	// directory isn't complete; reload
+        // directory isn't complete; reload
         dout(7) << "traverse: incomplete dir contents for " << *cur << ", fetching" << dendl;
         touch_inode(cur);
         curdir->fetch(path[depth], snapid, cf.build());
