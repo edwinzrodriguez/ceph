@@ -15,6 +15,7 @@
 
 #include "CInode.h"
 
+#include <mutex>
 #include <string>
 
 #include "common/debug.h"
@@ -54,6 +55,30 @@
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix *_dout << "mds." << mdcache->mds->get_nodeid() << ".cache.ino(" << ino() << ") "
+
+namespace {
+const bufferlist&
+empty_inodestat_optmetadata_encoded()
+{
+  static bufferlist bl;
+  static std::once_flag once;
+  std::call_once(once, []() {
+    decltype(InodeStat::optmetadata) optmetadata;
+    encode(optmetadata, bl);
+  });
+  return bl;
+}
+
+// Fixed-size portion of encode_inodestat (reply-encoding path); see the
+// full field-by-field sum in the getattr (!for_readdir) guard below.
+constexpr unsigned inodestat_readdir_fixed_encode_bound =
+    8 + 8 + 4 + 8 + 8 + sizeof(ceph_mds_reply_cap) + sizeof(ceph_file_layout) +
+    sizeof(ceph_timespec) * 3 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 8 + 8 + 8 +
+    8 + 8 + sizeof(ceph_timespec) + sizeof(__u32) * 2 + sizeof(__u32) +
+    sizeof(ceph_dir_layout) + 4 + 4 + sizeof(version_t) + sizeof(__u32) + 1 +
+    1 + 8 + 8 + 4 + 4 + sizeof(ceph_timespec) + 8 + 8 + sizeof(ceph_timespec) +
+    8 + 4 + 1 + 8 + 64;
+} // anonymous namespace
 
 using namespace std;
 
@@ -4086,39 +4111,48 @@ CInode::encode_inodestat(
   }
 
   bufferlist optmdbl;
-  {
+  if (auto* csp = get_charmap()) {
+    if (mdcache->mds->logger)
+      mdcache->mds->logger->inc(l_mds_encode_inodestat_charmap);
+    dout(25) << *csp << dendl;
     decltype(InodeStat::optmetadata) optmetadata;
     using kind_t = decltype(optmetadata)::optkind_t;
-
-    auto* csp = get_charmap();
-    if (csp) {
-      if (mdcache->mds->logger)
-        mdcache->mds->logger->inc(l_mds_encode_inodestat_charmap);
-      dout(25) << *csp << dendl;
-      auto& opt = optmetadata.get_or_create_opt(kind_t::CHARMAP);
-      auto& cs = opt.template get_meta< charmap_md_t >();
-      cs = *csp;
-      dout(25) << "cs now " << cs << dendl;
-    }
-
+    auto& opt = optmetadata.get_or_create_opt(kind_t::CHARMAP);
+    auto& cs = opt.template get_meta<charmap_md_t>();
+    cs = *csp;
+    dout(25) << "cs now " << cs << dendl;
     encode(optmetadata, optmdbl);
+  } else {
+    optmdbl = empty_inodestat_optmetadata_encoded();
   }
 
   // do we have room?
   if (max_bytes) {
-    unsigned bytes =
-      8 + 8 + 4 + 8 + 8 + sizeof(ceph_mds_reply_cap) +
-      sizeof(struct ceph_file_layout) +
-      sizeof(struct ceph_timespec) * 3 + 4 + // ctime ~ time_warp_seq
-      8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + // size ~ nlink
-      8 + 8 + 8 + 8 + 8 + sizeof(struct ceph_timespec) + // dirstat.nfiles ~ rstat.rctime
-      sizeof(__u32) + sizeof(__u32) * 2 * dirfragtree._splits.size() + // dirfragtree
-      sizeof(__u32) + symlink.length() + // symlink
-      sizeof(struct ceph_dir_layout) // dir_layout
-      + 4 + file_i->fscrypt_auth.size() // len + data
-      + 4 + file_i->fscrypt_file.size() // len + data
-      + optmdbl.length()
-      ;
+    unsigned bytes;
+    if (for_readdir) {
+      bytes = inodestat_readdir_fixed_encode_bound + optmdbl.length() +
+              inline_data.length() + symlink.length() + layout.pool_ns.size() +
+              file_i->fscrypt_auth.size() + file_i->fscrypt_file.size() +
+              sizeof(__u32) * 2 * dirfragtree._splits.size();
+      bytes += sizeof(__u32); // snap_metadata map len
+      for (const auto& p : snap_metadata) {
+        bytes += sizeof(__u32) * 2 + p.first.length() + p.second.length();
+      }
+    } else {
+      bytes = 8 + 8 + 4 + 8 + 8 + sizeof(ceph_mds_reply_cap) +
+              sizeof(struct ceph_file_layout) +
+              sizeof(struct ceph_timespec) * 3 + 4 + // ctime ~ time_warp_seq
+              8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + // size ~ nlink
+              8 + 8 + 8 + 8 + 8 +
+              sizeof(struct ceph_timespec) + // dirstat.nfiles ~ rstat.rctime
+              sizeof(__u32) +
+              sizeof(__u32) * 2 * dirfragtree._splits.size() + // dirfragtree
+              sizeof(__u32) + symlink.length() + // symlink
+              sizeof(struct ceph_dir_layout) // dir_layout
+              + 4 + file_i->fscrypt_auth.size() // len + data
+              + 4 + file_i->fscrypt_file.size() // len + data
+              + optmdbl.length();
+    }
 
     if (xattr_version) {
       bytes += sizeof(__u32) + sizeof(__u32); // xattr buffer len + number entries
@@ -4129,11 +4163,13 @@ CInode::encode_inodestat(
     } else {
       bytes += sizeof(__u32); // xattr buffer len
     }
-    bytes +=
-      sizeof(version_t) + sizeof(__u32) + inline_data.length() + // inline data
-      1 + 1 + 8 + 8 + 4 + // quota
-      4 + layout.pool_ns.size() + // pool ns
-      sizeof(struct ceph_timespec) + 8; // btime + change_attr
+    if (!for_readdir) {
+      bytes += sizeof(version_t) + sizeof(__u32) +
+               inline_data.length() + // inline data
+               1 + 1 + 8 + 8 + 4 + // quota
+               4 + layout.pool_ns.size() + // pool ns
+               sizeof(struct ceph_timespec) + 8; // btime + change_attr
+    }
 
     if (bytes > max_bytes)
       return -ENOSPC;
