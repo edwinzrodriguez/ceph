@@ -8485,6 +8485,10 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
     }
 
     // open dir
+    if (mds->logger)
+      mds->logger->inc(l_mds_traverse_component);
+    if (!cur->dirfragtree.empty() && mds->logger)
+      mds->logger->inc(l_mds_traverse_double_hash);
     frag_t fg = cur->pick_dirfrag(path[depth]);
     CDir *curdir = cur->get_dirfrag(fg);
     if (pdir) {
@@ -8516,6 +8520,8 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
     }
     ceph_assert(curdir);
 
+    if (mds->logger)
+      mds->logger->inc(l_mds_traverse_damage_check);
     if (mds->damage_table.is_dirfrag_damaged(curdir)) {
       dout(4) << "traverse: stopped lookup at dirfrag "
               << *curdir << "/" << path[depth] << " snap=" << snapid << dendl;
@@ -8551,6 +8557,8 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
 
     // Before doing dirfrag->dn lookup, compare with DamageTable's
     // record of which dentries were unreadable
+    if (mds->logger)
+      mds->logger->inc(l_mds_traverse_damage_check);
     if (mds->damage_table.is_dentry_damaged(curdir, path[depth], snapid)) {
       dout(4) << "traverse: stopped lookup at damaged dentry "
               << *curdir << "/" << path[depth] << " snap=" << snapid << dendl;
@@ -8560,6 +8568,11 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
     // dentry
     CDentry *dn = curdir->lookup(path[depth], snapid);
     if (dn) {
+      if (mds->logger) {
+        mds->logger->inc(l_mds_traverse_dentry_hit);
+        if (!dn->is_projected())
+          mds->logger->inc(l_mds_traverse_linkage_plain_eligible);
+      }
       if (dn->state_test(CDentry::STATE_PURGING))
 	return -ENOENT;
 
@@ -8592,9 +8605,11 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
 	  }
 	  lov.add_rdlock(&dn->lock);
 	}
-	if (!mds->locker->acquire_locks(mdr, lov)) {
-	  return 1;
-	}
+        if (mds->logger)
+          mds->logger->inc(l_mds_traverse_acquire_locks);
+        if (!mds->locker->acquire_locks(mdr, lov)) {
+          return 1;
+        }
       } else if (!path_locked &&
 		 !dn->lock.can_read(client) &&
 		 !(dn->lock.is_xlocked() && dn->lock.is_xlocked_by(mdr))) {
@@ -8652,10 +8667,13 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
       if (rdlock_snap && !(want_dentry && !want_inode && depth == path.depth() - 1)) {
 	lov.clear();
 	lov.add_rdlock(&cur->snaplock);
-	if (!mds->locker->acquire_locks(mdr, lov)) {
-	  dout(10) << "traverse: failed to rdlock " << cur->snaplock << " " << *cur << dendl;
-	  return 1;
-	}
+        if (mds->logger)
+          mds->logger->inc(l_mds_traverse_acquire_locks);
+        if (!mds->locker->acquire_locks(mdr, lov)) {
+          dout(10) << "traverse: failed to rdlock " << cur->snaplock << " "
+                   << *cur << dendl;
+          return 1;
+        }
       }
 
       if (depth == path.depth() - 1)
@@ -8715,11 +8733,13 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
 		}
 		lov.add_rdlock(&dn->lock);
 	      }
-	      if (!mds->locker->acquire_locks(mdr, lov)) {
-		return 1;
-	      }
-	    }
-	  }
+              if (mds->logger)
+                mds->logger->inc(l_mds_traverse_acquire_locks);
+              if (!mds->locker->acquire_locks(mdr, lov)) {
+                return 1;
+              }
+            }
+          }
 	  if (dn) {
 	    pdnvec->push_back(dn);
 	    if (want_dentry)

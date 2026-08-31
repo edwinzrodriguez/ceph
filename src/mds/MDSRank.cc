@@ -3840,6 +3840,84 @@ void MDSRank::create_logger()
     mds_plb.add_u64_counter(l_mdss_handle_inode_file_caps, "handle_inode_file_caps",
                            "Inter mds caps msg", "hifc", PerfCountersBuilder::PRIO_INTERESTING);
 
+    // hot-path optimization counters (baseline + future phases)
+    mds_plb.add_u64_counter(
+        l_mds_traverse_component, "traverse_component",
+        "Path traverse components walked", "trcp",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_traverse_dentry_hit, "traverse_dentry_hit",
+        "Path traverse dentry cache hits", "trdh",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_traverse_double_hash, "traverse_double_hash",
+        "Path traverse dentry name hashed twice", "tr2h",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_traverse_acquire_locks, "traverse_acquire_locks",
+        "Path traverse acquire_locks calls", "tral",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_traverse_acquire_locks_merged, "traverse_acquire_locks_merged",
+        "Path traverse merged acquire_locks calls", "trmg",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_traverse_linkage_plain_eligible,
+        "traverse_linkage_plain_eligible",
+        "Path traverse dentries eligible for plain linkage", "trle",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_traverse_damage_check, "traverse_damage_check",
+        "Path traverse damage table lookups", "trdc",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_cap_release, "cap_release", "Client cap release operations",
+        "cprl", PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_cap_release_ignored, "cap_release_ignored",
+        "Client cap releases ignored (stale/missing)", "cpri",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_cap_release_stale_seq, "cap_release_stale_seq",
+        "Client cap releases confirming old issue seq", "cprs",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_cap_release_remove, "cap_release_remove",
+        "Client cap releases removing capability", "cprr",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_cap_release_eval, "cap_release_eval",
+        "Client cap release lock eval invocations", "cpre",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_cap_release_eval_skipped, "cap_release_eval_skipped",
+        "Client cap release eval skipped (not notable)", "cpsk",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_cap_release_eval_batched, "cap_release_eval_batched",
+        "Client cap release batched eval invocations", "cpbt",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_encode_inodestat, "encode_inodestat",
+        "Inode stat encodes for client reply", "eist",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_encode_inodestat_readdir, "encode_inodestat_readdir",
+        "Inode stat encodes from readdir", "eird",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_encode_inodestat_cap_issue, "encode_inodestat_cap_issue",
+        "Inode stat encodes that issued caps", "eisc",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_encode_inodestat_charmap, "encode_inodestat_charmap",
+        "Inode stat encodes including charmap", "eich",
+        PerfCountersBuilder::PRIO_USEFUL);
+    mds_plb.add_u64_counter(
+        l_mds_encode_inodestat_fast, "encode_inodestat_fast",
+        "Inode stat encodes using readdir fast path", "eisf",
+        PerfCountersBuilder::PRIO_USEFUL);
+
     // useful dir/inode/subtree stats
     mds_plb.set_prio_default(PerfCountersBuilder::PRIO_USEFUL);
     mds_plb.add_u64(l_mds_root_rfiles, "root_rfiles", "root inode rfiles");
