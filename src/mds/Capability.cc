@@ -165,7 +165,7 @@ Capability::Capability(CInode *i, Session *s, uint64_t id) :
   inode(i), session(s), cap_id(id)
 {
   if (session) {
-    session->touch_cap_bottom(this);
+    session->link_cap(this);
     cap_gen = session->get_cap_gen();
     if (session->is_stale())
       --cap_gen; // not valid

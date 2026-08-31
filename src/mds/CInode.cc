@@ -3600,8 +3600,8 @@ void CInode::remove_client_cap(client_t client)
   auto it = client_caps.find(client);
   ceph_assert(it != client_caps.end());
   Capability *cap = &it->second;
-  
-  cap->item_session_caps.remove_myself();
+
+  cap->get_session()->unlink_cap(cap);
   cap->item_revoking_caps.remove_myself();
   cap->item_client_revoking_caps.remove_myself();
   containing_realm->remove_cap(client, cap);
