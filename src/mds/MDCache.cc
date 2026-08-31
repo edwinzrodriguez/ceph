@@ -8568,15 +8568,18 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
     // dentry
     CDentry* dn = curdir->lookup(name, snapid, name_hash);
     if (dn) {
+      const bool use_projected_linkage = dn->use_projected(client, mdr);
       if (mds->logger) {
         mds->logger->inc(l_mds_traverse_dentry_hit);
-        if (!dn->is_projected())
+        if (!use_projected_linkage)
           mds->logger->inc(l_mds_traverse_linkage_plain_eligible);
       }
       if (dn->state_test(CDentry::STATE_PURGING))
 	return -ENOENT;
 
-      CDentry::linkage_t *dnl = dn->get_projected_linkage();
+      CDentry::linkage_t* dnl = use_projected_linkage
+                                    ? dn->get_projected_linkage()
+                                    : dn->get_linkage();
       // If an auth check was deferred before and the target inode is found
       // not to exist now, do the auth check here if necessary.
       if (want_auth && want_dentry && want_inode && depth == path.depth() - 1 &&
@@ -8655,9 +8658,11 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
                     << *dn << dendl;
             return -EIO;
           }
-          open_remote_dentry(dn, true, cf.build(),
-			     (path_locked && depth == path.depth() - 1));
-	  if (mds->logger) mds->logger->inc(l_mds_traverse_remote_ino);
+          open_remote_dentry(
+              dn, use_projected_linkage, cf.build(),
+              (path_locked && depth == path.depth() - 1));
+          if (mds->logger)
+            mds->logger->inc(l_mds_traverse_remote_ino);
           return 1;
         }
       }
