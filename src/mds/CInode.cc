@@ -81,8 +81,7 @@ constexpr unsigned inodestat_readdir_fixed_encode_bound =
     8 + 4 + 1 + 8 + 64;
 
 bool
-inodestat_readdir_fast_eligible(
-    CInode* in,
+inodestat_readdir_partial_fast(
     bool for_readdir,
     snapid_t snapid,
     int getattr_caps,
@@ -90,7 +89,6 @@ inodestat_readdir_fast_eligible(
     bool valid,
     bool no_caps,
     Capability* cap,
-    SnapRealm* dir_realm,
     const mempool_inode* file_i,
     const mempool_inode* xattr_i)
 {
@@ -102,14 +100,6 @@ inodestat_readdir_fast_eligible(
     return false;
   if (!no_caps && !cap)
     return false;
-  if (cap && cap->is_new() && !dir_realm)
-    return false;
-  if (!no_caps && cap) {
-    int likes = in->get_caps_liked();
-    int allowed = in->get_caps_allowed_for_client(session, cap, file_i);
-    if ((cap->wanted() | likes) & allowed)
-      return false;
-  }
   if (file_i->inline_data.version != CEPH_INLINE_NONE) {
     if (!cap && !no_caps)
       return false;
@@ -4173,20 +4163,18 @@ CInode::encode_inodestat(
   const mempool_inode* link_i = plink ? pi : oi;
   const mempool_inode* xattr_i = pxattr ? pi : oi;
 
-  const bool readdir_fast = inodestat_readdir_fast_eligible(
-      this, for_readdir, snapid, getattr_caps, session, valid, no_caps, cap,
-      dir_realm, file_i, xattr_i);
-  if (readdir_fast && mdcache->mds->logger) {
+  const bool readdir_partial_fast = inodestat_readdir_partial_fast(
+      for_readdir, snapid, getattr_caps, session, valid, no_caps, cap, file_i,
+      xattr_i);
+  if (readdir_partial_fast && mdcache->mds->logger)
     mdcache->mds->logger->inc(l_mds_encode_inodestat_fast);
-  }
 
   // inline data
   version_t inline_version = 0;
   bufferlist inline_data;
-  if (readdir_fast) {
-    if (file_i->inline_data.version == CEPH_INLINE_NONE) {
+  if (readdir_partial_fast) {
+    if (file_i->inline_data.version == CEPH_INLINE_NONE)
       inline_version = CEPH_INLINE_NONE;
-    }
   } else if (file_i->inline_data.version == CEPH_INLINE_NONE) {
     inline_version = CEPH_INLINE_NONE;
   } else if (
@@ -4199,7 +4187,7 @@ CInode::encode_inodestat(
   }
 
   // nest (do same as file... :/)
-  if (cap && !readdir_fast) {
+  if (cap && !readdir_partial_fast) {
     cap->last_rbytes = file_i->rstat.rbytes;
     cap->last_rsize = file_i->rstat.rsize();
   }
@@ -4207,7 +4195,7 @@ CInode::encode_inodestat(
   using ceph::encode;
   // xattr
   version_t xattr_version;
-  if (readdir_fast) {
+  if (readdir_partial_fast) {
     xattr_version = 0;
   } else if (
       (!cap && !no_caps) ||
@@ -4220,7 +4208,8 @@ CInode::encode_inodestat(
     xattr_version = 0;
   }
 
-  bufferlist optmdbl;
+  bufferlist optmdbl_owned;
+  const bufferlist* optmdbl = &empty_inodestat_optmetadata_encoded();
   if (auto* csp = get_charmap(); csp || has_quarantined()) {
     decltype(InodeStat::optmetadata) optmetadata;
     using kind_t = decltype(optmetadata)::optkind_t;
@@ -4238,16 +4227,15 @@ CInode::encode_inodestat(
       auto& qs = opt.template get_meta<quarantine_md_t>();
       dout(25) << "qtine now " << qs << dendl;
     }
-    encode(optmetadata, optmdbl);
-  } else {
-    optmdbl = empty_inodestat_optmetadata_encoded();
+    encode(optmetadata, optmdbl_owned);
+    optmdbl = &optmdbl_owned;
   }
 
   // do we have room?
   if (max_bytes) {
     unsigned bytes;
     if (for_readdir) {
-      bytes = inodestat_readdir_fixed_encode_bound + optmdbl.length() +
+      bytes = inodestat_readdir_fixed_encode_bound + optmdbl->length() +
               inline_data.length() + symlink.length() + layout.pool_ns.size() +
               file_i->fscrypt_auth.size() + file_i->fscrypt_file.size() +
               sizeof(__u32) * 2 * dirfragtree._splits.size();
@@ -4268,7 +4256,7 @@ CInode::encode_inodestat(
               sizeof(struct ceph_dir_layout) // dir_layout
               + 4 + file_i->fscrypt_auth.size() // len + data
               + 4 + file_i->fscrypt_file.size() // len + data
-              + optmdbl.length();
+              + optmdbl->length();
     }
 
     if (xattr_version) {
@@ -4322,52 +4310,51 @@ CInode::encode_inodestat(
     ecap.mseq = 0;
     ecap.realm = 0;
   } else {
-    if (!readdir_fast) {
-      if (!no_caps && !cap) {
-        // add a new cap
-        cap = add_client_cap(client, session, realm);
-        if (is_auth())
-          choose_ideal_loner();
-      }
+    bool cap_mutated = false;
+    if (!no_caps && !cap) {
+      // add a new cap
+      cap = add_client_cap(client, session, realm);
+      if (is_auth())
+        choose_ideal_loner();
+      cap_mutated = true;
+    }
 
-      int issue = 0;
-      if (!no_caps && cap) {
-        int likes = get_caps_liked();
-        int allowed = get_caps_allowed_for_client(session, cap, file_i);
-        issue = (cap->wanted() | likes) & allowed;
-        cap->issue_norevoke(issue, true);
-        issue = cap->pending();
-        dout(10) << "encode_inodestat issuing " << ccap_string(issue) << " seq "
-                 << cap->get_last_seq() << dendl;
-      } else if (cap && cap->is_new() && !dir_realm) {
-        // alway issue new caps to client, otherwise the caps get lost
-        ceph_assert(cap->is_stale());
-        ceph_assert(!cap->pending());
-        issue = CEPH_CAP_PIN;
-        cap->issue_norevoke(issue, true);
-        dout(10) << "encode_inodestat issuing " << ccap_string(issue) << " seq "
-                 << cap->get_last_seq() << "(stale&new caps)" << dendl;
+    int issue = 0;
+    if (!no_caps && cap) {
+      int likes = get_caps_liked();
+      int allowed = get_caps_allowed_for_client(session, cap, file_i);
+      int issue_desired = (cap->wanted() | likes) & allowed;
+      if (issue_desired & ~cap->pending()) {
+        cap->issue_norevoke(issue_desired, true);
+        cap_mutated = true;
       }
+      issue = cap->pending();
+      dout(10) << "encode_inodestat issuing " << ccap_string(issue) << " seq "
+               << cap->get_last_seq() << dendl;
+    } else if (cap && cap->is_new() && !dir_realm) {
+      // alway issue new caps to client, otherwise the caps get lost
+      ceph_assert(cap->is_stale());
+      ceph_assert(!cap->pending());
+      issue = CEPH_CAP_PIN;
+      cap->issue_norevoke(issue, true);
+      cap_mutated = true;
+      dout(10) << "encode_inodestat issuing " << ccap_string(issue) << " seq "
+               << cap->get_last_seq() << "(stale&new caps)" << dendl;
+    }
 
-      if (issue) {
+    if (issue) {
+      if (cap_mutated) {
         if (mdcache->mds->logger)
           mdcache->mds->logger->inc(l_mds_encode_inodestat_cap_issue);
         cap->set_last_issue();
         cap->set_last_issue_stamp(ceph_clock_now());
-        ecap.caps = issue;
-        ecap.wanted = cap->wanted();
-        ecap.cap_id = cap->get_cap_id();
-        ecap.seq = cap->get_last_seq();
-        ecap.mseq = cap->get_mseq();
-        ecap.realm = realm->inode->ino();
-      } else {
-        ecap.cap_id = 0;
-        ecap.caps = 0;
-        ecap.seq = 0;
-        ecap.mseq = 0;
-        ecap.realm = 0;
-        ecap.wanted = 0;
       }
+      ecap.caps = issue;
+      ecap.wanted = cap->wanted();
+      ecap.cap_id = cap->get_cap_id();
+      ecap.seq = cap->get_last_seq();
+      ecap.mseq = cap->get_mseq();
+      ecap.realm = realm->inode->ino();
     } else {
       ecap.cap_id = 0;
       ecap.caps = 0;
@@ -4382,7 +4369,7 @@ CInode::encode_inodestat(
 	   << " seq " << ecap.seq << " mseq " << ecap.mseq
 	   << " xattrv " << xattr_version << dendl;
 
-  if (!readdir_fast && inline_data.length() && cap) {
+  if (!readdir_partial_fast && inline_data.length() && cap) {
     if ((cap->pending() | getattr_caps) & CEPH_CAP_FILE_SHARED) {
       dout(10) << "including inline version " << inline_version << dendl;
       cap->client_inline_version = inline_version;
@@ -4394,7 +4381,7 @@ CInode::encode_inodestat(
   }
 
   // include those xattrs?
-  if (!readdir_fast && xattr_version && cap) {
+  if (!readdir_partial_fast && xattr_version && cap) {
     if ((cap->pending() | getattr_caps) & CEPH_CAP_XATTR_SHARED) {
       dout(10) << "including xattrs version " << xattr_version << dendl;
       cap->client_xattr_version = xattr_version;
@@ -4494,7 +4481,7 @@ CInode::encode_inodestat(
       !file_i->fscrypt_auth.empty(),
       file_i->fscrypt_auth,
       file_i->fscrypt_file);
-    encode_nohead(optmdbl, bl);
+    encode_nohead(*optmdbl, bl);
     encode(get_subvolume_id(), bl);
     // encode inodestat
     ENCODE_FINISH(bl);
