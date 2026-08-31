@@ -8586,6 +8586,10 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
 	  dnl->is_null() && (r = maybe_request_forward_to_auth(mdr, cf, dn)) != 0)
 	return r;
 
+      const bool want_snaplock = rdlock_snap && !(want_dentry && !want_inode &&
+                                                  depth == path.depth() - 1);
+      bool merge_snaplock = false;
+
       if (rdlock_path) {
 	lov.clear();
 	// do not xlock the tail dentry if target inode exists and caller wants it
@@ -8608,8 +8612,20 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
 	  }
 	  lov.add_rdlock(&dn->lock);
 	}
-        if (mds->logger)
+        if (!dnl->is_null() && want_snaplock) {
+          CInode* snap_in = dnl->get_inode();
+          if (!snap_in && dnl->is_remote())
+            snap_in = get_inode(dnl->get_remote_ino());
+          if (snap_in) {
+            lov.add_rdlock(&snap_in->snaplock);
+            merge_snaplock = true;
+          }
+        }
+        if (mds->logger) {
           mds->logger->inc(l_mds_traverse_acquire_locks);
+          if (merge_snaplock)
+            mds->logger->inc(l_mds_traverse_acquire_locks_merged);
+        }
         if (!mds->locker->acquire_locks(mdr, lov)) {
           return 1;
         }
@@ -8669,9 +8685,9 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
 
       cur = in;
 
-      if (rdlock_snap && !(want_dentry && !want_inode && depth == path.depth() - 1)) {
-	lov.clear();
-	lov.add_rdlock(&cur->snaplock);
+      if (want_snaplock && !merge_snaplock) {
+        lov.clear();
+        lov.add_rdlock(&cur->snaplock);
         if (mds->logger)
           mds->logger->inc(l_mds_traverse_acquire_locks);
         if (!mds->locker->acquire_locks(mdr, lov)) {
