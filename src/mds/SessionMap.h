@@ -302,6 +302,7 @@ public:
 
   void touch_cap(Capability *cap);
   void touch_cap_bottom(Capability *cap);
+  Capability* find_cap(inodeno_t ino) const;
 
   void touch_lease(ClientLease *r);
 
