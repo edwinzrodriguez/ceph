@@ -300,6 +300,8 @@ public:
     cap_acquisition.hit(count);
   }
 
+  void link_cap(Capability* cap);
+  void unlink_cap(Capability* cap);
   void touch_cap(Capability *cap);
   void touch_cap_bottom(Capability *cap);
   Capability* find_cap(inodeno_t ino) const;
@@ -438,6 +440,7 @@ public:
   interval_set<inodeno_t> delegated_inos; // hand these out to client
 
   xlist<Capability*> caps;     // inodes with caps; front=most recently used
+  std::unordered_map<inodeno_t, Capability*> caps_by_ino;
   xlist<ClientLease*> leases;  // metadata leases to clients
   time last_cap_renew = clock::zero();
   time last_seen = clock::zero();
