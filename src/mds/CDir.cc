@@ -320,10 +320,11 @@ void CDir::adjust_num_inodes_with_caps(int d)
   ceph_assert(num_inodes_with_caps >= 0);
 }
 
-CDentry *CDir::lookup(std::string_view name, snapid_t snap)
-{ 
+CDentry*
+CDir::lookup(std::string_view name, snapid_t snap, __u32 name_hash)
+{
   dout(20) << "lookup (" << name << ", '" << snap << "')" << dendl;
-  auto iter = items.lower_bound(dentry_key_t(snap, name, inode->hash_dentry_name(name)));
+  auto iter = items.lower_bound(dentry_key_t(snap, name, name_hash));
   if (iter == items.end())
     return 0;
   if (iter->second->get_name() == name &&
@@ -334,6 +335,12 @@ CDentry *CDir::lookup(std::string_view name, snapid_t snap)
   }
   dout(20) << "  miss -> " << iter->first << dendl;
   return 0;
+}
+
+CDentry*
+CDir::lookup(std::string_view name, snapid_t snap)
+{
+  return lookup(name, snap, inode->hash_dentry_name(name));
 }
 
 CDentry *CDir::lookup_exact_snap(std::string_view name, snapid_t last) {

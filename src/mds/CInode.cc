@@ -715,8 +715,16 @@ frag_t InodeStoreBase::pick_dirfrag(std::string_view dn)
   if (dirfragtree.empty())
     return frag_t();          // avoid the string hash if we can.
 
-  __u32 h = hash_dentry_name(dn);
-  return dirfragtree[h];
+  return pick_dirfrag(dn, hash_dentry_name(dn));
+}
+
+frag_t
+InodeStoreBase::pick_dirfrag(std::string_view dn, __u32 hash)
+{
+  if (dirfragtree.empty())
+    return frag_t();
+
+  return dirfragtree[hash];
 }
 
 std::pair<bool, std::vector<CDir*>> CInode::get_dirfrags_under(frag_t fg)
