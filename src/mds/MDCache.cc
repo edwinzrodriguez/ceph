@@ -8487,9 +8487,9 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
     // open dir
     if (mds->logger)
       mds->logger->inc(l_mds_traverse_component);
-    if (!cur->dirfragtree.empty() && mds->logger)
-      mds->logger->inc(l_mds_traverse_double_hash);
-    frag_t fg = cur->pick_dirfrag(path[depth]);
+    const std::string_view name = path[depth];
+    __u32 name_hash = cur->hash_dentry_name(name);
+    frag_t fg = cur->pick_dirfrag(name, name_hash);
     CDir *curdir = cur->get_dirfrag(fg);
     if (pdir) {
       *pdir = curdir;
@@ -8566,7 +8566,7 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
     }
 
     // dentry
-    CDentry *dn = curdir->lookup(path[depth], snapid);
+    CDentry* dn = curdir->lookup(name, snapid, name_hash);
     if (dn) {
       if (mds->logger) {
         mds->logger->inc(l_mds_traverse_dentry_hit);
