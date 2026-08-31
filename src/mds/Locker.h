@@ -261,6 +261,7 @@ protected:
       uint64_t cap_id,
       ceph_seq_t mseq,
       ceph_seq_t seq,
+      Session* session = nullptr,
       CapReleaseEvalBatch* batch = nullptr);
   void flush_cap_release_eval_batch(CapReleaseEvalBatch& batch);
   void caps_tick();

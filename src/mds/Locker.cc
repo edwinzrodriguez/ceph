@@ -4270,7 +4270,7 @@ void Locker::handle_client_cap_release(const cref_t<MClientCapRelease> &m)
   for (const auto &cap : m->caps) {
     _do_cap_release(
         client, inodeno_t((uint64_t)cap.ino), cap.cap_id, cap.migrate_seq,
-        cap.issue_seq, &batch);
+        cap.issue_seq, session, &batch);
   }
   flush_cap_release_eval_batch(batch);
 
@@ -4294,6 +4294,15 @@ public:
   }
 };
 
+namespace {
+bool
+cap_release_gather_needed(CInode* in)
+{
+  return !in->filelock.is_stable() || !in->authlock.is_stable() ||
+         !in->linklock.is_stable() || !in->xattrlock.is_stable();
+}
+} // anonymous namespace
+
 void
 Locker::_do_cap_release(
     client_t client,
@@ -4301,19 +4310,29 @@ Locker::_do_cap_release(
     uint64_t cap_id,
     ceph_seq_t mseq,
     ceph_seq_t seq,
+    Session* session,
     CapReleaseEvalBatch* batch)
 {
   if (mds->logger)
     mds->logger->inc(l_mds_cap_release);
 
-  CInode *in = mdcache->get_inode(ino);
+  CInode* in = nullptr;
+  Capability* cap = nullptr;
+  if (session) {
+    cap = session->find_cap(ino);
+    if (cap)
+      in = cap->get_inode();
+  }
+  if (!in)
+    in = mdcache->get_inode(ino);
   if (!in) {
     if (mds->logger)
       mds->logger->inc(l_mds_cap_release_ignored);
     dout(7) << "_do_cap_release missing ino " << ino << dendl;
     return;
   }
-  Capability *cap = in->get_client_cap(client);
+  if (!cap)
+    cap = in->get_client_cap(client);
   if (!cap) {
     if (mds->logger)
       mds->logger->inc(l_mds_cap_release_ignored);
@@ -4345,7 +4364,9 @@ Locker::_do_cap_release(
       mds->logger->inc(l_mds_cap_release_stale_seq);
     dout(7) << " issue_seq " << seq << " < " << cap->get_last_issue() << dendl;
     // clean out any old revoke history
-    cap->clean_revoke_from(seq);
+    const bool revoke_changed = cap->clean_revoke_from(seq);
+    if (!revoke_changed && !cap_release_gather_needed(in))
+      return;
     if (batch) {
       batch->gather.insert(in);
       batch->deferred_eval_ops++;

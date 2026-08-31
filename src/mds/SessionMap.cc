@@ -15,6 +15,8 @@
 
 #include "SessionMap.h"
 
+#include <algorithm>
+
 #include "common/debug.h"
 
 #include "common/DecayCounter.h"
@@ -57,6 +59,15 @@ void Session::touch_cap(Capability *cap) {
 void Session::touch_cap_bottom(Capability *cap) {
   session_cache_liveness.hit(1.0);
   caps.push_back(&cap->item_session_caps);
+}
+
+Capability*
+Session::find_cap(inodeno_t ino) const
+{
+  auto it = std::find_if(caps.begin(), caps.end(), [ino](Capability* cap) {
+    return cap->get_inode()->ino() == ino;
+  });
+  return it != caps.end() ? *it : nullptr;
 }
 
 void Session::touch_lease(ClientLease *r) {
