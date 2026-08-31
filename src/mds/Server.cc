@@ -5246,7 +5246,9 @@ void Server::handle_client_readdir(const MDRequestRef& mdr)
 
     // inode
     dout(12) << "including inode in " << *in << " snap " << snapid << dendl;
-    int r = in->encode_inodestat(dnbl, mdr->session, realm, snapid, bytes_left - (int)dnbl.length());
+    int r = in->encode_inodestat(
+        dnbl, mdr->session, realm, snapid, bytes_left - (int)dnbl.length(), 0,
+        true);
     if (r < 0) {
       // chop off dn->name, lease
       dout(10) << " ran out of room, stopping at " << start_len << " < " << bytes_left << dendl;
@@ -11436,7 +11438,9 @@ void Server::handle_client_lssnap(const MDRequestRef& mdr)
     mds->locker->encode_lease(dnbl, mdr->session->info, e);
     dout(20) << "encode_infinite_lease" << dendl;
 
-    int r = diri->encode_inodestat(dnbl, mdr->session, realm, p->first, max_bytes - (int)dnbl.length());
+    int r = diri->encode_inodestat(
+        dnbl, mdr->session, realm, p->first, max_bytes - (int)dnbl.length(), 0,
+        true);
     if (r < 0) {
       bufferlist keep;
       keep.substr_of(dnbl, 0, start_len);
@@ -12398,7 +12402,9 @@ void Server::_readdir_diff(
 
       // inode
       dout(10) << "inc inode " << *in << " snap "	<< effective_snapid << dendl;
-      int r = in->encode_inodestat(dnbl, mdr->session, realm, effective_snapid, bytes_left - (int)dnbl.length());
+      int r = in->encode_inodestat(
+          dnbl, mdr->session, realm, effective_snapid,
+          bytes_left - (int)dnbl.length(), 0, true);
       if (r < 0) {
 	// chop off dn->name, lease
 	dout(10) << " ran out of room, stopping at "

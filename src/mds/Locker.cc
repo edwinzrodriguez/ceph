@@ -4293,23 +4293,34 @@ public:
 void Locker::_do_cap_release(client_t client, inodeno_t ino, uint64_t cap_id,
 			     ceph_seq_t mseq, ceph_seq_t seq)
 {
+  if (mds->logger)
+    mds->logger->inc(l_mds_cap_release);
+
   CInode *in = mdcache->get_inode(ino);
   if (!in) {
+    if (mds->logger)
+      mds->logger->inc(l_mds_cap_release_ignored);
     dout(7) << "_do_cap_release missing ino " << ino << dendl;
     return;
   }
   Capability *cap = in->get_client_cap(client);
   if (!cap) {
+    if (mds->logger)
+      mds->logger->inc(l_mds_cap_release_ignored);
     dout(7) << "_do_cap_release no cap for client" << client << " on "<< *in << dendl;
     return;
   }
 
   dout(7) << "_do_cap_release for client." << client << " on "<< *in << dendl;
   if (cap->get_cap_id() != cap_id) {
+    if (mds->logger)
+      mds->logger->inc(l_mds_cap_release_ignored);
     dout(7) << " capid " << cap_id << " != " << cap->get_cap_id() << ", ignore" << dendl;
     return;
   }
   if (ceph_seq_cmp(mseq, cap->get_mseq()) < 0) {
+    if (mds->logger)
+      mds->logger->inc(l_mds_cap_release_ignored);
     dout(7) << " mseq " << mseq << " < " << cap->get_mseq() << ", ignore" << dendl;
     return;
   }
@@ -4320,12 +4331,18 @@ void Locker::_do_cap_release(client_t client, inodeno_t ino, uint64_t cap_id,
     return;
   }
   if (seq < cap->get_last_issue()) {
+    if (mds->logger)
+      mds->logger->inc(l_mds_cap_release_stale_seq);
     dout(7) << " issue_seq " << seq << " < " << cap->get_last_issue() << dendl;
     // clean out any old revoke history
     cap->clean_revoke_from(seq);
+    if (mds->logger)
+      mds->logger->inc(l_mds_cap_release_eval);
     eval_cap_gather(in);
     return;
   }
+  if (mds->logger)
+    mds->logger->inc(l_mds_cap_release_remove);
   remove_client_cap(in, cap);
 }
 
@@ -4344,8 +4361,11 @@ void Locker::remove_client_cap(CInode *in, Capability *cap, bool kill)
 
   bool notable = cap->is_notable();
   in->remove_client_cap(client);
-  if (!notable)
+  if (!notable) {
+    if (mds->logger)
+      mds->logger->inc(l_mds_cap_release_eval_skipped);
     return;
+  }
 
   if (in->is_auth()) {
     // make sure we clear out the client byte range
@@ -4359,7 +4379,9 @@ void Locker::remove_client_cap(CInode *in, Capability *cap, bool kill)
   } else {
     request_inode_file_caps(in);
   }
-  
+
+  if (mds->logger)
+    mds->logger->inc(l_mds_cap_release_eval);
   try_eval(in, CEPH_CAP_LOCKS);
 }
 
