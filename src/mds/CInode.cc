@@ -78,6 +78,47 @@ constexpr unsigned inodestat_readdir_fixed_encode_bound =
     sizeof(ceph_dir_layout) + 4 + 4 + sizeof(version_t) + sizeof(__u32) + 1 +
     1 + 8 + 8 + 4 + 4 + sizeof(ceph_timespec) + 8 + 8 + sizeof(ceph_timespec) +
     8 + 4 + 1 + 8 + 64;
+
+bool
+inodestat_readdir_fast_eligible(
+    CInode* in,
+    bool for_readdir,
+    snapid_t snapid,
+    int getattr_caps,
+    Session* session,
+    bool valid,
+    bool no_caps,
+    Capability* cap,
+    SnapRealm* dir_realm,
+    const mempool_inode* file_i,
+    const mempool_inode* xattr_i)
+{
+  if (!for_readdir || snapid != CEPH_NOSNAP || getattr_caps != 0)
+    return false;
+  if (!session->info.has_feature(CEPHFS_FEATURE_REPLY_ENCODING))
+    return false;
+  if (!valid)
+    return false;
+  if (!no_caps && !cap)
+    return false;
+  if (cap && cap->is_new() && !dir_realm)
+    return false;
+  if (!no_caps && cap) {
+    int likes = in->get_caps_liked();
+    int allowed = in->get_caps_allowed_for_client(session, cap, file_i);
+    if ((cap->wanted() | likes) & allowed)
+      return false;
+  }
+  if (file_i->inline_data.version != CEPH_INLINE_NONE) {
+    if (!cap && !no_caps)
+      return false;
+    if (cap && cap->client_inline_version < file_i->inline_data.version)
+      return false;
+  }
+  if (cap && cap->client_xattr_version < xattr_i->xattr_version)
+    return false;
+  return true;
+}
 } // anonymous namespace
 
 using namespace std;
@@ -4069,38 +4110,48 @@ CInode::encode_inodestat(
     std::min(oi->get_client_range(client),
 	     pi->get_client_range(client));
 
+  const mempool_inode* auth_i = pauth ? pi : oi;
+  const mempool_inode* link_i = plink ? pi : oi;
+  const mempool_inode* xattr_i = pxattr ? pi : oi;
+
+  const bool readdir_fast = inodestat_readdir_fast_eligible(
+      this, for_readdir, snapid, getattr_caps, session, valid, no_caps, cap,
+      dir_realm, file_i, xattr_i);
+  if (readdir_fast && mdcache->mds->logger) {
+    mdcache->mds->logger->inc(l_mds_encode_inodestat_fast);
+  }
+
   // inline data
   version_t inline_version = 0;
   bufferlist inline_data;
-  if (file_i->inline_data.version == CEPH_INLINE_NONE) {
+  if (readdir_fast) {
+    if (file_i->inline_data.version == CEPH_INLINE_NONE) {
+      inline_version = CEPH_INLINE_NONE;
+    }
+  } else if (file_i->inline_data.version == CEPH_INLINE_NONE) {
     inline_version = CEPH_INLINE_NONE;
-  } else if ((!cap && !no_caps) ||
-	     (cap && cap->client_inline_version < file_i->inline_data.version) ||
-	     (getattr_caps & CEPH_CAP_FILE_RD)) { // client requests inline data
+  } else if (
+      (!cap && !no_caps) ||
+      (cap && cap->client_inline_version < file_i->inline_data.version) ||
+      (getattr_caps & CEPH_CAP_FILE_RD)) { // client requests inline data
     inline_version = file_i->inline_data.version;
     if (file_i->inline_data.length() > 0)
       file_i->inline_data.get_data(inline_data);
   }
 
   // nest (do same as file... :/)
-  if (cap) {
+  if (cap && !readdir_fast) {
     cap->last_rbytes = file_i->rstat.rbytes;
     cap->last_rsize = file_i->rstat.rsize();
   }
 
-  // auth
-  const mempool_inode *auth_i = pauth ? pi:oi;
-
-  // link
-  const mempool_inode *link_i = plink ? pi:oi;
-  
-  // xattr
-  const mempool_inode *xattr_i = pxattr ? pi:oi;
-
   using ceph::encode;
   // xattr
   version_t xattr_version;
-  if ((!cap && !no_caps) ||
+  if (readdir_fast) {
+    xattr_version = 0;
+  } else if (
+      (!cap && !no_caps) ||
       (cap && cap->client_xattr_version < xattr_i->xattr_version) ||
       (getattr_caps & CEPH_CAP_XATTR_SHARED)) { // client requests xattrs
     if (!pxattrs)
@@ -4200,44 +4251,52 @@ CInode::encode_inodestat(
     ecap.mseq = 0;
     ecap.realm = 0;
   } else {
-    if (!no_caps && !cap) {
-      // add a new cap
-      cap = add_client_cap(client, session, realm);
-      if (is_auth())
-	choose_ideal_loner();
-    }
+    if (!readdir_fast) {
+      if (!no_caps && !cap) {
+        // add a new cap
+        cap = add_client_cap(client, session, realm);
+        if (is_auth())
+          choose_ideal_loner();
+      }
 
-    int issue = 0;
-    if (!no_caps && cap) {
-      int likes = get_caps_liked();
-      int allowed = get_caps_allowed_for_client(session, cap, file_i);
-      issue = (cap->wanted() | likes) & allowed;
-      cap->issue_norevoke(issue, true);
-      issue = cap->pending();
-      dout(10) << "encode_inodestat issuing " << ccap_string(issue)
-	       << " seq " << cap->get_last_seq() << dendl;
-    } else if (cap && cap->is_new() && !dir_realm) {
-      // alway issue new caps to client, otherwise the caps get lost
-      ceph_assert(cap->is_stale());
-      ceph_assert(!cap->pending());
-      issue = CEPH_CAP_PIN;
-      cap->issue_norevoke(issue, true);
-      dout(10) << "encode_inodestat issuing " << ccap_string(issue)
-	       << " seq " << cap->get_last_seq()
-	       << "(stale&new caps)" << dendl;
-    }
+      int issue = 0;
+      if (!no_caps && cap) {
+        int likes = get_caps_liked();
+        int allowed = get_caps_allowed_for_client(session, cap, file_i);
+        issue = (cap->wanted() | likes) & allowed;
+        cap->issue_norevoke(issue, true);
+        issue = cap->pending();
+        dout(10) << "encode_inodestat issuing " << ccap_string(issue) << " seq "
+                 << cap->get_last_seq() << dendl;
+      } else if (cap && cap->is_new() && !dir_realm) {
+        // alway issue new caps to client, otherwise the caps get lost
+        ceph_assert(cap->is_stale());
+        ceph_assert(!cap->pending());
+        issue = CEPH_CAP_PIN;
+        cap->issue_norevoke(issue, true);
+        dout(10) << "encode_inodestat issuing " << ccap_string(issue) << " seq "
+                 << cap->get_last_seq() << "(stale&new caps)" << dendl;
+      }
 
-    if (issue) {
-      if (mdcache->mds->logger)
-        mdcache->mds->logger->inc(l_mds_encode_inodestat_cap_issue);
-      cap->set_last_issue();
-      cap->set_last_issue_stamp(ceph_clock_now());
-      ecap.caps = issue;
-      ecap.wanted = cap->wanted();
-      ecap.cap_id = cap->get_cap_id();
-      ecap.seq = cap->get_last_seq();
-      ecap.mseq = cap->get_mseq();
-      ecap.realm = realm->inode->ino();
+      if (issue) {
+        if (mdcache->mds->logger)
+          mdcache->mds->logger->inc(l_mds_encode_inodestat_cap_issue);
+        cap->set_last_issue();
+        cap->set_last_issue_stamp(ceph_clock_now());
+        ecap.caps = issue;
+        ecap.wanted = cap->wanted();
+        ecap.cap_id = cap->get_cap_id();
+        ecap.seq = cap->get_last_seq();
+        ecap.mseq = cap->get_mseq();
+        ecap.realm = realm->inode->ino();
+      } else {
+        ecap.cap_id = 0;
+        ecap.caps = 0;
+        ecap.seq = 0;
+        ecap.mseq = 0;
+        ecap.realm = 0;
+        ecap.wanted = 0;
+      }
     } else {
       ecap.cap_id = 0;
       ecap.caps = 0;
@@ -4252,7 +4311,7 @@ CInode::encode_inodestat(
 	   << " seq " << ecap.seq << " mseq " << ecap.mseq
 	   << " xattrv " << xattr_version << dendl;
 
-  if (inline_data.length() && cap) {
+  if (!readdir_fast && inline_data.length() && cap) {
     if ((cap->pending() | getattr_caps) & CEPH_CAP_FILE_SHARED) {
       dout(10) << "including inline version " << inline_version << dendl;
       cap->client_inline_version = inline_version;
@@ -4264,7 +4323,7 @@ CInode::encode_inodestat(
   }
 
   // include those xattrs?
-  if (xattr_version && cap) {
+  if (!readdir_fast && xattr_version && cap) {
     if ((cap->pending() | getattr_caps) & CEPH_CAP_XATTR_SHARED) {
       dout(10) << "including xattrs version " << xattr_version << dendl;
       cap->client_xattr_version = xattr_version;
