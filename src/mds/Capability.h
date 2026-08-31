@@ -187,7 +187,9 @@ public:
   int confirm_receipt(ceph_seq_t seq, unsigned caps);
   // we may get a release racing with revocations, which means our revokes will be ignored
   // by the client.  clean them out of our _revokes history so we don't wait on them.
-  void clean_revoke_from(ceph_seq_t li) {
+  bool
+  clean_revoke_from(ceph_seq_t li)
+  {
     bool changed = false;
     while (!_revokes.empty() && _revokes.front().last_issue <= li) {
       _revokes.pop_front();
@@ -202,6 +204,7 @@ public:
 	maybe_clear_notable();
       }
     }
+    return changed;
   }
   ceph_seq_t get_mseq() const { return mseq; }
   void inc_mseq() { mseq++; }
