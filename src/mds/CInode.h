@@ -179,6 +179,7 @@ public:
   /* For use by offline tools */
   __u32 hash_dentry_name(std::string_view dn);
   frag_t pick_dirfrag(std::string_view dn);
+  frag_t pick_dirfrag(std::string_view dn, __u32 hash);
 
   mempool::mds_co::string	symlink;      // symlink dest, if symlink
   fragtree_t			dirfragtree;  // dir frag tree, if any.  always consistent with our dirfrag map.

@@ -380,6 +380,7 @@ public:
   // -- dentries and inodes --
   CDentry* lookup_exact_snap(std::string_view dname, snapid_t last);
   CDentry* lookup(std::string_view n, snapid_t snap=CEPH_NOSNAP);
+  CDentry* lookup(std::string_view n, snapid_t snap, __u32 name_hash);
 
   void adjust_dentry_lru(CDentry *dn);
   CDentry* add_null_dentry(std::string_view dname,
