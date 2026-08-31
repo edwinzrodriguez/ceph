@@ -166,7 +166,17 @@ public:
   void kick_cap_releases(const MDRequestRef& mdr);
   void kick_issue_caps(CInode *in, client_t client, ceph_seq_t seq);
 
-  void remove_client_cap(CInode *in, Capability *cap, bool kill=false);
+  struct CapReleaseEvalBatch {
+    std::set<CInode*> gather;
+    std::set<CInode*> try_eval;
+    unsigned deferred_eval_ops = 0;
+  };
+
+  void remove_client_cap(
+      CInode* in,
+      Capability* cap,
+      bool kill = false,
+      CapReleaseEvalBatch* batch = nullptr);
 
   std::set<client_t> get_late_revoking_clients(double timeout);
 
@@ -245,7 +255,14 @@ protected:
   bool _do_cap_update(CInode *in, Capability *cap, int dirty, snapid_t follows, const cref_t<MClientCaps> &m,
 		      const ref_t<MClientCaps> &ack, bool *need_flush=NULL);
   void handle_client_cap_release(const cref_t<MClientCapRelease> &m);
-  void _do_cap_release(client_t client, inodeno_t ino, uint64_t cap_id, ceph_seq_t mseq, ceph_seq_t seq);
+  void _do_cap_release(
+      client_t client,
+      inodeno_t ino,
+      uint64_t cap_id,
+      ceph_seq_t mseq,
+      ceph_seq_t seq,
+      CapReleaseEvalBatch* batch = nullptr);
+  void flush_cap_release_eval_batch(CapReleaseEvalBatch& batch);
   void caps_tick();
 
   bool local_wrlock_start(LocalLockC *lock, const MDRequestRef& mut);
