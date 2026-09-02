@@ -22,6 +22,7 @@
 #include "include/compat.h"
 
 #include "MDCache.h"
+#include "MDLog.h"
 #include "MDSContext.h"
 #include "MDSDaemon.h"
 #include "MDSRank.h"
@@ -205,6 +206,13 @@ ReactorDispatchEngine::submit_trim_tick()
 }
 
 void
+ReactorDispatchEngine::submit_log_trim_tick()
+{
+  OpWorkItem* item = OpWorkItem::create_log_trim();
+  enqueue_item(item, DispatchLane::Maintenance);
+}
+
+void
 ReactorDispatchEngine::submit_callable(
     DispatchLane lane,
     std::function<void()> fn)
@@ -290,6 +298,12 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
   case WorkKind::TrimQuantum:
     if (ctx.rank && ctx.rank->mdcache) {
       ctx.rank->mdcache->trim_quantum();
+    }
+    break;
+
+  case WorkKind::LogTrim:
+    if (ctx.rank && ctx.rank->mdlog) {
+      ctx.rank->mdlog->trim_tick();
     }
     break;
   }

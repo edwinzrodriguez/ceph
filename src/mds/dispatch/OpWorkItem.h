@@ -48,6 +48,7 @@ enum class WorkKind : uint8_t {
   IOCompletion,
   AdvanceQueues,
   TrimQuantum,
+  LogTrim,
   Callable,
 };
 
@@ -69,6 +70,7 @@ struct OpWorkItem
   static OpWorkItem* create_io(MDSIOContextBase* ctx, int r);
   static OpWorkItem* create_advance();
   static OpWorkItem* create_trim();
+  static OpWorkItem* create_log_trim();
   static OpWorkItem* create_callable(DispatchLane lane, std::function<void()> fn);
   void note_enqueued();
   void destroy();

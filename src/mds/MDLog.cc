@@ -15,13 +15,16 @@
 
 #include "MDLog.h"
 
+#include "mds_lock_debug.h"
+
+#include "dispatch/MDSDispatchEngine.h"
+#include "mds/JournalPointer.h"
+#include "osdc/Journaler.h"
+
 #include "LogEvent.h"
 #include "MDCache.h"
 #include "MDSContext.h"
 #include "MDSRank.h"
-#include "mds/JournalPointer.h"
-#include "mds_lock_debug.h"
-#include "osdc/Journaler.h"
 
 static void mdlog_bind_journaler_completion(Journaler* journaler, MDSRank* mds)
 {
@@ -110,6 +113,15 @@ void MDLog::create_logger()
   plb.add_u64_counter(l_mdl_segadd, "segadd", "Segments added");
   plb.add_u64_counter(l_mdl_segex, "segex", "Total expired segments");
   plb.add_u64_counter(l_mdl_segtrm, "segtrm", "Trimmed segments");
+
+  plb.add_u64_counter(
+      l_mdl_trim_tick, "trim_tick",
+      "Journal trim ticks executed under mds_lock", "trtk",
+      PerfCountersBuilder::PRIO_USEFUL);
+  plb.add_time_avg(
+      l_mdl_trim_execute_usec, "trim_execute_usec",
+      "Journal trim execution time per tick", "trex",
+      PerfCountersBuilder::PRIO_USEFUL);
 
   plb.set_prio_default(PerfCountersBuilder::PRIO_DEBUGONLY);
   plb.add_u64(l_mdl_expos, "expos", "Journaler xpire position");
@@ -671,7 +683,10 @@ void MDLog::shutdown()
   }
 
   upkeep_log_trim_shutdown = true;
-  cond.notify_one();
+  {
+    std::lock_guard lock(upkeep_mutex);
+    upkeep_cvar.notify_one();
+  }
 
   mds->mds_lock.unlock();
   upkeep_thread.join();
@@ -719,18 +734,52 @@ bool MDLog::is_trim_slow() const {
   return (segments.size() > (size_t)(max_segments * log_warn_factor));
 }
 
+void
+MDLog::trim_tick()
+{
+  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+
+  const auto trim_start = ceph::coarse_mono_clock::now();
+  trim();
+  if (logger) {
+    const auto trim_usec = std::chrono::duration_cast<std::chrono::microseconds>(
+        ceph::coarse_mono_clock::now() - trim_start);
+    logger->inc(l_mdl_trim_tick);
+    logger->tinc(l_mdl_trim_execute_usec, trim_usec);
+  }
+}
+
 void MDLog::log_trim_upkeep(void) {
   ceph_pthread_setname("mds-log-trim");
 
   dout(10) << dendl;
 
-  std::unique_lock mds_lock(mds->mds_lock);
+  std::unique_lock lock(upkeep_mutex);
   while (!upkeep_log_trim_shutdown.load()) {
     if (mds->is_active() || mds->is_stopping()) {
-      trim();
+      if (auto* engine = mds->get_dispatch_engine();
+          engine && engine->is_reactor()) {
+        dout(20) << "log trim upkeep posting trim tick" << dendl;
+        engine->submit_log_trim_tick();
+      } else {
+        lock.unlock();
+        {
+          std::scoped_lock mds_lock(mds->mds_lock);
+          if (!upkeep_log_trim_shutdown.load() &&
+              (mds->is_active() || mds->is_stopping())) {
+            trim_tick();
+          }
+        }
+        lock.lock();
+        if (upkeep_log_trim_shutdown.load()) {
+          break;
+        }
+      }
     }
 
-    cond.wait_for(mds_lock, g_conf().get_val<std::chrono::milliseconds>("mds_log_trim_upkeep_interval"));
+    upkeep_cvar.wait_for(
+        lock, g_conf().get_val<std::chrono::milliseconds>(
+                  "mds_log_trim_upkeep_interval"));
   }
   dout(10) << __func__ << ": finished" << dendl;
 }

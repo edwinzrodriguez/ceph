@@ -46,6 +46,7 @@ public:
   void submit_io_completion(MDSIOContextBase* ctx, int r) override;
   void submit_advance_queues() override;
   void submit_trim_tick() override;
+  void submit_log_trim_tick() override;
   void submit_callable(DispatchLane lane, std::function<void()> fn) override;
   void note_finished_queued() override;
 

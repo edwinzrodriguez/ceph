@@ -55,6 +55,15 @@ OpWorkItem::create_trim()
 }
 
 OpWorkItem*
+OpWorkItem::create_log_trim()
+{
+  auto* item = new OpWorkItem;
+  item->kind = WorkKind::LogTrim;
+  item->lane = DispatchLane::Maintenance;
+  return item;
+}
+
+OpWorkItem*
 OpWorkItem::create_callable(DispatchLane lane, std::function<void()> fn)
 {
   auto* item = new OpWorkItem;
