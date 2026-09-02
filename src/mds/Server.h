@@ -225,6 +225,7 @@ public:
   void handle_peer_auth_pin_ack(const MDRequestRef& mdr, const cref_t<MMDSPeerRequest> &ack);
 
   // some helpers
+  bool ensure_parent_dir_wrlocks(const MDRequestRef& mdr, CInode* diri);
   bool check_fragment_space(const MDRequestRef& mdr, CDir *in);
   bool check_dir_max_entries(const MDRequestRef& mdr, CDir *in);
   bool check_access(const MDRequestRef& mdr, CInode *in, unsigned mask);
@@ -324,10 +325,17 @@ public:
   bool _dir_is_nonempty_unlocked(const MDRequestRef& mdr, CInode *rmdiri);
   bool _dir_is_nonempty(const MDRequestRef& mdr, CInode *rmdiri);
   bool _dir_has_snaps(const MDRequestRef& mdr, CInode *diri);
-  void _unlink_local(const MDRequestRef& mdr, CDentry *dn, CDentry *straydn);
-  void _unlink_local_finish(const MDRequestRef& mdr,
-			    CDentry *dn, CDentry *straydn,
-			    version_t);
+  void _unlink_local(
+      const MDRequestRef& mdr,
+      CDentry* dn,
+      CDentry* straydn,
+      CInode* in);
+  void _unlink_local_finish(
+      const MDRequestRef& mdr,
+      CDentry* dn,
+      CDentry* straydn,
+      CInode* in,
+      version_t dnpv);
   bool _rmdir_prepare_witness(const MDRequestRef& mdr, mds_rank_t who, std::vector<CDentry*>& trace, CDentry *straydn);
   void handle_peer_rmdir_prep(const MDRequestRef& mdr);
   void _logged_peer_rmdir(const MDRequestRef& mdr, CDentry *srcdn, CDentry *straydn);

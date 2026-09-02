@@ -4631,6 +4631,11 @@ void Locker::issue_client_lease(CDentry *dn, CInode *in, const MDRequestRef& mdr
       !(diri->get_client_cap_pending(client) & (CEPH_CAP_FILE_SHARED | CEPH_CAP_FILE_EXCL))) {
     int mask = 0;
     CDentry::linkage_t *dnl = dn->get_linkage(client, mdr);
+    // Unsafe early replies (e.g. unlink) may project a null linkage while the
+    // mutation only holds a dentry rdlock.  The client cannot read projected
+    // linkage in that state, but the reply trace must reflect the mutation.
+    if (mdr && mdr->is_rdlocked(&dn->lock) && !dn->use_projected(client, mdr))
+      dnl = dn->get_projected_linkage();
     if (dnl->is_primary()) {
       ceph_assert(dnl->get_inode() == in);
       mask = CEPH_LEASE_PRIMARY_LINK;

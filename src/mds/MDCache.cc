@@ -2253,13 +2253,47 @@ void MDCache::predirty_journal_parents(MutationRef mut, EMetaBlob *blob,
     mut->auth_pin(parent);
 
     auto pf = parent->project_fnode(mut);
-    pf->version = parent->pre_dirty();
+
+    auto apply_linkunlink_dirstat_in_place = [&]() {
+      pf->version = parent->get_projected_version();
+
+      mempool_inode* pi =
+          const_cast<mempool_inode*>(pin->get_projected_inode().get());
+      bool touched_mtime = false, touched_chattr = false;
+      pi->dirstat.add_delta(
+          pf->fragstat, pf->accounted_fragstat, &touched_mtime, &touched_chattr);
+      pf->accounted_fragstat = pf->fragstat;
+      if (touched_mtime) {
+        pi->mtime = pi->ctime = pi->dirstat.mtime;
+      }
+      if (touched_chattr) {
+        pi->change_attr++;
+      }
+    };
+
+    bool stop = false;
+    const bool defer_inode_prop = (do_parent_mtime || linkunlink) &&
+                                  (!mut->is_wrlocked(&pin->filelock) ||
+                                   !mut->is_wrlocked(&pin->nestlock));
+    if (defer_inode_prop) {
+      // Unlink/create/link may intentionally skip parent scatter wrlocks to
+      // avoid blocking on cap revoke from a client still waiting for the reply.
+      // Still update the dirfrag fnode; defer inode dirstat propagation.
+      dout(10)
+          << "predirty_journal_parents defer parent scatter (no wrlock) on "
+          << *pin << dendl;
+      stop = true;
+    } else {
+      pf->version = parent->pre_dirty();
+    }
 
     if (do_parent_mtime || linkunlink) {
-      ceph_assert(mut->is_wrlocked(&pin->filelock));
-      ceph_assert(mut->is_wrlocked(&pin->nestlock));
+      if (!defer_inode_prop) {
+        ceph_assert(mut->is_wrlocked(&pin->filelock));
+        ceph_assert(mut->is_wrlocked(&pin->nestlock));
+      }
       ceph_assert(cfollows == CEPH_NOSNAP);
-      
+
       // update stale fragstat/rstat?
       parent->resync_accounted_fragstat();
       parent->resync_accounted_rstat();
@@ -2285,48 +2319,71 @@ void MDCache::predirty_journal_parents(MutationRef mut, EMetaBlob *blob,
  	  //pf->rstat.rfiles += linkunlink;
 	}
       }
+
+      if (defer_inode_prop) {
+        apply_linkunlink_dirstat_in_place();
+        if (primary_dn) {
+          SnapRealm* prealm = pin->find_snaprealm();
+          snapid_t follows = cfollows;
+          if (follows == CEPH_NOSNAP)
+            follows = prealm->get_newest_seq();
+          snapid_t first = follows + 1;
+          project_rstat_inode_to_frag(
+              mut, cur, parent, first, linkunlink, prealm);
+          cur->clear_dirty_rstat();
+          mempool_inode* pi =
+              const_cast<mempool_inode*>(pin->get_projected_inode().get());
+          pi->rstat.add_delta(pf->rstat, pf->accounted_rstat);
+          pf->accounted_rstat = pf->rstat;
+          broadcast_quota_to_client(pin);
+        }
+      }
     }
 
     // rstat
-    if (!primary_dn) {
-      // don't update parent this pass
-    } else if (!linkunlink && !(pin->nestlock.can_wrlock(-1) &&
-				pin->versionlock.can_wrlock())) {
-      dout(20) << " unwritable parent nestlock " << pin->nestlock
-	<< ", marking dirty rstat on " << *cur << dendl;
-      cur->mark_dirty_rstat();
-    } else {
-      // if we don't hold a wrlock reference on this nestlock, take one,
-      // because we are about to write into the dirfrag fnode and that needs
-      // to commit before the lock can cycle.
-      if (linkunlink) {
-	ceph_assert(pin->nestlock.get_num_wrlocks() || mut->is_peer());
+    if (!stop) {
+      if (!primary_dn) {
+        // don't update parent this pass
+      } else if (
+          !linkunlink &&
+          !(pin->nestlock.can_wrlock(-1) && pin->versionlock.can_wrlock())) {
+        dout(20) << " unwritable parent nestlock " << pin->nestlock
+                 << ", marking dirty rstat on " << *cur << dendl;
+        cur->mark_dirty_rstat();
+      } else {
+        // if we don't hold a wrlock reference on this nestlock, take one,
+        // because we are about to write into the dirfrag fnode and that needs
+        // to commit before the lock can cycle.
+        if (linkunlink) {
+          ceph_assert(pin->nestlock.get_num_wrlocks() || mut->is_peer());
+        }
+
+        if (!mut->is_wrlocked(&pin->nestlock)) {
+          dout(10) << " taking wrlock on " << pin->nestlock << " on " << *pin
+                   << dendl;
+          mds->locker->wrlock_force(&pin->nestlock, mut);
+        }
+
+        // now we can project the inode rstat diff the dirfrag
+        SnapRealm* prealm = pin->find_snaprealm();
+
+        snapid_t follows = cfollows;
+        if (follows == CEPH_NOSNAP)
+          follows = prealm->get_newest_seq();
+
+        snapid_t first = follows + 1;
+
+        // first, if the frag is stale, bring it back in sync.
+        parent->resync_accounted_rstat();
+
+        // now push inode rstats into frag
+        project_rstat_inode_to_frag(mut, cur, parent, first, linkunlink, prealm);
+        cur->clear_dirty_rstat();
       }
-
-      if (!mut->is_wrlocked(&pin->nestlock)) {
-	dout(10) << " taking wrlock on " << pin->nestlock << " on " << *pin << dendl;
-	mds->locker->wrlock_force(&pin->nestlock, mut);
-      }
-
-      // now we can project the inode rstat diff the dirfrag
-      SnapRealm *prealm = pin->find_snaprealm();
-
-      snapid_t follows = cfollows;
-      if (follows == CEPH_NOSNAP)
-	follows = prealm->get_newest_seq();
-
-      snapid_t first = follows+1;
-
-      // first, if the frag is stale, bring it back in sync.
-      parent->resync_accounted_rstat();
-
-      // now push inode rstats into frag
-      project_rstat_inode_to_frag(mut, cur, parent, first, linkunlink, prealm);
-      cur->clear_dirty_rstat();
     }
 
-    bool stop = false;
-    if (!pin->is_auth() || (!mut->is_auth_pinned(pin) && !pin->can_auth_pin())) {
+    if (!stop && (!pin->is_auth() ||
+                  (!mut->is_auth_pinned(pin) && !pin->can_auth_pin()))) {
       dout(10) << "predirty_journal_parents !auth or ambig or can't authpin on " << *pin << dendl;
       stop = true;
     }
@@ -2356,14 +2413,27 @@ void MDCache::predirty_journal_parents(MutationRef mut, EMetaBlob *blob,
       stop = true;
     }
     if (stop) {
-      dout(10) << "predirty_journal_parents stop.  marking nestlock on " << *pin << dendl;
-      mds->locker->mark_updated_scatterlock(&pin->nestlock);
-      mut->ls->dirty_dirfrag_nest.push_back(&pin->item_dirty_dirfrag_nest);
-      mut->add_updated_lock(&pin->nestlock);
-      if (do_parent_mtime || linkunlink) {
-	mds->locker->mark_updated_scatterlock(&pin->filelock);
-	mut->ls->dirty_dirfrag_dir.push_back(&pin->item_dirty_dirfrag_dir);
-	mut->add_updated_lock(&pin->filelock);
+      if (linkunlink) {
+        // Link/unlink under a hot parent (SWBUILD bucket dirs) updates fragstat
+        // in the journaled fnode.  Avoid scatter nudges here: they require cap
+        // revokes that deadlock with concurrent creates on the same directory.
+        if (!defer_inode_prop) {
+          apply_linkunlink_dirstat_in_place();
+        }
+        dout(10) << "predirty_journal_parents stop (linkunlink). scatter flush "
+                    "skipped on "
+                 << *pin << dendl;
+      } else {
+        dout(10) << "predirty_journal_parents stop.  marking nestlock on "
+                 << *pin << dendl;
+        mds->locker->mark_updated_scatterlock(&pin->nestlock);
+        mut->ls->dirty_dirfrag_nest.push_back(&pin->item_dirty_dirfrag_nest);
+        mut->add_updated_lock(&pin->nestlock);
+        if (do_parent_mtime || linkunlink) {
+          mds->locker->mark_updated_scatterlock(&pin->filelock);
+          mut->ls->dirty_dirfrag_dir.push_back(&pin->item_dirty_dirfrag_dir);
+          mut->add_updated_lock(&pin->filelock);
+        }
       }
       break;
     }
@@ -8591,29 +8661,53 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
       const bool want_snaplock = rdlock_snap && !(want_dentry && !want_inode &&
                                                   depth == path.depth() - 1);
       bool merge_snaplock = false;
+      const bool unlink_existing =
+          depth == path.depth() - 1 && !dnl->is_null() && mdr &&
+          mdr->client_request &&
+          (mdr->client_request->get_op() == CEPH_MDS_OP_UNLINK ||
+           mdr->client_request->get_op() == CEPH_MDS_OP_RMDIR);
+      // Creating a new file name under the parent (null tail).  Same cap-revoke
+      // deadlock as unlink: path_traverse would wrlock parent filelock after
+      // quiescelock, send Fs revoke, and wait while the client is blocked on
+      // the create/link reply.  predirty_journal_parents() updates dirstat
+      // in place when wrlocks are not held.  MKDIR/MKNOD/SYMLINK still wrlock
+      // the parent so nlink/quota stay coherent for clients.
+      const bool defer_parent_scatter =
+          depth == path.depth() - 1 && dnl->is_null() && mdr &&
+          mdr->client_request &&
+          (mdr->client_request->get_op() == CEPH_MDS_OP_CREATE ||
+           mdr->client_request->get_op() == CEPH_MDS_OP_LINK);
+      // For existing unlink/rmdir, skip parent scatter wrlock and tail dentry
+      // xlock here.  Wrlocking the parent while the requesting client waits for
+      // the unlink reply can deadlock on cap revoke (client holds parent dir
+      // caps).  predirty_journal_parents() defers the parent scatter update
+      // when wrlocks are not held.
 
       if (rdlock_path) {
 	lov.clear();
 	// do not xlock the tail dentry if target inode exists and caller wants it
-	if (xlock_dentry && (dnl->is_null() || !want_inode) &&
-	    depth == path.depth() - 1) {
-	  ceph_assert(dn->is_auth());
-	  if (depth > 0 || !mdr->lock_cache) {
-	    lov.add_wrlock(&cur->filelock);
-	    lov.add_wrlock(&cur->nestlock);
-	    if (rdlock_authlock)
-	      lov.add_rdlock(&cur->authlock);
-	  }
-	  lov.add_xlock(&dn->lock);
-	} else {
-	  // force client to flush async dir operation if necessary
-	  if (cur->filelock.is_cached() &&
-	      !(mdr->lock_cache &&
-		static_cast<const MutationImpl*>(mdr->lock_cache)->is_wrlocked(&cur->filelock))) {
-	    lov.add_wrlock(&cur->filelock);
-	  }
-	  lov.add_rdlock(&dn->lock);
-	}
+        if (xlock_dentry && (dnl->is_null() || !want_inode) &&
+            depth == path.depth() - 1 && !unlink_existing) {
+          ceph_assert(dn->is_auth());
+          if (depth > 0 || !mdr->lock_cache) {
+            if (!defer_parent_scatter) {
+              lov.add_wrlock(&cur->filelock);
+              lov.add_wrlock(&cur->nestlock);
+            }
+            if (rdlock_authlock)
+              lov.add_rdlock(&cur->authlock);
+          }
+          lov.add_xlock(&dn->lock);
+        } else {
+          // force client to flush async dir operation if necessary
+          if (!unlink_existing && cur->filelock.is_cached() &&
+              !(mdr->lock_cache &&
+                static_cast<const MutationImpl*>(mdr->lock_cache)
+                    ->is_wrlocked(&cur->filelock))) {
+            lov.add_wrlock(&cur->filelock);
+          }
+          lov.add_rdlock(&dn->lock);
+        }
         if (!dnl->is_null() && want_snaplock) {
           CInode* snap_in = dnl->get_inode();
           if (!snap_in && dnl->is_remote())
@@ -8733,45 +8827,53 @@ int MDCache::path_traverse(const MDRequestRef& mdr, MDSContextFactory& cf,
 	    dout(7) << "traverse: " << *curdir << " is frozen, waiting" << dendl;
 	    curdir->add_waiter(CDir::WAIT_UNFREEZE, cf.build());
 	    return 1;
-	  } else {
-	    // create a null dentry
-	    dn = curdir->add_null_dentry(path[depth]);
-	    dout(20) << " added null " << *dn << dendl;
+    } else {
+      // create a null dentry
+      dn = curdir->add_null_dentry(path[depth]);
+      dout(20) << " added null " << *dn << dendl;
 
-	    if (rdlock_path) {
-	      lov.clear();
-	      if (xlock_dentry) {
-		if (depth > 0 || !mdr->lock_cache) {
-		  lov.add_wrlock(&cur->filelock);
-		  lov.add_wrlock(&cur->nestlock);
-		  if (rdlock_authlock)
-		    lov.add_rdlock(&cur->authlock);
-		}
-		lov.add_xlock(&dn->lock);
-	      } else {
-		// force client to flush async dir operation if necessary
-		if (cur->filelock.is_cached() &&
-		    !(mdr->lock_cache &&
-		      static_cast<const MutationImpl*>(mdr->lock_cache)->is_wrlocked(&cur->filelock))) {
-		  lov.add_wrlock(&cur->filelock);
-		}
-		lov.add_rdlock(&dn->lock);
-	      }
-              if (mds->logger)
-                mds->logger->inc(l_mds_traverse_acquire_locks);
-              if (!mds->locker->acquire_locks(mdr, lov)) {
-                return 1;
-              }
+      if (rdlock_path) {
+        lov.clear();
+        if (xlock_dentry) {
+          const bool defer_parent_scatter =
+              mdr && mdr->client_request &&
+              (mdr->client_request->get_op() == CEPH_MDS_OP_CREATE ||
+                mdr->client_request->get_op() == CEPH_MDS_OP_LINK);
+          if (depth > 0 || !mdr->lock_cache) {
+            if (!defer_parent_scatter) {
+              lov.add_wrlock(&cur->filelock);
+              lov.add_wrlock(&cur->nestlock);
+            }
+            if (rdlock_authlock) {
+              lov.add_rdlock(&cur->authlock);
             }
           }
-	  if (dn) {
-	    pdnvec->push_back(dn);
-	    if (want_dentry)
-	      break;
-	  } else {
-	    pdnvec->clear();   // do not confuse likes of rdlock_path_pin_ref();
-	  }
-	}
+          lov.add_xlock(&dn->lock);
+        } else {
+          // force client to flush async dir operation if necessary
+          if (cur->filelock.is_cached() &&
+              !(mdr->lock_cache &&
+                static_cast<const MutationImpl*>(mdr->lock_cache)
+                    ->is_wrlocked(&cur->filelock))) {
+            lov.add_wrlock(&cur->filelock);
+          }
+          lov.add_rdlock(&dn->lock);
+        }
+        if (mds->logger)
+          mds->logger->inc(l_mds_traverse_acquire_locks);
+        if (!mds->locker->acquire_locks(mdr, lov)) {
+          return 1;
+        }
+      }
+    }
+    if (dn) {
+      pdnvec->push_back(dn);
+      if (want_dentry)
+        break;
+    } else {
+      pdnvec->clear();   // do not confuse likes of rdlock_path_pin_ref();
+    }
+  }
         return -ENOENT;
       } else {
 

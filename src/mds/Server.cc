@@ -3513,6 +3513,17 @@ bool Server::check_access(const MDRequestRef& mdr, CInode *in, unsigned mask)
   return true;
 }
 
+bool
+Server::ensure_parent_dir_wrlocks(const MDRequestRef& mdr, CInode* diri)
+{
+  if (mdr->is_wrlocked(&diri->filelock) && mdr->is_wrlocked(&diri->nestlock))
+    return true;
+  MutationImpl::LockOpVec parent_lov;
+  parent_lov.add_wrlock(&diri->filelock);
+  parent_lov.add_wrlock(&diri->nestlock);
+  return mds->locker->acquire_locks(mdr, parent_lov);
+}
+
 /**
  * check whether fragment has reached maximum size
  *
@@ -3548,6 +3559,15 @@ bool Server::check_dir_max_entries(const MDRequestRef& mdr, CDir *in)
   return true;
 }
 
+static bool
+stray_linkage_matches_inode(CDentry::linkage_t* l, CInode* in)
+{
+  if (l->is_null())
+    return false;
+  if (l->is_primary())
+    return l->get_inode()->ino() == in->ino();
+  return l->is_remote() && l->get_remote_ino() == in->ino();
+}
 
 CDentry* Server::prepare_stray_dentry(const MDRequestRef& mdr, CInode *in)
 {
@@ -3557,6 +3577,9 @@ CDentry* Server::prepare_stray_dentry(const MDRequestRef& mdr, CInode *in)
   CDentry *straydn = mdr->straydn;
   if (straydn) {
     ceph_assert(straydn->get_name() == straydname);
+    CDentry::linkage_t* strayl = straydn->get_projected_linkage();
+    if (!strayl->is_null())
+      ceph_assert(stray_linkage_matches_inode(strayl, in));
     return straydn;
   }
   CDir *straydir = mdcache->get_stray_dir(in);
@@ -3577,7 +3600,13 @@ CDentry* Server::prepare_stray_dentry(const MDRequestRef& mdr, CInode *in)
     straydn = straydir->add_null_dentry(straydname);
     straydn->mark_new();
   } else {
-    ceph_assert(straydn->get_projected_linkage()->is_null());
+    CDentry::linkage_t* strayl = straydn->get_projected_linkage();
+    if (!strayl->is_null()) {
+      // e.g. retry after _unlink_local() already projected this inode into stray
+      // but mdr->straydn was not preserved across the retry.
+      ceph_assert(stray_linkage_matches_inode(strayl, in));
+      dout(10) << __func__ << ": reusing stray dn " << *straydn << dendl;
+    }
   }
 
   straydn->state_set(CDentry::STATE_STRAY);
@@ -4963,7 +4992,12 @@ void Server::handle_client_openc(const MDRequestRef& mdr)
     newi->mark_clientwriteable();
     cap->mark_clientwriteable();
   }
-  
+
+  // Skip parent scatter wrlocks: path_traverse already deferred them for
+  // NEWINODE ops.  Taking filelock here after quiescelock deadlocks with a
+  // client that holds Fs on the parent and is blocked on this create reply.
+  // predirty_journal_parents() applies dirstat in place without wrlocks.
+
   // prepare finisher
   mdr->ls = mdlog->get_current_segment();
   EUpdate *le = new EUpdate(mdlog, "openc");
@@ -8469,8 +8503,18 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
   const cref_t<MClientRequest> &req = mdr->client_request;
   client_t client = mdr->get_client();
 
+  if (mdr->committing) {
+    dout(10) << "handle_client_unlink already committing " << *mdr << dendl;
+    return;
+  }
+
   // rmdir or unlink?
   bool rmdir = (req->get_op() == CEPH_MDS_OP_RMDIR);
+
+  // Keep the unsafe window closed until journal finish: early_reply drops
+  // rdlocks while xlocks are marked done, which lets overlapping work mutate
+  // projected inode state before _unlink_local_finish runs.
+  mdr->no_early_reply = true;
 
   if (rmdir)
     mdr->disable_lock_cache();
@@ -8519,8 +8563,25 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
 
   // -- create stray dentry? --
   CDentry *straydn = NULL;
+
+  // Unlink lock profile (single ordered sequence):
+  //   1) file inode linklock/snaplock (+ dir rdlock for rmdir checks)
+  //   2) stray dentry locks (if primary)
+  //   3) project + journal in _unlink_local() (parent scatter deferred if needed)
+  if (!(mdr->locking_state & MutationImpl::ALL_LOCKED)) {
+    MutationImpl::LockOpVec lov;
+
+    lov.add_xlock(&in->linklock);
+    lov.add_xlock(&in->snaplock);
+    if (in->is_dir())
+      lov.add_rdlock(&in->filelock); // to verify it's empty
+
+    if (!mds->locker->acquire_locks(mdr, lov))
+      return;
+  }
+
   if (dnl->is_primary()) {
-    straydn = prepare_stray_dentry(mdr, dnl->get_inode());
+    straydn = prepare_stray_dentry(mdr, in);
     if (!straydn)
       return;
     dout(10) << " straydn is " << *straydn << dendl;
@@ -8529,14 +8590,8 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
     mdr->straydn = NULL;
   }
 
-  // lock
   if (!(mdr->locking_state & MutationImpl::ALL_LOCKED)) {
     MutationImpl::LockOpVec lov;
-
-    lov.add_xlock(&in->linklock);
-    lov.add_xlock(&in->snaplock);
-    if (in->is_dir())
-      lov.add_rdlock(&in->filelock);   // to verify it's empty
 
     if (straydn) {
       lov.add_wrlock(&straydn->get_dir()->inode->filelock);
@@ -8606,37 +8661,74 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
       return;  // we're waiting for a witness.
   }
 
+  // Parent scatter wrlocks are skipped during path_traverse for existing
+  // file unlink and for CREATE/LINK (see MDCache::path_traverse).  Rmdir
+  // still needs them so parent nlink/dirstat stay coherent for stat/rmdir
+  // checks; MKDIR/MKNOD/SYMLINK still take them so parent nlink/quota stay
+  // visible to clients.
+  if (rmdir) {
+    if (!ensure_parent_dir_wrlocks(mdr, diri))
+      return;
+  }
+
   if (mds_allow_async_dirops && !rmdir && dnl->is_primary() && mdr->dn[0].size() == 1)
     mds->locker->create_lock_cache(mdr, diri);
+
+  mdr->tracei = in;
+  mdr->pin(in);
 
   // ok!
   if (dnl->is_remote() && !dnl->get_inode()->is_auth()) 
     _link_remote(mdr, false, dn, dnl->get_inode());
   else
-    _unlink_local(mdr, dn, straydn);
+    _unlink_local(mdr, dn, straydn, in);
 }
 
 class C_MDS_unlink_local_finish : public ServerLogContext {
   CDentry *dn;
   CDentry *straydn;
+  CInode* in;
   version_t dnpv;  // deleted dentry
 public:
-  C_MDS_unlink_local_finish(Server *s, const MDRequestRef& r, CDentry *d, CDentry *sd) :
-    ServerLogContext(s, r), dn(d), straydn(sd),
-    dnpv(d->get_projected_version()) {}
+  C_MDS_unlink_local_finish(
+      Server* s,
+      const MDRequestRef& r,
+      CDentry* d,
+      CDentry* sd,
+      CInode* i) :
+    ServerLogContext(s, r),
+    dn(d),
+    straydn(sd),
+    in(i),
+    dnpv(d->get_projected_version())
+  {}
   void finish(int r) override {
     ceph_assert(r == 0);
-    server->_unlink_local_finish(mdr, dn, straydn, dnpv);
+    server->_unlink_local_finish(mdr, dn, straydn, in, dnpv);
   }
 };
 
-void Server::_unlink_local(const MDRequestRef& mdr, CDentry *dn, CDentry *straydn)
+void
+Server::_unlink_local(
+    const MDRequestRef& mdr,
+    CDentry* dn,
+    CDentry* straydn,
+    CInode* in)
 {
-  dout(10) << "_unlink_local " << *dn << dendl;
+  dout(10) << "_unlink_local " << *dn << " " << *in << dendl;
+
+  if (mdr->committing) {
+    dout(10) << "_unlink_local already committing " << *mdr << dendl;
+    return;
+  }
 
   CDentry::linkage_t *dnl = dn->get_projected_linkage();
-  CInode *in = dnl->get_inode();
+  if (dnl->is_null() && dn->is_projected()) {
+    dout(10) << "_unlink_local already projected unlinked " << *dn << dendl;
+    return;
+  }
 
+  ceph_assert(in);
 
   // ok, let's do it.
   mdr->ls = mdlog->get_current_segment();
@@ -8653,7 +8745,11 @@ void Server::_unlink_local(const MDRequestRef& mdr, CDentry *dn, CDentry *strayd
 
   if (straydn) {
     ceph_assert(dnl->is_primary());
-    straydn->push_projected_linkage(in);
+    CDentry::linkage_t* strayl = straydn->get_projected_linkage();
+    if (strayl->is_null())
+      straydn->push_projected_linkage(in);
+    else
+      ceph_assert(stray_linkage_matches_inode(strayl, in));
   }
 
   // the unlinked dentry
@@ -8717,26 +8813,30 @@ void Server::_unlink_local(const MDRequestRef& mdr, CDentry *dn, CDentry *strayd
     mdcache->project_subtree_rename(in, dn->get_dir(), straydn->get_dir());
   }
 
-  journal_and_reply(mdr, 0, dn, le, new C_MDS_unlink_local_finish(this, mdr, dn, straydn));
+  journal_and_reply(
+      mdr, 0, dn, le, new C_MDS_unlink_local_finish(this, mdr, dn, straydn, in));
 }
 
-void Server::_unlink_local_finish(const MDRequestRef& mdr,
-				  CDentry *dn, CDentry *straydn,
-				  version_t dnpv) 
+void
+Server::_unlink_local_finish(
+    const MDRequestRef& mdr,
+    CDentry* dn,
+    CDentry* straydn,
+    CInode* in,
+    version_t dnpv)
 {
-  dout(10) << "_unlink_local_finish " << *dn << dendl;
+  dout(10) << "_unlink_local_finish " << *dn << " " << *in << dendl;
 
   if (!mdr->more()->witnessed.empty())
     mdcache->logged_leader_update(mdr->reqid);
 
-  CInode *strayin = NULL;
   bool hadrealm = false;
   if (straydn) {
     // if there is newly created snaprealm, need to split old snaprealm's
     // inodes_with_caps. So pop snaprealm before linkage changes.
-    strayin = dn->get_linkage()->get_inode();
-    hadrealm = strayin->snaprealm ? true : false;
-    strayin->early_pop_projected_snaprealm();
+    hadrealm = in->snaprealm ? true : false;
+    if (in->is_projected())
+      in->early_pop_projected_snaprealm();
   }
 
   // unlink main dentry
@@ -8747,7 +8847,11 @@ void Server::_unlink_local_finish(const MDRequestRef& mdr,
   // relink as stray?  (i.e. was primary link?)
   if (straydn) {
     dout(20) << " straydn is " << *straydn << dendl;
-    straydn->pop_projected_linkage();
+    if (straydn->is_projected()) {
+      straydn->pop_projected_linkage();
+    } else {
+      ceph_assert(straydn->get_linkage()->get_inode()->ino() == in->ino());
+    }
     mdcache->touch_dentry_bottom(straydn);
   }
 
@@ -8757,11 +8861,12 @@ void Server::_unlink_local_finish(const MDRequestRef& mdr,
   
   if (straydn) {
     // update subtree map?
-    if (strayin->is_dir())
-      mdcache->adjust_subtree_after_rename(strayin, dn->get_dir(), true);
+    if (in->is_dir())
+      mdcache->adjust_subtree_after_rename(in, dn->get_dir(), true);
 
-    if (strayin->snaprealm && !hadrealm)
-      mdcache->do_realm_invalidate_and_update_notify(strayin, CEPH_SNAP_OP_SPLIT, false);
+    if (in->snaprealm && !hadrealm)
+      mdcache->do_realm_invalidate_and_update_notify(
+          in, CEPH_SNAP_OP_SPLIT, false);
   }
 
   // bump pop
