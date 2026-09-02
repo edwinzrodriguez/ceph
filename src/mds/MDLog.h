@@ -39,21 +39,10 @@ enum {
   l_mdl_rdpos,
   l_mdl_jlat,
   l_mdl_replayed,
+  l_mdl_trim_tick,
+  l_mdl_trim_execute_usec,
   l_mdl_last,
 };
-
-#include "include/fs_types.h" // for inodeno_t
-#include "include/types.h"
-#include "include/Context.h"
-
-#include "common/Cond.h"
-#include "common/DecayCounter.h"
-#include "common/Thread.h"
-
-#include "LogSegment.h"
-#include "SegmentBoundary.h"
-#include "mdstypes.h"
-#include "LogSegmentRef.h"
 
 #include <atomic>
 #include <list>
@@ -61,6 +50,19 @@ enum {
 #include <set>
 #include <string>
 #include <vector>
+
+#include "common/Cond.h"
+#include "common/DecayCounter.h"
+#include "common/Thread.h"
+#include "common/ceph_mutex.h"
+#include "include/Context.h"
+#include "include/fs_types.h" // for inodeno_t
+#include "include/types.h"
+
+#include "LogSegment.h"
+#include "LogSegmentRef.h"
+#include "SegmentBoundary.h"
+#include "mdstypes.h"
 
 class Journaler;
 class JournalPointer;
@@ -187,6 +189,9 @@ public:
 
   // beacon needs me too
   bool is_trim_slow() const;
+
+  /// Run journal segment trim; caller must hold mds_lock.
+  void trim_tick();
 
 protected:
   struct PendingEvent {
@@ -334,8 +339,8 @@ private:
 
   // log trimming upkeeper thread
   std::thread upkeep_thread;
-  // guarded by mds_lock
-  std::condition_variable_any cond;
+  ceph::mutex upkeep_mutex = ceph::make_mutex("MDLog::upkeep_mutex");
+  ceph::condition_variable upkeep_cvar;
   std::atomic<bool> upkeep_log_trim_shutdown{false};
 
   std::map<uint64_t, std::vector<Context*>> waiting_for_expire; // protected by mds_lock
