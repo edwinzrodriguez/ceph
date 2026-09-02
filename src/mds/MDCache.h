@@ -1008,6 +1008,9 @@ private:
    * MDS_TRAVERSE_XLOCK_DENTRY: Caller wants to xlock tail dentry if MDS_TRAVERSE_WANT_INODE
    * is not set or (MDS_TRAVERSE_WANT_INODE is set but target inode does not exist)
    *
+   * For UNLINK/RMDIR on an existing tail dentry, parent directory scatter wrlocks are
+   * skipped during traverse; Server::handle_client_unlink acquires them later, after
+   * the file/stray locks, before journaling.
    * @param pdnvec Data return parameter -- on success, contains a
    * vector of dentries. On failure, is either empty or contains the
    * full trace of traversable dentries.
