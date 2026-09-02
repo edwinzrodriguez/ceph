@@ -100,6 +100,10 @@ ClassicDispatchEngine::submit_trim_tick()
 {}
 
 void
+ClassicDispatchEngine::submit_log_trim_tick()
+{}
+
+void
 ClassicDispatchEngine::submit_callable(
     DispatchLane lane,
     std::function<void()> fn)

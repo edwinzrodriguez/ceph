@@ -39,6 +39,8 @@ work_kind_owner_token(WorkKind kind)
     return "reactor:advance_queues";
   case WorkKind::TrimQuantum:
     return "reactor:trim_quantum";
+  case WorkKind::LogTrim:
+    return "reactor:log_trim";
   case WorkKind::Callable:
     return "reactor:callable";
   }
