@@ -933,6 +933,7 @@ void MDLog::try_expire(LogSegmentRef const& ls, int op_prio)
     gather_bld.activate();
   } else {
     dout(10) << "try_expire expired " << *ls << dendl;
+    ls->assert_elists_empty("try_expire");
     submit_mutex.lock();
     ceph_assert(expiring_segments.count(ls));
     expiring_segments.erase(ls);
@@ -970,10 +971,15 @@ void MDLog::_trim_expired_segments(auto& locker, MDSContext* ctx)
     if (auto msit = major_segments.find(seq); msit != major_segments.end() && end > 0) {
       dout(10) << __func__ << ": expiring up to this major segment seq=" << seq << dendl;
       uint64_t expire_pos = 0;
-      for (auto& [seq2, ls2] : segments) {
-        if (seq <= seq2) {
+      auto erase_it = segments.begin();
+      for (auto eit = segments.begin(); eit != it; ++eit) {
+        auto& ls2 = eit->second;
+        if (!expired_segments.count(ls2)) {
+          dout(10) << __func__ << ": stopping batch trim at non-expired "
+                   << *ls2 << dendl;
           break;
         }
+        ls2->assert_elists_empty("_trim_expired_segments");
         dout(20) << __func__ << ": expiring " << *ls2 << dendl;
         expired_events -= ls2->num_events;
         expired_segments.erase(ls2);
@@ -983,18 +989,22 @@ void MDLog::_trim_expired_segments(auto& locker, MDSContext* ctx)
         logger->inc(l_mdl_evtrm, ls2->num_events);
         logger->inc(l_mdl_segtrm);
         expire_pos = ls2->end;
+        erase_it = eit;
+        ++erase_it;
       }
-      segments.erase(segments.begin(), it);
-      logger->set(l_mdl_seg, segments.size());
-      major_segments.erase(major_segments.begin(), msit);
-      logger->set(l_mdl_segmjr, major_segments.size());
+      if (erase_it != segments.begin()) {
+        segments.erase(segments.begin(), erase_it);
+        logger->set(l_mdl_seg, segments.size());
+        major_segments.erase(major_segments.begin(), msit);
+        logger->set(l_mdl_segmjr, major_segments.size());
 
-      auto jexpire_pos = journaler->get_expire_pos();
-      if (jexpire_pos < expire_pos) {
-        journaler->set_expire_pos(expire_pos);
-        logger->set(l_mdl_expos, expire_pos);
-      } else {
-        logger->set(l_mdl_expos, jexpire_pos);
+        auto jexpire_pos = journaler->get_expire_pos();
+        if (jexpire_pos < expire_pos) {
+          journaler->set_expire_pos(expire_pos);
+          logger->set(l_mdl_expos, expire_pos);
+        } else {
+          logger->set(l_mdl_expos, jexpire_pos);
+        }
       }
     }
 

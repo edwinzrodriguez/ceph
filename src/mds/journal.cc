@@ -367,6 +367,45 @@ void LogSegment::try_to_expire(MDSRank *mds, MDSGatherBuilder &gather_bld, int o
   }
 }
 
+void
+LogSegment::assert_elists_empty(const char* where)
+{
+  if (!has_dirty_elists()) {
+    return;
+  }
+
+  generic_derr << where << ": " << *this << " has dirty elists" << dendl;
+  for (elist<CDir*>::iterator p = new_dirfrags.begin(); !p.end(); ++p) {
+    generic_derr << "  new_dirfrag " << **p << dendl;
+  }
+  for (elist<CDir*>::iterator p = dirty_dirfrags.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_dirfrag " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = dirty_inodes.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_inode " << **p << dendl;
+  }
+  for (elist<CDentry*>::iterator p = dirty_dentries.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_dentry " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = open_files.begin(); !p.end(); ++p) {
+    generic_derr << "  open_file " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = dirty_parent_inodes.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_parent_inode " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = dirty_dirfrag_dir.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_dirfrag_dir " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = dirty_dirfrag_nest.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_dirfrag_nest " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = dirty_dirfrag_dirfragtree.begin(); !p.end();
+       ++p) {
+    generic_derr << "  dirty_dirfrag_dirfragtree " << **p << dendl;
+  }
+  ceph_assert(!has_dirty_elists());
+}
+
 void LogSegment::purge_inodes_finish(interval_set<inodeno_t>& inos){
   purging_inodes.subtract(inos);
   if (NULL != purged_cb &&
