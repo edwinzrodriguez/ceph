@@ -73,6 +73,21 @@ class LogSegment {
     expiry_waiters.push_back(c);
   }
 
+  bool 
+  has_dirty_elists() const {
+    return !dirty_dirfrags.empty() ||
+           !new_dirfrags.empty() ||
+           !dirty_inodes.empty() ||
+           !dirty_dentries.empty() ||
+           !open_files.empty() ||
+           !dirty_parent_inodes.empty() ||
+           !dirty_dirfrag_dir.empty() ||
+           !dirty_dirfrag_nest.empty() ||
+           !dirty_dirfrag_dirfragtree.empty();
+  }
+
+  void assert_elists_empty(const char* where);
+
   const seq_t seq;
   uint64_t offset, end;
   uint64_t num_events = 0;
