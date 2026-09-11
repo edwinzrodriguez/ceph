@@ -1721,12 +1721,23 @@ void EMetaBlob::replay(MDSRank *mds, LogSegmentRef const& logseg, int type, MDPe
       if (session) {
 	dout(20) << " (session prealloc " << session->info.prealloc_inos << ")" << dendl;
 	if (used_preallocated_ino) {
-	  if (!session->info.prealloc_inos.empty()) {
-	    inodeno_t ino = session->take_ino(used_preallocated_ino);
-            dout(5) "received ino " << ino << " from the session" << dendl;
-	    ceph_assert(ino == used_preallocated_ino);
-	    session->info.prealloc_inos.erase(ino);
-	  }
+          if (session->info.prealloc_inos.contains(used_preallocated_ino)) {
+            inodeno_t ino = session->take_ino(used_preallocated_ino);
+            if (ino == used_preallocated_ino) {
+              dout(5) << "received ino " << ino << " from the session" << dendl;
+              session->info.prealloc_inos.erase(ino);
+            } else {
+              dout(5) << "EMetaBlob.replay used_prealloc "
+                      << used_preallocated_ino
+                      << " not available in session, marking taken" << dendl;
+              mds->mdcache->insert_taken_inos(used_preallocated_ino);
+            }
+          } else {
+            dout(5) << "EMetaBlob.replay used_prealloc "
+                    << used_preallocated_ino
+                    << " not in session prealloc, marking taken" << dendl;
+            mds->mdcache->insert_taken_inos(used_preallocated_ino);
+          }
           mds->sessionmap.replay_dirty_session(session);
 	}
 	if (!preallocated_inos.empty()) {

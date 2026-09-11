@@ -32,6 +32,7 @@ if(WITH_LIBCEPHFS)
     monconfig.cc
     client_cache.cc
     parallel_unlink.cc
+    prealloc_replay.cc
   )
   target_link_libraries(ceph_test_libcephfs
     ceph-common

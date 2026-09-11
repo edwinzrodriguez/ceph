@@ -1292,6 +1292,16 @@ options:
   fmt_desc: MDS will skip replaying the inotable when replaying the journal logs.
     (for testing only).
   with_legacy: true
+- name: mds_inject_prealloc_taken_retry
+  type: bool
+  level: dev
+  default: false
+  services:
+  - mds
+  fmt_desc: Force prepare_new_inode() to retry after take_ino() by marking the
+    preallocated ino as already taken, for journal replay regression tests.
+    (for testing only).
+  with_legacy: true
 #  percentage of MDS modify replies to skip sending the client a trace on [0-1]
 - name: mds_inject_traceless_reply_probability
   type: float
