@@ -3637,11 +3637,18 @@ CInode* Server::prepare_new_inode(const MDRequestRef& mdr, CDir *dir, inodeno_t 
   // assign ino
   do {
     if (allow_prealloc_inos && (mdr->used_prealloc_ino = _inode->ino = mdr->session->take_ino(_useino))) {
+      if (g_conf()->mds_inject_prealloc_taken_retry) {
+        mdcache->insert_taken_inos(mdr->used_prealloc_ino);
+      }
       if (mdcache->test_and_clear_taken_inos(_inode->ino)) {
+        inodeno_t taken = mdr->used_prealloc_ino;
         _inode->ino = 0;
-        dout(10) << "prepare_new_inode used_prealloc " << mdr->used_prealloc_ino
-                 << " (" << mdr->session->info.prealloc_inos.size() << " left)"
-	         << " but has been taken, will try again!" << dendl;
+        mdr->used_prealloc_ino = 0;
+        // take_ino() removed it from free_prealloc_inos; put it back for retry
+        mdr->session->free_prealloc_inos.insert(taken);
+        dout(10) << "prepare_new_inode used_prealloc " << taken << " ("
+                 << mdr->session->info.prealloc_inos.size() << " left)"
+                 << " but has been taken, will try again!" << dendl;
       } else {
         mds->sessionmap.mark_projected(mdr->session);
         dout(10) << "prepare_new_inode used_prealloc " << mdr->used_prealloc_ino
@@ -3649,13 +3656,16 @@ CInode* Server::prepare_new_inode(const MDRequestRef& mdr, CDir *dir, inodeno_t 
                  << dendl;
       }
     } else {
+      mdr->used_prealloc_ino = 0;
       mdr->alloc_ino =
        _inode->ino = mds->inotable->project_alloc_id(_useino);
       if (mdcache->test_and_clear_taken_inos(_inode->ino)) {
+        inodeno_t taken = mdr->alloc_ino;
         mds->inotable->apply_alloc_id(_inode->ino);
         _inode->ino = 0;
-        dout(10) << "prepare_new_inode alloc " << mdr->alloc_ino
-	         << " but has been taken, will try again!" << dendl;
+        mdr->alloc_ino = 0;
+        dout(10) << "prepare_new_inode alloc " << taken
+                 << " but has been taken, will try again!" << dendl;
       } else {
         dout(10) << "prepare_new_inode alloc " << mdr->alloc_ino << dendl;
       }
