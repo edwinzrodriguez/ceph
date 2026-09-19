@@ -345,8 +345,11 @@ void OpenFileTable::_journal_finish(int r, uint64_t log_seq, MDSContext *c,
   for (auto& [idx, vops] : ops_map) {
     object_t oid = get_object_name(idx);
     for (auto& op : vops) {
-      mds->objecter->mutate(oid, oloc, op, snapc, ceph::real_clock::now(),
-			    0, gather.new_sub());
+      Context* fin = gather.new_sub();
+      mds->mds_lock.unlock();
+      mds->objecter->mutate(
+          oid, oloc, op, snapc, ceph::real_clock::now(), 0, fin);
+      mds->mds_lock.lock();
     }
   }
   gather.activate();
@@ -360,6 +363,7 @@ void OpenFileTable::commit(MDSContext *c, uint64_t log_seq, int op_prio)
   dout(10) << __func__ << " log_seq " << log_seq << " committing_log_seq:"
           << committing_log_seq << dendl;
 
+  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
   ceph_assert(num_pending_commit == 0);
   num_pending_commit++;
   ceph_assert(log_seq >= committing_log_seq);
@@ -419,8 +423,12 @@ void OpenFileTable::commit(MDSContext *c, uint64_t log_seq, int op_prio)
     op.omap_set(tmp_map);
 
     object_t oid = get_object_name(idx);
-    mds->objecter->mutate(oid, oloc, op, snapc, ceph::real_clock::now(), 0,
-			  gather.new_sub());
+    Context* fin = gather.new_sub();
+    // Objecter may block in _throttle_op; MDLog::log_trim_upkeep holds
+    // mds_lock across try_to_commit_open_file_table -> commit.
+    mds->mds_lock.unlock();
+    mds->objecter->mutate(oid, oloc, op, snapc, ceph::real_clock::now(), 0, fin);
+    mds->mds_lock.lock();
 
 #ifdef HAVE_STDLIB_MAP_SPLICING
     ctl.journaled_update.merge(ctl.to_update);
@@ -473,8 +481,11 @@ void OpenFileTable::commit(MDSContext *c, uint64_t log_seq, int op_prio)
     for (auto& [idx, vops] : ops_map) {
       object_t oid = get_object_name(idx);
       for (auto& op : vops) {
-	mds->objecter->mutate(oid, oloc, op, snapc, ceph::real_clock::now(),
-			      0, gather.new_sub());
+        Context* fin = gather.new_sub();
+        mds->mds_lock.unlock();
+        mds->objecter->mutate(
+            oid, oloc, op, snapc, ceph::real_clock::now(), 0, fin);
+        mds->mds_lock.lock();
       }
     }
     gather.activate();
