@@ -62,6 +62,7 @@ private:
       DispatchLane lane,
       ceph::coarse_mono_time exec_start);
   void note_enqueued();
+  void maybe_abort_on_queue_depth(size_t depth);
   void publish_queue_depth_metrics();
 
   static constexpr unsigned dequeue_batch_size = 32;
@@ -71,4 +72,5 @@ private:
   std::thread op_thread;
   std::atomic<bool> stop{false};
   std::atomic<uint64_t> queue_len_max{0};
+  std::atomic<bool> queue_len_abort_armed{false};
 };

@@ -89,6 +89,22 @@ options:
   - reactor
   flags:
   - startup
+- name: mds_reactor_queue_len_abort
+  type: uint
+  level: dev
+  desc: Abort the MDS when the reactor dispatch queue depth reaches this value
+  long_desc: Debugging aid for reactor dispatch backlog stalls. When
+    ``mds_dispatch_engine=reactor`` and this value is non-zero, the MDS dumps
+    the recent in-memory log (see ``log_max_recent`` / ``debug_mds`` gather
+    level) and aborts as soon as ``MDSOpWorkQueue`` depth reaches the limit.
+    Use together with a large ``log_max_recent`` and ``debug_mds=N/M``
+    (``N`` low, ``M`` high) so the abort captures recent detail without writing
+    a full high-verbosity log to disk. ``0`` disables (default).
+  default: 0
+  services:
+  - mds
+  flags:
+  - runtime
 - name: mds_cache_quiesce_delay
   type: millisecs
   level: dev
