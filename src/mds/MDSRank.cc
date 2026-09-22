@@ -1100,7 +1100,7 @@ bool MDSRankDispatcher::ms_dispatch(const cref_t<Message> &m)
     ceph_assert(op);
   }
   else if (m->get_source().is_client()) {
-    Session *session = static_cast<Session*>(m->get_connection()->get_priv().get());
+    Session* session = static_cast<Session*>(m->get_connection()->peek_priv());
     if (session)
       session->last_seen = Session::clock::now();
   }
@@ -1482,8 +1482,9 @@ bool MDSRank::is_stale_message(const cref_t<Message> &m) const
 
 Session *MDSRank::get_session(const cref_t<Message> &m)
 {
-  // do not carry ref
-  auto session = static_cast<Session *>(m->get_connection()->get_priv().get());
+  // Peek without RefCountedPtr bump; Session lifetime is owned by the
+  // Connection priv under mds_lock for the duration of this dispatch.
+  auto session = static_cast<Session*>(m->get_connection()->peek_priv());
   if (session) {
     dout(20) << "get_session have " << session << " " << session->info.inst
 	     << " state " << session->get_state_name() << dendl;
@@ -1604,8 +1605,8 @@ void MDSRank::send_message_client_counted(const ref_t<Message>& m, client_t clie
 
 void MDSRank::send_message_client_counted(const ref_t<Message>& m, const ConnectionRef& connection)
 {
-  // do not carry ref
-  auto session = static_cast<Session *>(connection->get_priv().get());
+  // Peek without RefCountedPtr bump; see get_session().
+  auto session = static_cast<Session*>(connection->peek_priv());
   if (session) {
     send_message_client_counted(m, session);
   } else {

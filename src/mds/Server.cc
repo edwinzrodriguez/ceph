@@ -190,6 +190,18 @@ void Server::create_logger()
   plb.add_u64_counter(l_mdss_handle_client_session,
                       "handle_client_session", "Client session messages", "hcs",
                       PerfCountersBuilder::PRIO_INTERESTING);
+  plb.add_time_avg(
+      l_mdss_session_get_session_latency, "session_get_session_latency",
+      "get_session time in handle_client_session (seconds)", "sgs",
+      PerfCountersBuilder::PRIO_USEFUL);
+  plb.add_time_avg(
+      l_mdss_session_touch_latency, "session_touch_latency",
+      "touch_session time on RENEWCAPS (seconds)", "sts",
+      PerfCountersBuilder::PRIO_USEFUL);
+  plb.add_time_avg(
+      l_mdss_session_renewcaps_reply_latency, "session_renewcaps_reply_latency",
+      "RENEWCAPS reply build+send time (seconds)", "srr",
+      PerfCountersBuilder::PRIO_USEFUL);
   plb.add_u64_counter(l_mdss_cap_revoke_eviction, "cap_revoke_eviction",
                       "Cap Revoke Client Eviction", "cre", PerfCountersBuilder::PRIO_INTERESTING);
   plb.add_u64_counter(l_mdss_session_recall_throttle, "session_recall_throttle",
@@ -596,7 +608,13 @@ void Server::handle_client_reclaim(const cref_t<MClientReclaim> &m)
 void Server::handle_client_session(const cref_t<MClientSession> &m)
 {
   version_t pv;
+  const auto get_session_start = ceph::coarse_mono_clock::now();
   Session *session = mds->get_session(m);
+  if (logger) {
+    logger->tinc(
+        l_mdss_session_get_session_latency,
+        ceph::coarse_mono_clock::now() - get_session_start);
+  }
 
   dout(3) << "handle_client_session " << *m << " from " << m->get_source() << dendl;
   ceph_assert(m->is_a_client()); // should _not_ come from an mds!
@@ -825,15 +843,32 @@ void Server::handle_client_session(const cref_t<MClientSession> &m)
 
   case CEPH_SESSION_REQUEST_RENEWCAPS:
     if (session->is_open() || session->is_stale()) {
-      mds->sessionmap.touch_session(session);
+      {
+        const auto touch_start = ceph::coarse_mono_clock::now();
+        mds->sessionmap.touch_session(session);
+        if (logger) {
+          logger->tinc(
+              l_mdss_session_touch_latency,
+              ceph::coarse_mono_clock::now() - touch_start);
+        }
+      }
       if (session->is_stale()) {
 	mds->sessionmap.set_state(session, Session::STATE_OPEN);
 	mds->locker->resume_stale_caps(session);
 	mds->sessionmap.touch_session(session);
       }
       trim_completed_request_list(m->oldest_client_tid, session);
-      auto reply = make_message<MClientSession>(CEPH_SESSION_RENEWCAPS, m->get_seq());
-      mds->send_message_client(reply, session);
+      {
+        const auto reply_start = ceph::coarse_mono_clock::now();
+        auto reply =
+            make_message<MClientSession>(CEPH_SESSION_RENEWCAPS, m->get_seq());
+        mds->send_message_client(reply, session);
+        if (logger) {
+          logger->tinc(
+              l_mdss_session_renewcaps_reply_latency,
+              ceph::coarse_mono_clock::now() - reply_start);
+        }
+      }
     } else {
       dout(10) << "ignoring renewcaps on non open|stale session (" << session->get_state_name() << ")" << dendl;
     }
