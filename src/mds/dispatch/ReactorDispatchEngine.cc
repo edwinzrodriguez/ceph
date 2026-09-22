@@ -44,25 +44,25 @@ dispatch_usec_since(ceph::coarse_mono_time t)
 }
 
 static int
-dispatch_enqueue_usec_lane_counter(DispatchLane lane)
+dispatch_enqueue_latency_lane_counter(DispatchLane lane)
 {
   static const int counters[] = {
-      l_mds_dispatch_enqueue_usec_control,
-      l_mds_dispatch_enqueue_usec_io,
-      l_mds_dispatch_enqueue_usec_client,
-      l_mds_dispatch_enqueue_usec_maintenance,
+      l_mds_dispatch_enqueue_latency_control,
+      l_mds_dispatch_enqueue_latency_io,
+      l_mds_dispatch_enqueue_latency_client,
+      l_mds_dispatch_enqueue_latency_maintenance,
   };
   return counters[static_cast<size_t>(lane)];
 }
 
 static int
-dispatch_execute_usec_lane_counter(DispatchLane lane)
+dispatch_execute_latency_lane_counter(DispatchLane lane)
 {
   static const int counters[] = {
-      l_mds_dispatch_execute_usec_control,
-      l_mds_dispatch_execute_usec_io,
-      l_mds_dispatch_execute_usec_client,
-      l_mds_dispatch_execute_usec_maintenance,
+      l_mds_dispatch_execute_latency_control,
+      l_mds_dispatch_execute_latency_io,
+      l_mds_dispatch_execute_latency_client,
+      l_mds_dispatch_execute_latency_maintenance,
   };
   return counters[static_cast<size_t>(lane)];
 }
@@ -109,8 +109,8 @@ ReactorDispatchEngine::record_wait_metrics(const OpWorkItem& item)
   const int64_t wait_usec = dispatch_usec_since(item.enqueued_at);
   const auto wait = std::chrono::microseconds(wait_usec);
 
-  logger->tinc(l_mds_dispatch_enqueue_usec, wait);
-  logger->tinc(dispatch_enqueue_usec_lane_counter(item.lane), wait);
+  logger->tinc(l_mds_dispatch_enqueue_latency, wait);
+  logger->tinc(dispatch_enqueue_latency_lane_counter(item.lane), wait);
   logger->hinc(
       l_mds_dispatch_enqueue_hist, wait_usec, static_cast<int64_t>(item.lane));
 }
@@ -128,8 +128,8 @@ ReactorDispatchEngine::record_execute_metrics(
   const int64_t exec_usec = dispatch_usec_since(exec_start);
   const auto exec = std::chrono::microseconds(exec_usec);
 
-  logger->tinc(l_mds_dispatch_execute_usec, exec);
-  logger->tinc(dispatch_execute_usec_lane_counter(lane), exec);
+  logger->tinc(l_mds_dispatch_execute_latency, exec);
+  logger->tinc(dispatch_execute_latency_lane_counter(lane), exec);
   logger->hinc(
       l_mds_dispatch_execute_hist, exec_usec, static_cast<int64_t>(lane));
 }
