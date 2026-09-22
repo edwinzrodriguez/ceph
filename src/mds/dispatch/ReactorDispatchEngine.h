@@ -59,7 +59,7 @@ private:
   void execute_io_completion(MDSIOContextBase* ioctx, int r);
   void record_wait_metrics(const OpWorkItem& item);
   void record_execute_metrics(
-      DispatchLane lane,
+      const OpWorkItem& item,
       ceph::coarse_mono_time exec_start);
   void note_enqueued();
   void maybe_abort_on_queue_depth(size_t depth);

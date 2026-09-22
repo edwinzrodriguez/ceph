@@ -37,6 +37,7 @@
 #include "dispatch/MDSDispatchContext.h"
 #include "dispatch/MDSDispatchEngine.h"
 #include "dispatch/OpWorkItem.h"
+#include "dispatch/classify.h"
 #include "events/ELid.h"
 #include "events/ESubtreeMap.h"
 #include "log/Log.h"
@@ -4012,6 +4013,21 @@ void MDSRank::create_logger()
           "dispatch_execute_latency_maintenance",
           "Reactor dispatch execute time (maintenance lane, seconds)", "dexm",
           PerfCountersBuilder::PRIO_USEFUL);
+      {
+        const size_t wc_count = static_cast<size_t>(DispatchWorkClass::Count);
+        ceph_assert(
+            wc_count <= static_cast<size_t>(
+                            l_mds_dispatch_execute_latency_wc_last -
+                            l_mds_dispatch_execute_latency_wc_first + 1));
+        for (size_t i = 0; i < wc_count; ++i) {
+          const auto wc = static_cast<DispatchWorkClass>(i);
+          const auto& info = dispatch_work_class_info(wc);
+          mds_plb.add_time_avg(
+              l_mds_dispatch_execute_latency_wc_first + static_cast<int>(i),
+              info.counter_name, info.description, info.nick,
+              PerfCountersBuilder::PRIO_USEFUL);
+        }
+      }
       mds_plb.add_u64_counter_histogram(
           l_mds_dispatch_enqueue_hist, "dispatch_enqueue_hist",
           dispatch_latency_x, dispatch_lane_y,
