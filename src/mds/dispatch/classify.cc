@@ -58,6 +58,7 @@ classify_inbound_message(const Message& m)
   case CEPH_MSG_CLIENT_CAPS:
   case CEPH_MSG_CLIENT_CAPRELEASE:
   case CEPH_MSG_CLIENT_LEASE:
+  case CEPH_MSG_CLIENT_METRICS:
   case MSG_MDS_PEER_REQUEST:
   case MSG_MDS_LOCK:
   case MSG_MDS_INODEFILECAPS:
