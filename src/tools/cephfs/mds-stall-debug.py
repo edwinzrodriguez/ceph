@@ -912,16 +912,16 @@ PERF_DISPATCH_KEYS = (
     "dispatch_queue_len_max",
     "dispatch_inbound",
     "dispatch_io_completions",
-    "dispatch_enqueue_usec",
-    "dispatch_execute_usec",
-    "dispatch_enqueue_usec_client",
-    "dispatch_execute_usec_client",
-    "dispatch_enqueue_usec_control",
-    "dispatch_execute_usec_control",
-    "dispatch_enqueue_usec_maintenance",
-    "dispatch_execute_usec_maintenance",
-    "dispatch_enqueue_usec_io",
-    "dispatch_execute_usec_io",
+    "dispatch_enqueue_latency",
+    "dispatch_execute_latency",
+    "dispatch_enqueue_latency_client",
+    "dispatch_execute_latency_client",
+    "dispatch_enqueue_latency_control",
+    "dispatch_execute_latency_control",
+    "dispatch_enqueue_latency_maintenance",
+    "dispatch_execute_latency_maintenance",
+    "dispatch_enqueue_latency_io",
+    "dispatch_execute_latency_io",
     "req",
     "reply",
     "forward",
@@ -1623,28 +1623,28 @@ def build_prometheus_queries(selector: str) -> Dict[str, str]:
         ),
         "handle_client_caps_rate": counter_rate("ceph_mds_handle_client_caps"),
         "reply_rate": counter_rate("ceph_mds_reply"),
-        "dispatch_enqueue_usec": time_avg("ceph_mds_dispatch_enqueue_usec"),
-        "dispatch_execute_usec": time_avg("ceph_mds_dispatch_execute_usec"),
-        "dispatch_enqueue_usec_client": time_avg(
-            "ceph_mds_dispatch_enqueue_usec_client"
+        "dispatch_enqueue_latency": time_avg("ceph_mds_dispatch_enqueue_latency"),
+        "dispatch_execute_latency": time_avg("ceph_mds_dispatch_execute_latency"),
+        "dispatch_enqueue_latency_client": time_avg(
+            "ceph_mds_dispatch_enqueue_latency_client"
         ),
-        "dispatch_execute_usec_client": time_avg(
-            "ceph_mds_dispatch_execute_usec_client"
+        "dispatch_execute_latency_client": time_avg(
+            "ceph_mds_dispatch_execute_latency_client"
         ),
-        "dispatch_enqueue_usec_control": time_avg(
-            "ceph_mds_dispatch_enqueue_usec_control"
+        "dispatch_enqueue_latency_control": time_avg(
+            "ceph_mds_dispatch_enqueue_latency_control"
         ),
-        "dispatch_execute_usec_control": time_avg(
-            "ceph_mds_dispatch_execute_usec_control"
+        "dispatch_execute_latency_control": time_avg(
+            "ceph_mds_dispatch_execute_latency_control"
         ),
-        "dispatch_enqueue_usec_maintenance": time_avg(
-            "ceph_mds_dispatch_enqueue_usec_maintenance"
+        "dispatch_enqueue_latency_maintenance": time_avg(
+            "ceph_mds_dispatch_enqueue_latency_maintenance"
         ),
-        "dispatch_execute_usec_maintenance": time_avg(
-            "ceph_mds_dispatch_execute_usec_maintenance"
+        "dispatch_execute_latency_maintenance": time_avg(
+            "ceph_mds_dispatch_execute_latency_maintenance"
         ),
-        "dispatch_enqueue_usec_io": time_avg("ceph_mds_dispatch_enqueue_usec_io"),
-        "dispatch_execute_usec_io": time_avg("ceph_mds_dispatch_execute_usec_io"),
+        "dispatch_enqueue_latency_io": time_avg("ceph_mds_dispatch_enqueue_latency_io"),
+        "dispatch_execute_latency_io": time_avg("ceph_mds_dispatch_execute_latency_io"),
         "cache_trim_throttle_rate": counter_rate("ceph_mds_cache_cache_trim_throttle"),
         "mem_heap": f"max({('ceph_mds_mem_heap' + selector)})",
         "mem_cap": f"max({('ceph_mds_mem_cap' + selector)})",
