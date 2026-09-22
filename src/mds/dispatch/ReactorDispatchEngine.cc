@@ -18,8 +18,12 @@
 #include "common/debug.h"
 #include "mds_lock_debug.h"
 
+#include "common/ceph_context.h"
+#include "common/config.h"
 #include "common/perf_counters.h"
+#include "include/ceph_assert.h"
 #include "include/compat.h"
+#include "log/Log.h"
 
 #include "MDCache.h"
 #include "MDLog.h"
@@ -75,6 +79,33 @@ ReactorDispatchEngine::note_enqueued()
   while (depth > max && !queue_len_max.compare_exchange_weak(
                             max, depth, std::memory_order_relaxed)) {
   }
+  maybe_abort_on_queue_depth(depth);
+}
+
+void
+ReactorDispatchEngine::maybe_abort_on_queue_depth(size_t depth)
+{
+  const uint64_t limit =
+      g_conf().get_val<uint64_t>("mds_reactor_queue_len_abort");
+  if (limit == 0 || depth < limit) {
+    return;
+  }
+  // Only one producer should dump+abort if many race past the threshold.
+  if (queue_len_abort_armed.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  derr << "mds_reactor_queue_len_abort: dispatch queue depth " << depth
+       << " >= limit " << limit
+       << " (queue_len_max=" << queue_len_max.load(std::memory_order_relaxed)
+       << ")" << dendl;
+  publish_queue_depth_metrics();
+  if (g_ceph_context && g_ceph_context->_log) {
+    g_ceph_context->_log->dump_recent();
+  }
+  ceph_abort_msg(
+      "mds_reactor_queue_len_abort: reactor dispatch queue depth exceeded "
+      "mds_reactor_queue_len_abort");
 }
 
 void
