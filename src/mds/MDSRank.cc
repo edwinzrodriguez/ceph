@@ -3967,46 +3967,50 @@ void MDSRank::create_logger()
           "Inbound messages executed on reactor op thread", "dinb",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_enqueue_usec, "dispatch_enqueue_usec",
-          "Reactor dispatch queue wait time", "deq",
+          l_mds_dispatch_enqueue_latency, "dispatch_enqueue_latency",
+          "Reactor dispatch queue wait time (seconds)", "deq",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_execute_usec, "dispatch_execute_usec",
-          "Reactor dispatch op execution time", "dex",
+          l_mds_dispatch_execute_latency, "dispatch_execute_latency",
+          "Reactor dispatch op execution time (seconds)", "dex",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_enqueue_usec_control, "dispatch_enqueue_usec_control",
-          "Reactor dispatch queue wait (control lane)", "deqc",
+          l_mds_dispatch_enqueue_latency_control,
+          "dispatch_enqueue_latency_control",
+          "Reactor dispatch queue wait (control lane, seconds)", "deqc",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_enqueue_usec_io, "dispatch_enqueue_usec_io",
-          "Reactor dispatch queue wait (io lane)", "deqi",
+          l_mds_dispatch_enqueue_latency_io, "dispatch_enqueue_latency_io",
+          "Reactor dispatch queue wait (io lane, seconds)", "deqi",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_enqueue_usec_client, "dispatch_enqueue_usec_client",
-          "Reactor dispatch queue wait (client lane)", "deql",
+          l_mds_dispatch_enqueue_latency_client,
+          "dispatch_enqueue_latency_client",
+          "Reactor dispatch queue wait (client lane, seconds)", "deql",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_enqueue_usec_maintenance,
-          "dispatch_enqueue_usec_maintenance",
-          "Reactor dispatch queue wait (maintenance lane)", "deqm",
+          l_mds_dispatch_enqueue_latency_maintenance,
+          "dispatch_enqueue_latency_maintenance",
+          "Reactor dispatch queue wait (maintenance lane, seconds)", "deqm",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_execute_usec_control, "dispatch_execute_usec_control",
-          "Reactor dispatch execute time (control lane)", "dexc",
+          l_mds_dispatch_execute_latency_control,
+          "dispatch_execute_latency_control",
+          "Reactor dispatch execute time (control lane, seconds)", "dexc",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_execute_usec_io, "dispatch_execute_usec_io",
-          "Reactor dispatch execute time (io lane)", "dexi",
+          l_mds_dispatch_execute_latency_io, "dispatch_execute_latency_io",
+          "Reactor dispatch execute time (io lane, seconds)", "dexi",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_execute_usec_client, "dispatch_execute_usec_client",
-          "Reactor dispatch execute time (client lane)", "dexl",
+          l_mds_dispatch_execute_latency_client,
+          "dispatch_execute_latency_client",
+          "Reactor dispatch execute time (client lane, seconds)", "dexl",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_execute_usec_maintenance,
-          "dispatch_execute_usec_maintenance",
-          "Reactor dispatch execute time (maintenance lane)", "dexm",
+          l_mds_dispatch_execute_latency_maintenance,
+          "dispatch_execute_latency_maintenance",
+          "Reactor dispatch execute time (maintenance lane, seconds)", "dexm",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_u64_counter_histogram(
           l_mds_dispatch_enqueue_hist, "dispatch_enqueue_hist",
