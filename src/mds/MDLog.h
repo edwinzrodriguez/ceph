@@ -45,8 +45,10 @@ enum {
 };
 
 #include <atomic>
+#include <chrono>
 #include <list>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -55,6 +57,7 @@ enum {
 #include "common/DecayCounter.h"
 #include "common/Thread.h"
 #include "common/ceph_mutex.h"
+#include "common/ceph_time.h"
 #include "include/Context.h"
 #include "include/fs_types.h" // for inodeno_t
 #include "include/types.h"
@@ -191,7 +194,10 @@ public:
   bool is_trim_slow() const;
 
   /// Run journal segment trim; caller must hold mds_lock.
-  void trim_tick();
+  /// @param max_duration wall-clock budget; zero means no time limit.
+  /// @return true if more trim work remains (caller may re-enqueue).
+  bool trim_tick(
+      std::chrono::milliseconds max_duration = std::chrono::milliseconds::zero());
 
 protected:
   struct PendingEvent {
@@ -312,10 +318,19 @@ private:
   void try_expire(LogSegmentRef const& ls, int op_prio);
   void _maybe_expired(LogSegmentRef const& ls, int op_prio);
   void _expired(LogSegmentRef const& ls);
-  void _trim_expired_segments(auto& locker, MDSContext* ctx=nullptr);
+  /// @return true if expired-segment work remains (or was deferred by deadline).
+  bool _trim_expired_segments(
+      auto& locker,
+      MDSContext* ctx = nullptr,
+      std::optional<ceph::coarse_mono_time> deadline = std::nullopt);
   void write_head(MDSContext *onfinish);
 
-  void trim();
+  /// @return true if more segments still need trimming.
+  /// @param max_duration wall-clock budget; zero means no time limit.
+  ///        Implemented as deadline = now() + max_duration and checked
+  ///        throughout the expire loop and post-loop finish work.
+  bool trim(
+      std::chrono::milliseconds max_duration = std::chrono::milliseconds::zero());
   void log_trim_upkeep(void);
 
   bool debug_subtrees;

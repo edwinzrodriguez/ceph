@@ -734,19 +734,39 @@ bool MDLog::is_trim_slow() const {
   return (segments.size() > (size_t)(max_segments * log_warn_factor));
 }
 
-void
-MDLog::trim_tick()
+namespace {
+
+std::optional<ceph::coarse_mono_time>
+make_trim_deadline(std::chrono::milliseconds max_duration)
+{
+  if (max_duration <= std::chrono::milliseconds::zero()) {
+    return std::nullopt;
+  }
+  return ceph::coarse_mono_clock::now() + max_duration;
+}
+
+bool
+past_trim_deadline(const std::optional<ceph::coarse_mono_time>& deadline)
+{
+  return deadline && ceph::coarse_mono_clock::now() >= *deadline;
+}
+
+} // namespace
+
+bool
+MDLog::trim_tick(std::chrono::milliseconds max_duration)
 {
   MDS_ASSERT_MDS_LOCK(mds->mds_lock);
 
   const auto trim_start = ceph::coarse_mono_clock::now();
-  trim();
+  const bool more = trim(max_duration);
   if (logger) {
     const auto trim_usec = std::chrono::duration_cast<std::chrono::microseconds>(
         ceph::coarse_mono_clock::now() - trim_start);
     logger->inc(l_mdl_trim_tick);
     logger->tinc(l_mdl_trim_execute_usec, trim_usec);
   }
+  return more;
 }
 
 void MDLog::log_trim_upkeep(void) {
@@ -784,13 +804,14 @@ void MDLog::log_trim_upkeep(void) {
   dout(10) << __func__ << ": finished" << dendl;
 }
 
-void MDLog::trim()
+bool
+MDLog::trim(std::chrono::milliseconds max_duration)
 {
   int max_ev = max_events;
 
   if (mds->mdcache->is_readonly()) {
     dout(10) << "trim, ignoring read-only FS" <<  dendl;
-    return;
+    return false;
   }
 
   // Clamp max_ev to not be smaller than events per segment
@@ -809,7 +830,7 @@ void MDLog::trim()
 	   << dendl;
 
   if (segments.empty()) {
-    return;
+    return false;
   }
 
   int op_prio = CEPH_MSG_PRIO_LOW +
@@ -826,11 +847,27 @@ void MDLog::trim()
 
   map<uint64_t,LogSegmentRef>::iterator p = segments.begin();
 
-  auto trim_start = ceph::coarse_mono_clock::now();
+  const auto trim_start = ceph::coarse_mono_clock::now();
+  const auto deadline = make_trim_deadline(max_duration);
   std::optional<ceph::coarse_mono_time> trim_end;
 
   auto log_trim_counter_start = log_trim_counter.get();
   auto log_trim_threshold = g_conf().get_val<Option::size_t>("mds_log_trim_threshold");
+
+  auto above_trim_ceiling = [&] {
+    unsigned num_remaining_segments =
+        (segments.size() - expired_segments.size() - expiring_segments.size());
+    if (num_remaining_segments > max_segments) {
+      return true;
+    }
+    if (max_ev >= 0 &&
+        (num_events - expiring_events - expired_events) > (uint64_t)max_ev) {
+      return true;
+    }
+    return false;
+  };
+
+  bool more = false;
 
   while (p != segments.end()) {
     // throttle - break out of trimmming if we've hit the threshold
@@ -842,6 +879,15 @@ void MDLog::trim()
       dout(10) << __func__ << ": breaking out of trim loop - trimmed "
 	       << new_expiring_segments << " segment(s) in " << time_spent.count()
 	       << "s" << dendl;
+      more = above_trim_ceiling();
+      break;
+    }
+
+    if (past_trim_deadline(deadline)) {
+      dout(10) << __func__
+               << ": breaking out of trim loop - past deadline after "
+               << new_expiring_segments << " segment(s)" << dendl;
+      more = true;
       break;
     }
 
@@ -850,10 +896,10 @@ void MDLog::trim()
 	     << ", num_remaining_segments=" << num_remaining_segments
 	     << ", max_segments=" << max_segments << dendl;
 
-    if ((num_remaining_segments <= max_segments) &&
-	(max_ev < 0 || (num_events - expiring_events - expired_events) <= (uint64_t)max_ev)) {
+    if (!above_trim_ceiling()) {
       dout(10) << __func__ << ": breaking out of trim loop - segments/events fell below ceiling"
 	       << " max_segments/max_ev" << dendl;
+      more = false;
       break;
     }
 
@@ -866,6 +912,8 @@ void MDLog::trim()
 	ls->end > safe_pos) {
       dout(5) << "trim " << *ls << " is not fully flushed yet: safe "
 	      << journaler->get_write_safe_pos() << " < end " << ls->end << dendl;
+      // Cannot make progress until flush completes; let the upkeep interval retry.
+      more = false;
       break;
     }
 
@@ -892,9 +940,25 @@ void MDLog::trim()
 
   ceph_assert(locker.owns_lock());
 
+  // Finish work is part of the same wall-clock budget so a tick that
+  // spent its quota in the expire loop does not still hold mds_lock for
+  // open-file-table commit / expired-segment cleanup.
+  if (past_trim_deadline(deadline)) {
+    dout(10) << __func__ << ": past deadline, deferring open_file_table commit "
+             << "and expired-segment trim" << dendl;
+    return true;
+  }
+
   try_to_commit_open_file_table(get_last_segment_seq());
 
-  _trim_expired_segments(locker);
+  if (past_trim_deadline(deadline)) {
+    dout(10) << __func__ << ": past deadline after open_file_table commit, "
+             << "deferring expired-segment trim" << dendl;
+    return true;
+  }
+
+  const bool expired_more = _trim_expired_segments(locker, nullptr, deadline);
+  return more || expired_more;
 }
 
 class C_MaybeExpiredSegment : public MDSInternalContext {
@@ -1006,14 +1070,26 @@ void MDLog::_maybe_expired(LogSegmentRef const& ls, int op_prio)
   try_expire(ls, op_prio);
 }
 
-void MDLog::_trim_expired_segments(auto& locker, MDSContext* ctx)
+bool
+MDLog::_trim_expired_segments(
+    auto& locker,
+    MDSContext* ctx,
+    std::optional<ceph::coarse_mono_time> deadline)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(submit_mutex));
   ceph_assert(locker.owns_lock());
 
   // trim expired segments?
   uint64_t end = 0;
+  bool deferred = false;
   for (auto it = segments.begin(); it != segments.end(); ++it) {
+    if (past_trim_deadline(deadline)) {
+      dout(10) << __func__ << ": past deadline, deferring remaining expired "
+               << "segment trim" << dendl;
+      deferred = true;
+      break;
+    }
+
     auto& [seq, ls] = *it;
     dout(20) << __func__ << ": examining " << *ls << dendl;
 
@@ -1066,9 +1142,11 @@ void MDLog::_trim_expired_segments(auto& locker, MDSContext* ctx)
     dout(10) << __func__ << ": maybe expiring " << *ls << dendl;
   }
 
+  const bool more_expired = deferred || !expired_segments.empty();
   locker.unlock();
 
   write_head(ctx);
+  return more_expired;
 }
 
 void MDLog::_expired(LogSegmentRef const& ls)

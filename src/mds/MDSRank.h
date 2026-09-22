@@ -146,9 +146,11 @@ enum {
   l_mds_dispatch_execute_latency_maintenance,
   // Per DispatchWorkClass execute averages (see classify.h). Contiguous block
   // indexed as l_mds_dispatch_execute_latency_wc_first + class_id.
+  // Must equal DispatchWorkClass::Count entries (no gaps — PerfCountersBuilder
+  // requires every index between l_mds_first and l_mds_last to be populated).
   l_mds_dispatch_execute_latency_wc_first,
   l_mds_dispatch_execute_latency_wc_last =
-      l_mds_dispatch_execute_latency_wc_first + 31,
+      l_mds_dispatch_execute_latency_wc_first + 23,
   l_mds_dispatch_io_completions,
   l_mds_dispatch_inbound,
   l_mds_last,

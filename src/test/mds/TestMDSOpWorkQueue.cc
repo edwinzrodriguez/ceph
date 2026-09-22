@@ -157,6 +157,28 @@ TEST(MDSOpWorkQueue, PerLaneBankSwap)
   item->destroy();
 }
 
+TEST(MDSOpWorkQueue, MaintenancePreemptsClient)
+{
+  MDSOpWorkQueue queue;
+
+  queue.enqueue(
+      OpWorkItem::create_inbound(
+          make_message(CEPH_MSG_CLIENT_REQUEST), DispatchLane::Client),
+      DispatchLane::Client);
+  queue.enqueue(OpWorkItem::create_trim(), DispatchLane::Maintenance);
+
+  OpWorkItem* maint = queue.dequeue();
+  ASSERT_NE(maint, nullptr);
+  EXPECT_EQ(maint->lane, DispatchLane::Maintenance);
+  EXPECT_EQ(maint->kind, WorkKind::TrimQuantum);
+  maint->destroy();
+
+  OpWorkItem* client = queue.dequeue();
+  ASSERT_NE(client, nullptr);
+  EXPECT_EQ(client->lane, DispatchLane::Client);
+  client->destroy();
+}
+
 TEST(MDSOpWorkQueue, ControlPreemptsClientOnProducerBank)
 {
   MDSOpWorkQueue queue;
