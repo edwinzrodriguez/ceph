@@ -17,31 +17,32 @@
 
 #include <atomic>
 #include <chrono>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
 
+#include <boost/intrusive_ptr.hpp>
+
 #include "common/DecayCounter.h"
 #include "common/MemoryModel.h"
 #include "common/admin_finisher.h"
+#include "include/Context.h"
 #include "include/common_fwd.h"
-#include "include/types.h"
-#include "include/filepath.h"
 #include "include/elist.h"
+#include "include/filepath.h"
 #include "include/rados/rados_types.hpp"
-
+#include "include/types.h"
 #include "osdc/Filer.h"
-#include "CInode.h"
+
 #include "CDentry.h"
 #include "CDir.h"
-#include "include/Context.h"
+#include "CInode.h"
+#include "LogSegmentRef.h"
+#include "MDSContext.h"
+#include "OpenFileTable.h"
 #include "RecoveryQueue.h"
 #include "StrayManager.h"
-#include "OpenFileTable.h"
-#include "MDSContext.h"
-#include "LogSegmentRef.h"
-
-#include <boost/intrusive_ptr.hpp>
 
 class EMetaBlob;
 class MCacheExpire;
@@ -808,10 +809,15 @@ private:
   size_t get_cache_size() { return lru.lru_get_size(); }
 
   // trimming
-  std::pair<bool, uint64_t> trim(uint64_t count=0);
+  std::pair<bool, uint64_t> trim(
+      uint64_t count = 0,
+      std::chrono::milliseconds max_duration = std::chrono::milliseconds::zero());
   /// One bounded cache-trim slice; caller must hold mds_lock.
-  /// @return true if the cache was trimmable and trim work ran
-  bool trim_quantum();
+  /// @param max_duration wall-clock budget; zero means no time limit.
+  /// @return nullopt if the cache was not trimmable; otherwise whether more
+  ///         trim work remains (caller may re-enqueue).
+  std::optional<bool> trim_quantum(
+      std::chrono::milliseconds max_duration = std::chrono::milliseconds::zero());
 
   bool trim_non_auth_subtree(CDir *directory);
   void standby_trim_segment(LogSegmentRef const& ls);
@@ -1536,7 +1542,10 @@ private:
 
   void identify_files_to_recover();
 
-  std::pair<bool, uint64_t> trim_lru(uint64_t count, expiremap& expiremap);
+  std::pair<bool, uint64_t> trim_lru(
+      uint64_t count,
+      expiremap& expiremap,
+      std::chrono::milliseconds max_duration = std::chrono::milliseconds::zero());
   bool trim_dentry(CDentry *dn, expiremap& expiremap);
   void trim_dirfrag(CDir *dir, CDir *con, expiremap& expiremap);
   bool trim_inode(CDentry *dn, CInode *in, CDir *con, expiremap&);

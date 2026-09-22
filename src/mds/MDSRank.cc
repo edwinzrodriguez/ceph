@@ -4015,8 +4015,8 @@ void MDSRank::create_logger()
           PerfCountersBuilder::PRIO_USEFUL);
       {
         const size_t wc_count = static_cast<size_t>(DispatchWorkClass::Count);
-        ceph_assert(
-            wc_count <= static_cast<size_t>(
+        static_assert(
+            wc_count == static_cast<size_t>(
                             l_mds_dispatch_execute_latency_wc_last -
                             l_mds_dispatch_execute_latency_wc_first + 1));
         for (size_t i = 0; i < wc_count; ++i) {
@@ -4428,6 +4428,7 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_cache_quiesce_threshold",
     "mds_cache_reservation",
     "mds_cache_trim_decay_rate",
+    "mds_cache_trim_max_duration",
     "mds_cap_acquisition_throttle_retry_request_time",
     "mds_cap_revoke_eviction_timeout",
     "mds_debug_subtrees",
@@ -4465,6 +4466,7 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_log_skip_corrupt_events",
     "mds_log_skip_unbounded_events",
     "mds_log_trim_decay_rate",
+    "mds_log_trim_max_duration",
     "mds_log_trim_threshold",
     "mds_max_caps_per_client",
     "mds_max_export_size",
