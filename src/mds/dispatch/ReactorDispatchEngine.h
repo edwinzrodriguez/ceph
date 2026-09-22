@@ -18,7 +18,8 @@
  *
  * Reactor-mode dispatch backend (mds_dispatch_engine=reactor). Producers enqueue
  * OpWorkItem instances; a single op thread drains MDSOpWorkQueue and executes
- * work under mds_lock without other threads contending for that lock.
+ * Lane priority (high -> low): Control, IOComplete, Maintenance, Client.
+ * TrimQuantum/LogTrim are single-flight and cooperatively time-sliced.
  */
 
 #pragma once
@@ -64,6 +65,8 @@ private:
   void note_enqueued();
   void maybe_abort_on_queue_depth(size_t depth);
   void publish_queue_depth_metrics();
+  void finish_trim_quantum(bool more);
+  void finish_log_trim(bool more);
 
   static constexpr unsigned dequeue_batch_size = 32;
 
@@ -73,4 +76,7 @@ private:
   std::atomic<bool> stop{false};
   std::atomic<uint64_t> queue_len_max{0};
   std::atomic<bool> queue_len_abort_armed{false};
+  /// At most one TrimQuantum / LogTrim outstanding (queued or running).
+  std::atomic<bool> trim_quantum_queued{false};
+  std::atomic<bool> log_trim_queued{false};
 };

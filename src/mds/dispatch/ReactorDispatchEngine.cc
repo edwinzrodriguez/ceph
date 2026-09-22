@@ -53,8 +53,8 @@ dispatch_enqueue_latency_lane_counter(DispatchLane lane)
   static const int counters[] = {
       l_mds_dispatch_enqueue_latency_control,
       l_mds_dispatch_enqueue_latency_io,
-      l_mds_dispatch_enqueue_latency_client,
       l_mds_dispatch_enqueue_latency_maintenance,
+      l_mds_dispatch_enqueue_latency_client,
   };
   return counters[static_cast<size_t>(lane)];
 }
@@ -65,8 +65,8 @@ dispatch_execute_latency_lane_counter(DispatchLane lane)
   static const int counters[] = {
       l_mds_dispatch_execute_latency_control,
       l_mds_dispatch_execute_latency_io,
-      l_mds_dispatch_execute_latency_client,
       l_mds_dispatch_execute_latency_maintenance,
+      l_mds_dispatch_execute_latency_client,
   };
   return counters[static_cast<size_t>(lane)];
 }
@@ -198,6 +198,8 @@ ReactorDispatchEngine::shutdown()
   queue.flush_and_clear();
 
   queue_len_max.store(0, std::memory_order_relaxed);
+  trim_quantum_queued.store(false, std::memory_order_relaxed);
+  log_trim_queued.store(false, std::memory_order_relaxed);
   if (ctx.rank && ctx.rank->logger) {
     ctx.rank->logger->set(l_mds_reactor_dispatch_queue_len, 0);
     ctx.rank->logger->set(l_mds_dispatch_queue_len_max, 0);
@@ -236,6 +238,10 @@ ReactorDispatchEngine::submit_advance_queues()
 void
 ReactorDispatchEngine::submit_trim_tick()
 {
+  // Single-flight: at most one TrimQuantum queued or running.
+  if (trim_quantum_queued.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
   OpWorkItem* item = OpWorkItem::create_trim();
   enqueue_item(item, DispatchLane::Maintenance);
 }
@@ -243,8 +249,33 @@ ReactorDispatchEngine::submit_trim_tick()
 void
 ReactorDispatchEngine::submit_log_trim_tick()
 {
+  // Single-flight: at most one LogTrim queued or running.
+  if (log_trim_queued.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
   OpWorkItem* item = OpWorkItem::create_log_trim();
   enqueue_item(item, DispatchLane::Maintenance);
+}
+
+void
+ReactorDispatchEngine::finish_trim_quantum(bool more)
+{
+  if (more && !stop.load(std::memory_order_relaxed)) {
+    // Keep trim_quantum_queued set; continuation is the outstanding item.
+    enqueue_item(OpWorkItem::create_trim(), DispatchLane::Maintenance);
+    return;
+  }
+  trim_quantum_queued.store(false, std::memory_order_release);
+}
+
+void
+ReactorDispatchEngine::finish_log_trim(bool more)
+{
+  if (more && !stop.load(std::memory_order_relaxed)) {
+    enqueue_item(OpWorkItem::create_log_trim(), DispatchLane::Maintenance);
+    return;
+  }
+  log_trim_queued.store(false, std::memory_order_release);
 }
 
 void
@@ -331,13 +362,22 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
 
   case WorkKind::TrimQuantum:
     if (ctx.rank && ctx.rank->mdcache) {
-      ctx.rank->mdcache->trim_quantum();
+      const auto budget = g_conf().get_val<std::chrono::milliseconds>(
+          "mds_cache_trim_max_duration");
+      const auto more = ctx.rank->mdcache->trim_quantum(budget);
+      finish_trim_quantum(more && *more);
+    } else {
+      finish_trim_quantum(false);
     }
     break;
 
   case WorkKind::LogTrim:
     if (ctx.rank && ctx.rank->mdlog) {
-      ctx.rank->mdlog->trim_tick();
+      const auto budget = g_conf().get_val<std::chrono::milliseconds>(
+          "mds_log_trim_max_duration");
+      finish_log_trim(ctx.rank->mdlog->trim_tick(budget));
+    } else {
+      finish_log_trim(false);
     }
     break;
   }

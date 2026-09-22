@@ -112,7 +112,7 @@ const DispatchWorkClassInfo work_class_info[] = {
     {"dispatch_execute_latency_remove_snaps",
      "Reactor execute time (MSG_REMOVE_SNAPS, seconds)", "dxrs"},
     {"dispatch_execute_latency_command",
-     "Reactor execute time (MSG_COMMAND, seconds)", "dxcmd"},
+     "Reactor execute time (MSG_COMMAND, seconds)", "dxcm"},
     {"dispatch_execute_latency_mon_command",
      "Reactor execute time (MSG_MON_COMMAND, seconds)", "dxmc"},
     {"dispatch_execute_latency_client_session",
