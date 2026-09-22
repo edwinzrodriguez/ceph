@@ -144,6 +144,11 @@ enum {
   l_mds_dispatch_execute_latency_io,
   l_mds_dispatch_execute_latency_client,
   l_mds_dispatch_execute_latency_maintenance,
+  // Per DispatchWorkClass execute averages (see classify.h). Contiguous block
+  // indexed as l_mds_dispatch_execute_latency_wc_first + class_id.
+  l_mds_dispatch_execute_latency_wc_first,
+  l_mds_dispatch_execute_latency_wc_last =
+      l_mds_dispatch_execute_latency_wc_first + 31,
   l_mds_dispatch_io_completions,
   l_mds_dispatch_inbound,
   l_mds_last,

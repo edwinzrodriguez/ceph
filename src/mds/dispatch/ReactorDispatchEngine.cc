@@ -148,7 +148,7 @@ ReactorDispatchEngine::record_wait_metrics(const OpWorkItem& item)
 
 void
 ReactorDispatchEngine::record_execute_metrics(
-    DispatchLane lane,
+    const OpWorkItem& item,
     ceph::coarse_mono_time exec_start)
 {
   if (!ctx.rank || !ctx.rank->logger) {
@@ -160,9 +160,13 @@ ReactorDispatchEngine::record_execute_metrics(
   const auto exec = std::chrono::microseconds(exec_usec);
 
   logger->tinc(l_mds_dispatch_execute_latency, exec);
-  logger->tinc(dispatch_execute_latency_lane_counter(lane), exec);
+  logger->tinc(dispatch_execute_latency_lane_counter(item.lane), exec);
+  if (auto wc = classify_dispatch_work_class(item); wc) {
+    logger->tinc(
+        l_mds_dispatch_execute_latency_wc_first + static_cast<int>(*wc), exec);
+  }
   logger->hinc(
-      l_mds_dispatch_execute_hist, exec_usec, static_cast<int64_t>(lane));
+      l_mds_dispatch_execute_hist, exec_usec, static_cast<int64_t>(item.lane));
 }
 
 ReactorDispatchEngine::ReactorDispatchEngine(const MDSDispatchContext& ctx_) :
@@ -292,7 +296,6 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
   record_wait_metrics(*item);
 
   const auto exec_start = ceph::coarse_mono_clock::now();
-  const DispatchLane lane = item->lane;
 
   mds::MdsLockGuard mds_lock_guard{
       *ctx.mds_lock, mds::work_kind_owner_token(item->kind)};
@@ -339,7 +342,7 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
     break;
   }
 
-  record_execute_metrics(lane, exec_start);
+  record_execute_metrics(*item, exec_start);
   item->destroy();
 }
 
