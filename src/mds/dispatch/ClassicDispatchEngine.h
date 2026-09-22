@@ -25,7 +25,8 @@
  * when reactor mode is unavailable. start/shutdown and queue-related submit_*
  * methods are no-ops. ProgressThread runs in classic mode only; reactor mode
  * drains finished_queue via note_finished_queued() on the op thread. MDCache
- * upkeep runs trim_quantum() inline under mds_lock (reactor posts submit_trim_tick()).
+ * upkeep runs trim_quantum() inline under mds_lock (reactor posts submit_trim_tick()
+ * on the Maintenance lane, above Client).
  * submit_callable() runs inline under mds_lock in classic mode.
  */
 

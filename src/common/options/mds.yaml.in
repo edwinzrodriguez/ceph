@@ -195,6 +195,23 @@ options:
   - mds
   flags:
   - runtime
+- name: mds_cache_trim_max_duration
+  type: millisecs
+  level: advanced
+  desc: Max wall time for one reactor cache trim quantum
+  long_desc: When ``mds_dispatch_engine=reactor``, each TrimQuantum work item
+    stops after this duration and re-enqueues another quantum if more cache
+    trim work remains. ``0`` disables the time budget (segment/dentry
+    thresholds still apply). Classic mode ignores this and trims under
+    ``mds_lock`` as before.
+  default: 10
+  services:
+  - mds
+  see_also:
+  - mds_cache_trim_threshold
+  - mds_dispatch_engine
+  flags:
+  - runtime
 - name: mds_cache_quiesce_decay_rate
   type: float
   level: advanced
@@ -1813,6 +1830,24 @@ options:
   see_also:
   - mds_log_max_events
   - mds_log_max_segments
+  flags:
+  - runtime
+- name: mds_log_trim_max_duration
+  type: millisecs
+  level: advanced
+  desc: Max wall time for one reactor log trim tick
+  long_desc: When ``mds_dispatch_engine=reactor``, each LogTrim work item
+    computes a deadline of now + this duration and stops as soon as that
+    deadline is reached — including during the expire loop and the follow-on
+    open-file-table commit / expired-segment cleanup. Another tick is
+    re-enqueued if more journal trim work remains. ``0`` disables the time
+    budget (``mds_log_trim_threshold`` still applies). Classic mode ignores this.
+  default: 10
+  services:
+  - mds
+  see_also:
+  - mds_log_trim_threshold
+  - mds_dispatch_engine
   flags:
   - runtime
 - name: mds_log_trim_decay_rate

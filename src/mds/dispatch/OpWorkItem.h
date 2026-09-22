@@ -36,8 +36,8 @@ class MDSIOContextBase;
 enum class DispatchLane : uint8_t {
   Control = 0,
   IOComplete = 1,
-  Client = 2,
-  Maintenance = 3,
+  Maintenance = 2,
+  Client = 3,
 
   Count
 };
