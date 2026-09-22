@@ -814,16 +814,13 @@ void SessionMap::remove_session(Session *s)
 
 void SessionMap::touch_session(Session *session)
 {
-  dout(10) << __func__ << " s=" << session << " name=" << session->info.inst.name << dendl;
+  dout(20) << __func__ << " s=" << session
+           << " name=" << session->info.inst.name << dendl;
 
-  // Move to the back of the session list for this state (should
-  // already be on a list courtesy of add_session and set_state)
+  // Already on a by_state list from add_session/set_state; move to back
+  // without a by_state map lookup (hot on every RENEWCAPS).
   ceph_assert(session->item_session_list.is_on_list());
-  auto by_state_entry = by_state.find(session->state);
-  if (by_state_entry == by_state.end())
-    by_state_entry = by_state.emplace(session->state,
-				      new xlist<Session*>).first;
-  by_state_entry->second->push_back(&session->item_session_list);
+  session->item_session_list.move_to_back();
 
   session->last_cap_renew = clock::now();
 }
