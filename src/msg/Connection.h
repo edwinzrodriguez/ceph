@@ -81,6 +81,20 @@ public:
     return priv;
   }
 
+  /**
+   * Return the priv pointer without bumping a RefCountedPtr.
+   *
+   * Safe only while the Connection continues to hold that priv and the
+   * caller does not use the pointer across connection reset / clear_priv.
+   * MDS callers typically use this under mds_lock for Session*.
+   */
+  RefCountedObject*
+  peek_priv()
+  {
+    std::lock_guard l{lock};
+    return priv.get();
+  }
+
   void clear_priv() {
     std::lock_guard l{lock};
     priv.reset(nullptr);
