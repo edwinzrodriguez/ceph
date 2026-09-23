@@ -4470,6 +4470,7 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_cache_reservation",
     "mds_cache_trim_decay_rate",
     "mds_cache_trim_max_duration",
+    "mds_cache_trim_threshold",
     "mds_cap_acquisition_throttle_retry_request_time",
     "mds_cap_revoke_eviction_timeout",
     "mds_debug_subtrees",
@@ -4520,6 +4521,7 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_op_history_duration",
     "mds_op_history_size",
     "mds_op_log_threshold",
+    "mds_reactor_queue_len_abort",
     "mds_recall_max_decay_rate",
     "mds_recall_warning_decay_rate",
     "mds_request_load_average_decay_rate",
@@ -4606,6 +4608,9 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
   }
   if (changed.count("mds_inject_journal_corrupt_dentry_first")) {
     inject_journal_corrupt_dentry_first = g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first");
+  }
+  if (dispatch_engine) {
+    dispatch_engine->handle_conf_change(changed);
   }
 
   finisher->queue(new LambdaContext([this, changed](int) {
