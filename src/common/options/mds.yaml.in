@@ -105,6 +105,65 @@ options:
   - mds
   flags:
   - runtime
+- name: mds_reactor_lane_slice_control
+  type: millisecs
+  level: advanced
+  desc: Max wall time per Control lane visit in a reactor scheduling round
+  long_desc: When ``mds_dispatch_engine=reactor``, the op thread visits lanes
+    Control, IOComplete, Maintenance, then Client each round. This option is
+    the wall-clock budget for the Control lane before advancing. ``0`` drains
+    Control until empty (no wall deadline).
+  default: 10
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_lane_slice_io
+  - mds_reactor_lane_slice_maintenance
+  - mds_reactor_lane_slice_client
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_io
+  type: millisecs
+  level: advanced
+  desc: Max wall time per IOComplete lane visit in a reactor scheduling round
+  long_desc: See ``mds_reactor_lane_slice_control``. ``0`` drains IOComplete
+    until empty.
+  default: 10
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_lane_slice_control
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_maintenance
+  type: millisecs
+  level: advanced
+  desc: Max wall time per Maintenance lane visit in a reactor scheduling round
+  long_desc: Caps how long LogTrim/TrimQuantum (and other Maintenance work) may
+    run before Client gets a turn. See ``mds_reactor_lane_slice_control``.
+  default: 2
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_lane_slice_client
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_client
+  type: millisecs
+  level: advanced
+  desc: Max wall time per Client lane visit in a reactor scheduling round
+  long_desc: See ``mds_reactor_lane_slice_control``.
+  default: 2
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_lane_slice_maintenance
+  flags:
+  - runtime
 - name: mds_cache_quiesce_delay
   type: millisecs
   level: dev

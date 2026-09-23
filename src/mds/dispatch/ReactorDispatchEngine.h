@@ -17,13 +17,18 @@
  * ReactorDispatchEngine.h
  *
  * Reactor-mode dispatch backend (mds_dispatch_engine=reactor). Producers enqueue
- * OpWorkItem instances; a single op thread drains MDSOpWorkQueue and executes
- * Lane priority (high -> low): Control, IOComplete, Maintenance, Client.
+ * OpWorkItem instances; a single op thread drains MDSOpWorkQueue and executes.
+ *
+ * Lane order (high -> low): Control, IOComplete, Maintenance, Client.
+ * Each scheduling round visits lanes in that order and runs each lane until
+ * empty or its fixed wall-clock budget (mds_reactor_lane_slice_*) expires, so
+ * lower-priority work still runs under Maintenance pressure.
  * TrimQuantum/LogTrim are single-flight and cooperatively time-sliced.
  */
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <set>
@@ -72,8 +77,10 @@ private:
   void finish_trim_quantum(bool more);
   void finish_log_trim(bool more);
   void refresh_cached_conf();
-
-  static constexpr unsigned dequeue_batch_size = 32;
+  int64_t lane_slice_ms(DispatchLane lane) const;
+  void advance_lane_slice(
+      size_t& lane_idx,
+      ceph::coarse_mono_time& slice_deadline);
 
   MDSDispatchContext ctx;
   MDSOpWorkQueue queue;
@@ -85,6 +92,8 @@ private:
   std::atomic<uint64_t> queue_len_abort_limit{0};
   std::atomic<int64_t> cache_trim_max_duration_ms{0};
   std::atomic<int64_t> log_trim_max_duration_ms{0};
+  std::array<std::atomic<int64_t>, static_cast<size_t>(DispatchLane::Count)>
+      lane_slice_ms_cached{};
   /// At most one TrimQuantum / LogTrim outstanding (queued or running).
   std::atomic<bool> trim_quantum_queued{false};
   std::atomic<bool> log_trim_queued{false};

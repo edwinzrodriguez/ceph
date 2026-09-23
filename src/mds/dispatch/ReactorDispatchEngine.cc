@@ -98,6 +98,27 @@ ReactorDispatchEngine::refresh_cached_conf()
           .get_val<std::chrono::milliseconds>("mds_log_trim_max_duration")
           .count(),
       std::memory_order_relaxed);
+  lane_slice_ms_cached[static_cast<size_t>(DispatchLane::Control)].store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_reactor_lane_slice_control")
+          .count(),
+      std::memory_order_relaxed);
+  lane_slice_ms_cached[static_cast<size_t>(DispatchLane::IOComplete)].store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_reactor_lane_slice_io")
+          .count(),
+      std::memory_order_relaxed);
+  lane_slice_ms_cached[static_cast<size_t>(DispatchLane::Maintenance)].store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>(
+              "mds_reactor_lane_slice_maintenance")
+          .count(),
+      std::memory_order_relaxed);
+  lane_slice_ms_cached[static_cast<size_t>(DispatchLane::Client)].store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_reactor_lane_slice_client")
+          .count(),
+      std::memory_order_relaxed);
 }
 
 void
@@ -105,8 +126,35 @@ ReactorDispatchEngine::handle_conf_change(const std::set<std::string>& changed)
 {
   if (changed.count("mds_reactor_queue_len_abort") ||
       changed.count("mds_cache_trim_max_duration") ||
-      changed.count("mds_log_trim_max_duration")) {
+      changed.count("mds_log_trim_max_duration") ||
+      changed.count("mds_reactor_lane_slice_control") ||
+      changed.count("mds_reactor_lane_slice_io") ||
+      changed.count("mds_reactor_lane_slice_maintenance") ||
+      changed.count("mds_reactor_lane_slice_client")) {
     refresh_cached_conf();
+  }
+}
+
+int64_t
+ReactorDispatchEngine::lane_slice_ms(DispatchLane lane) const
+{
+  return lane_slice_ms_cached[static_cast<size_t>(lane)].load(
+      std::memory_order_relaxed);
+}
+
+void
+ReactorDispatchEngine::advance_lane_slice(
+    size_t& lane_idx,
+    ceph::coarse_mono_time& slice_deadline)
+{
+  lane_idx = (lane_idx + 1) % static_cast<size_t>(DispatchLane::Count);
+  const auto budget_ms = lane_slice_ms(static_cast<DispatchLane>(lane_idx));
+  if (budget_ms <= 0) {
+    // Zero means drain until empty this visit (no wall deadline).
+    slice_deadline = ceph::coarse_mono_time::max();
+  } else {
+    slice_deadline = ceph::coarse_mono_clock::now() +
+                     std::chrono::milliseconds(budget_ms);
   }
 }
 
@@ -426,12 +474,41 @@ ReactorDispatchEngine::op_thread_main()
   mds::reactor_register_op_thread();
 #endif
 
+  size_t lane_idx = 0;
+  ceph::coarse_mono_time slice_deadline;
+  {
+    const auto budget_ms = lane_slice_ms(DispatchLane::Control);
+    if (budget_ms <= 0) {
+      slice_deadline = ceph::coarse_mono_time::max();
+    } else {
+      slice_deadline = ceph::coarse_mono_clock::now() +
+                       std::chrono::milliseconds(budget_ms);
+    }
+  }
+
   while (!stop.load()) {
     unsigned processed = 0;
-    while (processed < dequeue_batch_size) {
-      OpWorkItem* item = queue.dequeue();
+    // Bound work per wake so we still publish queue-depth metrics.
+    constexpr unsigned max_items_per_wake = 256;
+    while (processed < max_items_per_wake) {
+      OpWorkItem* item = nullptr;
+      size_t lanes_visited = 0;
+      while (lanes_visited < static_cast<size_t>(DispatchLane::Count)) {
+        if (ceph::coarse_mono_clock::now() >= slice_deadline) {
+          advance_lane_slice(lane_idx, slice_deadline);
+          ++lanes_visited;
+          continue;
+        }
+        item = queue.dequeue_lane(static_cast<DispatchLane>(lane_idx));
+        if (item) {
+          break;
+        }
+        // Lane empty before budget expired: yield to next priority.
+        advance_lane_slice(lane_idx, slice_deadline);
+        ++lanes_visited;
+      }
       if (!item) {
-        break;
+        break; // all lanes empty
       }
       execute_item(item);
       ++processed;
