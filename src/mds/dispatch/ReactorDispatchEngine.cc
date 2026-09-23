@@ -83,10 +83,37 @@ ReactorDispatchEngine::note_enqueued()
 }
 
 void
+ReactorDispatchEngine::refresh_cached_conf()
+{
+  queue_len_abort_limit.store(
+      g_conf().get_val<uint64_t>("mds_reactor_queue_len_abort"),
+      std::memory_order_relaxed);
+  cache_trim_max_duration_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_cache_trim_max_duration")
+          .count(),
+      std::memory_order_relaxed);
+  log_trim_max_duration_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_log_trim_max_duration")
+          .count(),
+      std::memory_order_relaxed);
+}
+
+void
+ReactorDispatchEngine::handle_conf_change(const std::set<std::string>& changed)
+{
+  if (changed.count("mds_reactor_queue_len_abort") ||
+      changed.count("mds_cache_trim_max_duration") ||
+      changed.count("mds_log_trim_max_duration")) {
+    refresh_cached_conf();
+  }
+}
+
+void
 ReactorDispatchEngine::maybe_abort_on_queue_depth(size_t depth)
 {
-  const uint64_t limit =
-      g_conf().get_val<uint64_t>("mds_reactor_queue_len_abort");
+  const uint64_t limit = queue_len_abort_limit.load(std::memory_order_relaxed);
   if (limit == 0 || depth < limit) {
     return;
   }
@@ -171,7 +198,9 @@ ReactorDispatchEngine::record_execute_metrics(
 
 ReactorDispatchEngine::ReactorDispatchEngine(const MDSDispatchContext& ctx_) :
   ctx(ctx_)
-{}
+{
+  refresh_cached_conf();
+}
 
 ReactorDispatchEngine::~ReactorDispatchEngine() { shutdown(); }
 
@@ -362,8 +391,8 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
 
   case WorkKind::TrimQuantum:
     if (ctx.rank && ctx.rank->mdcache) {
-      const auto budget = g_conf().get_val<std::chrono::milliseconds>(
-          "mds_cache_trim_max_duration");
+      const auto budget = std::chrono::milliseconds(
+          cache_trim_max_duration_ms.load(std::memory_order_relaxed));
       const auto more = ctx.rank->mdcache->trim_quantum(budget);
       finish_trim_quantum(more && *more);
     } else {
@@ -373,8 +402,8 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
 
   case WorkKind::LogTrim:
     if (ctx.rank && ctx.rank->mdlog) {
-      const auto budget = g_conf().get_val<std::chrono::milliseconds>(
-          "mds_log_trim_max_duration");
+      const auto budget = std::chrono::milliseconds(
+          log_trim_max_duration_ms.load(std::memory_order_relaxed));
       finish_log_trim(ctx.rank->mdlog->trim_tick(budget));
     } else {
       finish_log_trim(false);

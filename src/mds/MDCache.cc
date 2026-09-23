@@ -173,6 +173,8 @@ MDCache::MDCache(MDSRank *m, PurgeQueue &purge_queue_) :
   cache_memory_limit = g_conf().get_val<Option::size_t>("mds_cache_memory_limit");
   cache_reservation = g_conf().get_val<double>("mds_cache_reservation");
   cache_health_threshold = g_conf().get_val<double>("mds_health_cache_threshold");
+  cache_trim_threshold =
+      g_conf().get_val<Option::size_t>("mds_cache_trim_threshold");
 
   export_ephemeral_distributed_config =  g_conf().get_val<bool>("mds_export_ephemeral_distributed");
   export_ephemeral_random_config =  g_conf().get_val<bool>("mds_export_ephemeral_random");
@@ -253,6 +255,10 @@ void MDCache::handle_conf_change(const std::set<std::string>& changed, const MDS
   }
   if (changed.count("mds_cache_trim_decay_rate")) {
     trim_counter = DecayCounter(g_conf().get_val<double>("mds_cache_trim_decay_rate"));
+  }
+  if (changed.count("mds_cache_trim_threshold")) {
+    cache_trim_threshold =
+        g_conf().get_val<Option::size_t>("mds_cache_trim_threshold");
   }
   if (changed.count("mds_symlink_recovery")) {
     symlink_recovery = g_conf().get_val<bool>("mds_symlink_recovery");
@@ -6949,7 +6955,7 @@ MDCache::trim_lru(
   std::vector<CDentry *> unexpirables;
   uint64_t trimmed = 0;
 
-  auto trim_threshold = g_conf().get_val<Option::size_t>("mds_cache_trim_threshold");
+  auto trim_threshold = cache_trim_threshold;
 
   dout(7) << "trim_lru trimming " << count
           << " items from LRU"

@@ -1597,6 +1597,8 @@ private:
   uint64_t cache_memory_limit;
   double cache_reservation;
   double cache_health_threshold;
+  /// Cached mds_cache_trim_threshold (avoid get_val on every trim slice).
+  uint64_t cache_trim_threshold = 0;
   std::array<CInode *, NUM_STRAY> strays{}; // my stray dir
 
   bool export_ephemeral_distributed_config;
