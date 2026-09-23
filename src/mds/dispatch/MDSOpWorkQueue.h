@@ -28,9 +28,15 @@
  * consumer bank run while higher-priority work sat on the producer side of
  * other lanes waiting for all lanes to drain.
  *
+ * Scheduling: ReactorDispatchEngine walks lanes Control -> IOComplete ->
+ * Maintenance -> Client in rounds, giving each lane a fixed wall-clock budget
+ * (see mds_reactor_lane_slice_*). dequeue() is strict priority; dequeue_lane()
+ * is used for the time-sliced drain.
+ *
  * Usage:
- *   queue.enqueue(item, lane);   // any producer thread
- *   item = queue.dequeue();      // op thread; walks lanes by priority
+ *   queue.enqueue(item, lane);          // any producer thread
+ *   item = queue.dequeue_lane(lane);    // op thread; one lane (+ bank swap)
+ *   item = queue.dequeue();             // op thread; highest-priority non-empty
  */
 
 #pragma once
@@ -53,6 +59,9 @@ public:
 
   /// Pop highest-priority item across lanes. Op thread only.
   OpWorkItem* dequeue();
+
+  /// Pop next item from a single lane (consumer bank, then swap). Op thread only.
+  OpWorkItem* dequeue_lane(DispatchLane lane);
 
   bool has_work_for_consumer();
 
@@ -99,7 +108,7 @@ private:
   std::atomic<size_t> depth{0};
 
   static LaneList& consumer_list(LaneQueue& lane);
-  OpWorkItem* dequeue_lane(LaneQueue& lane);
+  OpWorkItem* try_pop_consumer(LaneQueue& lane);
   void maybe_swap_lane(LaneQueue& lane);
   void clear_lane(LaneQueue& lane);
 };
