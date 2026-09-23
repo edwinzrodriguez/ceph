@@ -351,6 +351,8 @@ private:
 
   // log trimming decay counter
   DecayCounter log_trim_counter;
+  /// Cached mds_log_trim_threshold (avoid get_val on every trim slice).
+  uint64_t log_trim_threshold = 0;
 
   // log trimming upkeeper thread
   std::thread upkeep_thread;

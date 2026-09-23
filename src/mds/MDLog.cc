@@ -74,6 +74,8 @@ MDLog::MDLog(MDSRank* m)
   skip_unbounded_events = g_conf().get_val<bool>("mds_log_skip_unbounded_events");
   log_warn_factor = g_conf().get_val<double>("mds_log_warn_factor");
   minor_segments_per_major_segment = g_conf().get_val<uint64_t>("mds_log_minor_segments_per_major_segment");
+  log_trim_threshold =
+      g_conf().get_val<Option::size_t>("mds_log_trim_threshold");
   upkeep_thread = std::thread(&MDLog::log_trim_upkeep, this);
 }
 
@@ -852,7 +854,6 @@ MDLog::trim(std::chrono::milliseconds max_duration)
   std::optional<ceph::coarse_mono_time> trim_end;
 
   auto log_trim_counter_start = log_trim_counter.get();
-  auto log_trim_threshold = g_conf().get_val<Option::size_t>("mds_log_trim_threshold");
 
   auto above_trim_ceiling = [&] {
     unsigned num_remaining_segments =
@@ -1849,6 +1850,10 @@ void MDLog::handle_conf_change(const std::set<std::string>& changed, const MDSMa
   }
   if (changed.count("mds_log_trim_decay_rate")){
     log_trim_counter = DecayCounter(g_conf().get_val<double>("mds_log_trim_decay_rate"));
+  }
+  if (changed.count("mds_log_trim_threshold")) {
+    log_trim_threshold =
+        g_conf().get_val<Option::size_t>("mds_log_trim_threshold");
   }
   if (changed.count("mds_log_warn_factor")) {
     log_warn_factor = g_conf().get_val<double>("mds_log_warn_factor");
