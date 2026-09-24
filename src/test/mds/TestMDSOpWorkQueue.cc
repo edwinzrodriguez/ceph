@@ -242,19 +242,28 @@ TEST(MDSOpWorkQueue, DepthCounterTracksEnqueueDequeue)
           make_message(CEPH_MSG_MDS_MAP), DispatchLane::Control),
       DispatchLane::Control);
   EXPECT_EQ(queue.count(), 2u);
+  EXPECT_EQ(queue.count(DispatchLane::Client), 1u);
+  EXPECT_EQ(queue.count(DispatchLane::Control), 1u);
+  EXPECT_EQ(queue.count(DispatchLane::Maintenance), 0u);
 
   OpWorkItem* item = queue.dequeue();
   ASSERT_NE(item, nullptr);
+  EXPECT_EQ(item->lane, DispatchLane::Control);
   EXPECT_EQ(queue.count(), 1u);
+  EXPECT_EQ(queue.count(DispatchLane::Control), 0u);
+  EXPECT_EQ(queue.count(DispatchLane::Client), 1u);
   item->destroy();
 
   item = queue.dequeue();
   ASSERT_NE(item, nullptr);
   EXPECT_EQ(queue.count(), 0u);
+  EXPECT_EQ(queue.count(DispatchLane::Client), 0u);
   item->destroy();
 
   queue.enqueue(OpWorkItem::create_trim(), DispatchLane::Maintenance);
   EXPECT_EQ(queue.count(), 1u);
+  EXPECT_EQ(queue.count(DispatchLane::Maintenance), 1u);
   queue.flush_and_clear();
   EXPECT_EQ(queue.count(), 0u);
+  EXPECT_EQ(queue.count(DispatchLane::Maintenance), 0u);
 }

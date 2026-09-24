@@ -3960,6 +3960,28 @@ void MDSRank::create_logger()
           l_mds_dispatch_queue_len_max, "dispatch_queue_len_max",
           "Reactor dispatch op queue high water mark", "rdqm",
           PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_dispatch_queue_len_client, "dispatch_queue_len_client",
+          "Reactor Client lane queue depth", "rdqc",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_client_avg_exec_us, "dispatch_client_avg_exec_us",
+          "Rolling average Client lane execute time (microseconds)", "dcae",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_client_backlog_us, "dispatch_client_backlog_us",
+          "Estimated Client lane backlog (depth * avg exec, microseconds)",
+          "dcbl", PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_slice_client_effective_ms,
+          "dispatch_slice_client_effective_ms",
+          "Effective Client lane slice after backlog adaptation (ms)", "dsce",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_slice_maintenance_effective_ms,
+          "dispatch_slice_maintenance_effective_ms",
+          "Effective Maintenance lane slice after backlog adaptation (ms)",
+          "dsme", PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_u64_counter(
           l_mds_dispatch_io_completions, "dispatch_io_completions",
           "IO completions executed on reactor op thread", "dioc",
@@ -4481,10 +4503,14 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
        "mds_op_history_size",
        "mds_op_log_threshold",
        "mds_reactor_lane_slice_client",
+       "mds_reactor_lane_slice_client_max",
        "mds_reactor_lane_slice_control",
        "mds_reactor_lane_slice_io",
        "mds_reactor_lane_slice_maintenance",
+       "mds_reactor_lane_slice_maintenance_min",
        "mds_reactor_queue_len_abort",
+       "mds_reactor_slice_backlog_target",
+       "mds_reactor_slice_exec_window",
        "mds_recall_max_decay_rate",
        "mds_recall_warning_decay_rate",
        "mds_request_load_average_decay_rate",
