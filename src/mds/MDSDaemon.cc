@@ -1208,24 +1208,21 @@ bool MDSDaemon::ms_handle_reset(Connection *con)
   if (con->get_peer_type() != CEPH_ENTITY_TYPE_CLIENT)
     return false;
 
-  std::lock_guard l(mds_lock);
-  if (stopping) {
+  // Defer to the op thread while the reactor is draining work.  Once
+  // rank shutdown has begun (is_daemon_stopping), fall back to taking
+  // mds_lock on the messenger thread so cleanup still runs after the
+  // op thread has been joined (see MDSRank::shutdown messenger unlock).
+  if (use_reactor_dispatch() && !mds_rank->is_daemon_stopping()) {
+    ConnectionRef cref(con);
+    mds_rank->get_dispatch_engine()->submit_callable(
+        DispatchLane::Control, [this, cref = std::move(cref)]() {
+          handle_client_connection_reset(cref.get(), false);
+        });
     return false;
   }
-  dout(5) << "ms_handle_reset on " << con->get_peer_socket_addr() << dendl;
-  if (beacon.get_want_state() == CEPH_MDS_STATE_DNE)
-    return false;
 
-  auto priv = con->get_priv();
-  if (auto session = static_cast<Session *>(priv.get()); session) {
-    if (session->is_closed()) {
-      dout(3) << "ms_handle_reset closing connection for session " << session->info.inst << dendl;
-      con->mark_down();
-      con->set_priv(nullptr);
-    }
-  } else {
-    con->mark_down();
-  }
+  std::lock_guard l(mds_lock);
+  handle_client_connection_reset(con, false);
   return false;
 }
 
@@ -1235,22 +1232,42 @@ void MDSDaemon::ms_handle_remote_reset(Connection *con)
   if (con->get_peer_type() != CEPH_ENTITY_TYPE_CLIENT)
     return;
 
+  if (use_reactor_dispatch() && !mds_rank->is_daemon_stopping()) {
+    ConnectionRef cref(con);
+    mds_rank->get_dispatch_engine()->submit_callable(
+        DispatchLane::Control, [this, cref = std::move(cref)]() {
+          handle_client_connection_reset(cref.get(), true);
+        });
+    return;
+  }
+
   std::lock_guard l(mds_lock);
+  handle_client_connection_reset(con, true);
+}
+
+void
+MDSDaemon::handle_client_connection_reset(Connection* con, bool remote)
+{
+  MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
   if (stopping) {
     return;
   }
 
-  dout(5) << "ms_handle_remote_reset on " << con->get_peer_socket_addr() << dendl;
+  const char* tag = remote ? "ms_handle_remote_reset" : "ms_handle_reset";
+  dout(5) << tag << " on " << con->get_peer_socket_addr() << dendl;
   if (beacon.get_want_state() == CEPH_MDS_STATE_DNE)
     return;
 
   auto priv = con->get_priv();
   if (auto session = static_cast<Session *>(priv.get()); session) {
     if (session->is_closed()) {
-      dout(3) << "ms_handle_remote_reset closing connection for session " << session->info.inst << dendl;
+      dout(3) << tag << " closing connection for session " << session->info.inst
+              << dendl;
       con->mark_down();
       con->set_priv(nullptr);
     }
+  } else if (!remote) {
+    con->mark_down();
   }
 }
 
@@ -1296,11 +1313,31 @@ bool MDSDaemon::ms_handle_fast_authentication(Connection *con)
 
 void MDSDaemon::ms_handle_accept(Connection *con)
 {
-  entity_name_t n(con->get_peer_type(), con->get_peer_global_id());
+  // Before a rank exists, use_reactor_dispatch() is false and we take
+  // mds_lock inline (standby 'tell' connections).  Same shutdown
+  // fallback as ms_handle_reset.
+  if (use_reactor_dispatch() && !mds_rank->is_daemon_stopping()) {
+    ConnectionRef cref(con);
+    mds_rank->get_dispatch_engine()->submit_callable(
+        DispatchLane::Control, [this, cref = std::move(cref)]() {
+          handle_client_connection_accept(cref.get());
+        });
+    return;
+  }
+
   std::lock_guard l(mds_lock);
+  handle_client_connection_accept(con);
+}
+
+void
+MDSDaemon::handle_client_connection_accept(Connection* con)
+{
+  MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
   if (stopping) {
     return;
   }
+
+  entity_name_t n(con->get_peer_type(), con->get_peer_global_id());
 
   // We allow connections and assign Session instances to connections
   // even if we have not been assigned a rank, because clients with
