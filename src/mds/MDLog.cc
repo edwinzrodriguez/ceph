@@ -738,19 +738,16 @@ bool MDLog::is_trim_slow() const {
 
 namespace {
 
-std::optional<ceph::coarse_mono_time>
+std::optional<ceph::fast_mono_time>
 make_trim_deadline(std::chrono::milliseconds max_duration)
 {
-  if (max_duration <= std::chrono::milliseconds::zero()) {
-    return std::nullopt;
-  }
-  return ceph::coarse_mono_clock::now() + max_duration;
+  return ceph::make_fast_mono_deadline(max_duration);
 }
 
 bool
-past_trim_deadline(const std::optional<ceph::coarse_mono_time>& deadline)
+past_trim_deadline(const std::optional<ceph::fast_mono_time>& deadline)
 {
-  return deadline && ceph::coarse_mono_clock::now() >= *deadline;
+  return ceph::past_fast_mono_deadline(deadline);
 }
 
 } // namespace
@@ -760,11 +757,11 @@ MDLog::trim_tick(std::chrono::milliseconds max_duration)
 {
   MDS_ASSERT_MDS_LOCK(mds->mds_lock);
 
-  const auto trim_start = ceph::coarse_mono_clock::now();
+  const auto trim_start = ceph::fast_mono_clock::now();
   const bool more = trim(max_duration);
   if (logger) {
     const auto trim_usec = std::chrono::duration_cast<std::chrono::microseconds>(
-        ceph::coarse_mono_clock::now() - trim_start);
+        ceph::fast_mono_clock::now() - trim_start);
     logger->inc(l_mdl_trim_tick);
     logger->tinc(l_mdl_trim_execute_usec, trim_usec);
   }
@@ -851,9 +848,9 @@ MDLog::trim(std::chrono::milliseconds max_duration)
     ceph_assert(segments.size() >= pre_segments_size);
   }
 
-  const auto trim_start = ceph::coarse_mono_clock::now();
+  const auto trim_start = ceph::fast_mono_clock::now();
   const auto deadline = make_trim_deadline(max_duration);
-  std::optional<ceph::coarse_mono_time> trim_end;
+  std::optional<ceph::fast_mono_time> trim_end;
 
   auto log_trim_counter_start = log_trim_counter.get();
 
@@ -971,7 +968,7 @@ MDLog::trim(std::chrono::milliseconds max_duration)
 
         try_expire(ls, op_prio);
         log_trim_counter.hit();
-        trim_end = ceph::coarse_mono_clock::now();
+        trim_end = ceph::fast_mono_clock::now();
 
         locker.lock();
         p = segments.lower_bound(ls_seq + 1);
@@ -1130,7 +1127,7 @@ bool
 MDLog::_trim_expired_segments(
     auto& locker,
     MDSContext* ctx,
-    std::optional<ceph::coarse_mono_time> deadline)
+    std::optional<ceph::fast_mono_time> deadline)
 {
   ceph_assert(ceph_mutex_is_locked_by_me(submit_mutex));
   ceph_assert(locker.owns_lock());
