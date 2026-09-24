@@ -23,6 +23,11 @@
 #include "gtest/gtest.h"
 #include "include/stringify.h"
 
+using ceph::fast_mono_clock;
+using ceph::fast_mono_time;
+using ceph::make_fast_mono_deadline;
+using ceph::past_fast_mono_deadline;
+
 #if defined __x86_64__ or defined __i386__
 using ceph::tsc_clock;
 using ceph::tsc_tick;
@@ -202,6 +207,25 @@ TEST(TimePoints, stringify) {
   ASSERT_EQ(s.size(), strlen("2019-04-24T11:06:53.399000-0500"));
   ASSERT_TRUE(s[26] == '-' || s[26] == '+');
   ASSERT_EQ(s.substr(0, 9), "2019-04-2");
+}
+
+TEST(FastMonoClock, Sanity) {
+  auto now = fast_mono_clock::now();
+  auto now2 = fast_mono_clock::now();
+  ASSERT_GE(now2, now);
+  ASSERT_FALSE(fast_mono_clock::is_zero(now));
+  ASSERT_TRUE(fast_mono_clock::is_zero(fast_mono_clock::zero()));
+  ASSERT_TRUE(fast_mono_clock::is_steady);
+
+  auto d = make_fast_mono_deadline(std::chrono::milliseconds(0));
+  ASSERT_FALSE(d.has_value());
+  d = make_fast_mono_deadline(std::chrono::milliseconds(50));
+  ASSERT_TRUE(d.has_value());
+  ASSERT_FALSE(past_fast_mono_deadline(d));
+  // Deadline far in the past should report expired.
+  std::optional<fast_mono_time> past = fast_mono_clock::now() -
+                                       std::chrono::seconds(1);
+  ASSERT_TRUE(past_fast_mono_deadline(past));
 }
 
 #if defined __x86_64__ or defined __i386__
