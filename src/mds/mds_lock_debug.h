@@ -10,7 +10,6 @@
  * modify it under the terms of the GNU Lesser General Public
  * License version 2.1, as published by the Free Software
  * Foundation.  See file COPYING.
- *
  */
 
 /**
@@ -36,6 +35,9 @@
  *      mds_lock acquisition so assert failures log the active token.
  *   2. In reactor mode, abort if a token prefixed with "reactor:" is taken
  *      on a thread other than the registered op thread.
+ *   3. Express rank exclusivity as lock-held *or* on the registered op
+ *      thread (MDS_ASSERT_RANK_EXCLUSIVE), so OpWorkItem paths can drop
+ *      the real mutex later without rewriting every assert.
  *
  * Owner tokens are debug-only metadata stored on fair_mutex under
  * CEPH_DEBUG_MUTEX.  They do not affect lock ordering, lockdep, or release
@@ -73,12 +75,18 @@
  * Replace bare ceph_assert(ceph_mutex_is_locked_by_me(mds_lock)) with
  * MDS_ASSERT_MDS_LOCK(mds_lock) for richer diagnostics on failure.
  *
+ * For paths reachable under classic lock *or* via OpWorkItem on the op
+ * thread, prefer MDS_ASSERT_RANK_EXCLUSIVE(mds_lock).  Use
+ * mds::reactor_is_op_thread() when branching (e.g. skip a nested lock_guard
+ * that would deadlock once execute_item already holds exclusivity).
+ *
  * ReactorDispatchEngine registers the op thread via reactor_register_op_thread()
  * at thread start and deregisters on shutdown.  Dispatch engines pass
  * work_kind_owner_token() / dispatch_lane_owner_token() into MdsLockGuard.
  *
  * In non-debug builds (without CEPH_DEBUG_MUTEX), MdsLockGuard is a thin
  * lock_guard wrapper and MDS_ASSERT_MDS_LOCK falls back to the standard macro.
+ * Op-thread registration and MDS_ASSERT_RANK_EXCLUSIVE remain available.
  */
 
 #pragma once
@@ -95,6 +103,13 @@ const char* work_kind_owner_token(WorkKind kind);
 
 /// Owner token for classic-mode dispatch engine entry points.
 const char* dispatch_lane_owner_token(DispatchLane lane);
+
+/// Called once from ReactorDispatchEngine::op_thread_main().
+void reactor_register_op_thread();
+/// Called when the reactor op thread exits.
+void reactor_deregister_op_thread();
+/// True while this thread is the registered mds-rank-op thread.
+bool reactor_is_op_thread();
 
 #ifdef CEPH_DEBUG_MUTEX
 
@@ -124,17 +139,17 @@ public:
   MdsLockToken& operator=(const MdsLockToken&) = delete;
 };
 
-/// Called once from ReactorDispatchEngine::op_thread_main().
-void reactor_register_op_thread();
-/// Called when the reactor op thread exits.
-void reactor_deregister_op_thread();
 /// Abort if a reactor:* token is set on a non-op thread.
 void reactor_assert_op_thread(std::string_view token);
 /// Assert current thread holds @p lock; log @p site and owner token on failure.
 void assert_mds_lock_held_by_me(ceph::fair_mutex& lock, const char* site);
+/// Assert lock held by me, or current thread is the registered op thread.
+void assert_rank_exclusive(ceph::fair_mutex& lock, const char* site);
 
 #define MDS_ASSERT_MDS_LOCK(lock) \
   mds::assert_mds_lock_held_by_me((lock), __func__)
+#define MDS_ASSERT_RANK_EXCLUSIVE(lock) \
+  mds::assert_rank_exclusive((lock), __func__)
 
 #else
 
@@ -151,6 +166,8 @@ public:
 };
 
 #define MDS_ASSERT_MDS_LOCK(lock) ceph_assert(ceph_mutex_is_locked_by_me(lock))
+#define MDS_ASSERT_RANK_EXCLUSIVE(lock) \
+  ceph_assert(ceph_mutex_is_locked_by_me(lock) || mds::reactor_is_op_thread())
 
 #endif
 
