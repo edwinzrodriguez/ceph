@@ -40,13 +40,13 @@
 #define dout_subsys ceph_subsys_mds
 
 static int64_t
-dispatch_usec_since(ceph::coarse_mono_time t)
+dispatch_usec_since(ceph::fast_mono_time t)
 {
-  if (t == ceph::coarse_mono_time{}) {
+  if (t == ceph::fast_mono_time{}) {
     return 0;
   }
   return std::chrono::duration_cast<std::chrono::microseconds>(
-             ceph::coarse_mono_clock::now() - t)
+             ceph::fast_mono_clock::now() - t)
       .count();
 }
 
@@ -282,15 +282,15 @@ ReactorDispatchEngine::lane_slice_ms(DispatchLane lane) const
 void
 ReactorDispatchEngine::advance_lane_slice(
     size_t& lane_idx,
-    ceph::coarse_mono_time& slice_deadline)
+    ceph::fast_mono_time& slice_deadline)
 {
   lane_idx = (lane_idx + 1) % static_cast<size_t>(DispatchLane::Count);
   const auto budget_ms = lane_slice_ms(static_cast<DispatchLane>(lane_idx));
   if (budget_ms <= 0) {
     // Zero means drain until empty this visit (no wall deadline).
-    slice_deadline = ceph::coarse_mono_time::max();
+    slice_deadline = ceph::fast_mono_time::max();
   } else {
-    slice_deadline = ceph::coarse_mono_clock::now() +
+    slice_deadline = ceph::fast_mono_clock::now() +
                      std::chrono::milliseconds(budget_ms);
   }
 }
@@ -373,7 +373,7 @@ ReactorDispatchEngine::record_wait_metrics(const OpWorkItem& item)
 void
 ReactorDispatchEngine::record_execute_metrics(
     const OpWorkItem& item,
-    ceph::coarse_mono_time exec_start)
+    ceph::fast_mono_time exec_start)
 {
   const int64_t exec_usec = dispatch_usec_since(exec_start);
   const uint32_t usec = exec_usec < 0
@@ -572,7 +572,7 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
 
   record_wait_metrics(*item);
 
-  const auto exec_start = ceph::coarse_mono_clock::now();
+  const auto exec_start = ceph::fast_mono_clock::now();
 
   mds::MdsLockGuard mds_lock_guard{
       *ctx.mds_lock, mds::work_kind_owner_token(item->kind)};
@@ -644,13 +644,13 @@ ReactorDispatchEngine::op_thread_main()
 #endif
 
   size_t lane_idx = 0;
-  ceph::coarse_mono_time slice_deadline;
+  ceph::fast_mono_time slice_deadline;
   {
     const auto budget_ms = lane_slice_ms(DispatchLane::Control);
     if (budget_ms <= 0) {
-      slice_deadline = ceph::coarse_mono_time::max();
+      slice_deadline = ceph::fast_mono_time::max();
     } else {
-      slice_deadline = ceph::coarse_mono_clock::now() +
+      slice_deadline = ceph::fast_mono_clock::now() +
                        std::chrono::milliseconds(budget_ms);
     }
   }
@@ -663,7 +663,7 @@ ReactorDispatchEngine::op_thread_main()
       OpWorkItem* item = nullptr;
       size_t lanes_visited = 0;
       while (lanes_visited < static_cast<size_t>(DispatchLane::Count)) {
-        if (ceph::coarse_mono_clock::now() >= slice_deadline) {
+        if (ceph::fast_mono_clock::now() >= slice_deadline) {
           advance_lane_slice(lane_idx, slice_deadline);
           ++lanes_visited;
           continue;

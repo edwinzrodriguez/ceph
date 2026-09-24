@@ -322,7 +322,7 @@ private:
   bool _trim_expired_segments(
       auto& locker,
       MDSContext* ctx = nullptr,
-      std::optional<ceph::coarse_mono_time> deadline = std::nullopt);
+      std::optional<ceph::fast_mono_time> deadline = std::nullopt);
   void write_head(MDSContext *onfinish);
 
   /// @return true if more segments still need trimming.
