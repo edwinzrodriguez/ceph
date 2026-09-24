@@ -639,9 +639,7 @@ ReactorDispatchEngine::op_thread_main()
 #ifdef CEPH_LOCKSTAT
   lockstat_detail::LockStat::set_thread_iopath(true);
 #endif
-#ifdef CEPH_DEBUG_MUTEX
   mds::reactor_register_op_thread();
-#endif
 
   size_t lane_idx = 0;
   ceph::fast_mono_time slice_deadline;
@@ -694,7 +692,5 @@ ReactorDispatchEngine::op_thread_main()
     });
   }
 
-#ifdef CEPH_DEBUG_MUTEX
   mds::reactor_deregister_op_thread();
-#endif
 }
