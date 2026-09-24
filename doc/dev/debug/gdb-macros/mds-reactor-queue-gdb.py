@@ -383,15 +383,19 @@ def _is_core_file():
     return False
 
 
-def _coarse_mono_now_ns():
-    """Inferior ceph::coarse_mono_clock::now(), or None.
+def _fast_mono_now_ns():
+    """Inferior ceph::fast_mono_clock::now() (or coarse fallback), or None.
 
-    Never use the host monotonic clock: on cores (and many remote attaches)
-    it is unrelated to enqueued_at and produces multi-hour bogus waits.
+    OpWorkItem::enqueued_at uses fast_mono_clock. Never use the host
+    monotonic clock: on cores (and many remote attaches) it is unrelated
+    to enqueued_at and produces multi-hour bogus waits.
     """
     if _is_core_file():
         return None
     for expr in (
+        "ceph::fast_mono_clock::now()",
+        "((ceph::fast_mono_clock::time_point)ceph::fast_mono_clock::now())",
+        # Older binaries / fallback path
         "ceph::coarse_mono_clock::now()",
         "((ceph::coarse_mono_clock::time_point)ceph::coarse_mono_clock::now())",
     ):
@@ -415,7 +419,7 @@ def _pick_age_reference(ages, now_ns):
         # absolute waits dwarf the enqueue span of this burst.
         span_gate = max(span, 1)
         if oldest_wait <= max(60 * 10**9, 100 * span_gate):
-            return now_ns, "vs coarse_mono now"
+            return now_ns, "vs fast_mono now"
         return (
             newest,
             "vs newest queued item (ignored implausible now; "
@@ -1093,7 +1097,7 @@ class MdsReactorQueue(gdb.Command):
             % ("", "(internal)", "(external)", "", "", "")
         )
 
-        now_ns = _coarse_mono_now_ns() if collect_ages else None
+        now_ns = _fast_mono_now_ns() if collect_ages else None
         walked = 0
         all_ages = []
         lanes = queue["lanes"]
@@ -1177,7 +1181,7 @@ class MdsReactorQueue(gdb.Command):
             if "newest queued" in ref:
                 print(
                     "  note: ages are relative to the newest queued item "
-                    "(no usable inferior coarse_mono now — normal on cores). "
+                    "(no usable inferior fast_mono now — normal on cores). "
                     "enqueue_span is the backlog birth window."
                 )
 
