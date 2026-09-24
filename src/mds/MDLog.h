@@ -353,6 +353,12 @@ private:
   DecayCounter log_trim_counter;
   /// Cached mds_log_trim_threshold (avoid get_val on every trim slice).
   uint64_t log_trim_threshold = 0;
+  /// Next segments.seq to examine in trim()'s expire-initiation loop after a
+  /// time-budgeted yield. 0 means start at segments.begin().
+  uint64_t trim_expire_resume_seq = 0;
+  /// True when expire-initiation is done for this pass but OFT commit /
+  /// expired-segment trim still need another cooperative tick.
+  bool trim_finish_pending = false;
 
   // log trimming upkeeper thread
   std::thread upkeep_thread;
