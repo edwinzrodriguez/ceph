@@ -111,6 +111,11 @@ class MDSDaemon : public Dispatcher {
       const bufferlist& inbl,
       asok_finisher on_finish);
 
+  /// Rank-exclusive bodies for messenger session hooks (mds_lock held
+  /// and/or running on mds-rank-op).
+  void handle_client_connection_accept(Connection* con);
+  void handle_client_connection_reset(Connection* con, bool remote);
+
   void dump_status(Formatter *f);
 
   /**
