@@ -29,8 +29,9 @@
  * other lanes waiting for all lanes to drain.
  *
  * Scheduling: ReactorDispatchEngine walks lanes Control -> IOComplete ->
- * Maintenance -> Client in rounds, giving each lane a fixed wall-clock budget
- * (see mds_reactor_lane_slice_*). dequeue() is strict priority; dequeue_lane()
+ * Maintenance -> Client in rounds, giving each lane a wall-clock budget
+ * (see mds_reactor_lane_slice_*). Client/Maintenance budgets may adapt from
+ * estimated Client backlog. dequeue() is strict priority; dequeue_lane()
  * is used for the time-sliced drain.
  *
  * Usage:
@@ -68,6 +69,9 @@ public:
   /// Items waiting in all lane banks (O(1); maintained by depth counter).
   size_t count() const;
 
+  /// Items waiting in one lane's banks (O(1)).
+  size_t count(DispatchLane lane) const;
+
   void wake();
   void shutdown();
 
@@ -95,6 +99,8 @@ private:
     std::array<LaneList, NUM_BANKS> lists;
     /// Producer bank index; consumer bank is always producer_bank ^ 1.
     std::atomic<uint8_t> producer_bank{0};
+    /// Items in this lane across both banks.
+    std::atomic<size_t> depth{0};
     ceph::mutex lock;
 
     LaneQueue();

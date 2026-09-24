@@ -164,6 +164,70 @@ options:
   - mds_reactor_lane_slice_maintenance
   flags:
   - runtime
+- name: mds_reactor_slice_exec_window
+  type: uint
+  level: advanced
+  desc: Rolling window size for per-lane reactor execute-time average
+  long_desc: Number of recent completed ops per dispatch lane used to estimate
+    average execute time for backlog-adaptive lane slices
+    (``depth * avg_exec``). Clamped to ``[1, 1024]``.
+  default: 256
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_slice_backlog_target
+  flags:
+  - runtime
+- name: mds_reactor_slice_backlog_target
+  type: millisecs
+  level: advanced
+  desc: Soft Client backlog that starts adapting reactor lane slices
+  long_desc: When estimated Client backlog (lane depth times rolling average
+    execute time) reaches this target, the scheduler begins boosting the
+    Client lane slice toward ``mds_reactor_lane_slice_client_max`` and cutting
+    Maintenance toward ``mds_reactor_lane_slice_maintenance_min``. Full
+    adaptation is reached at four times this target. ``0`` disables adaptation.
+  default: 500
+  services:
+  - mds
+  see_also:
+  - mds_reactor_slice_exec_window
+  - mds_reactor_lane_slice_client
+  - mds_reactor_lane_slice_client_max
+  - mds_reactor_lane_slice_maintenance_min
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_client_max
+  type: millisecs
+  level: advanced
+  desc: Maximum Client lane slice under backlog adaptation
+  long_desc: Upper bound for the Client lane wall-clock budget when estimated
+    Client backlog is high. The configured ``mds_reactor_lane_slice_client``
+    remains the idle/base budget.
+  default: 20
+  services:
+  - mds
+  see_also:
+  - mds_reactor_lane_slice_client
+  - mds_reactor_slice_backlog_target
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_maintenance_min
+  type: millisecs
+  level: advanced
+  desc: Minimum Maintenance lane slice under Client backlog pressure
+  long_desc: Floor for the Maintenance lane wall-clock budget when estimated
+    Client backlog is high. The configured
+    ``mds_reactor_lane_slice_maintenance`` remains the idle/base budget.
+  default: 1
+  services:
+  - mds
+  see_also:
+  - mds_reactor_lane_slice_maintenance
+  - mds_reactor_slice_backlog_target
+  flags:
+  - runtime
 - name: mds_cache_quiesce_delay
   type: millisecs
   level: dev
