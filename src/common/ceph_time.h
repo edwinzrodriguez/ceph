@@ -425,6 +425,7 @@ typedef coarse_real_clock::time_point coarse_real_time;
 // std::chrono::steady_clock time and ceph::mono_clock time.
 typedef mono_clock::time_point mono_time;
 typedef coarse_mono_clock::time_point coarse_mono_time;
+// fast_mono_time is defined with fast_mono_clock (after tsc_clock).
 
 template<typename Rep1, typename Ratio1, typename Rep2, typename Ratio2>
 auto floor(const std::chrono::duration<Rep1, Ratio1>& duration,
@@ -793,6 +794,83 @@ private:
 };
 
 #endif // __x86_64__ or __i386__
+
+/**
+ * fast_mono_clock — hot-path monotonic clock.
+ *
+ * Prefers an architecture-specific counter that avoids clock_gettime(2)
+ * (x86: tsc_clock / RDTSC when tsc_clock::is_available). Falls back to
+ * coarse_mono_clock otherwise. Future ARM64 (e.g. CNTVCT_EL0) should be
+ * added here so call sites stay unchanged.
+ *
+ * time_points are nanoseconds on a clock-specific epoch — only compare
+ * values obtained from this clock. Suitable for short deadlines and
+ * latency samples, not wall-clock or cross-host time.
+ */
+class fast_mono_clock {
+public:
+  using duration = signedspan;
+  using rep = duration::rep;
+  using period = duration::period;
+  using time_point = std::chrono::time_point<fast_mono_clock, duration>;
+  static constexpr bool is_steady = true;
+
+  static time_point
+  now() noexcept
+  {
+#if defined __x86_64__ || defined __i386__
+    if (tsc_clock::is_available) {
+      // tsc_rep::operator int64_t() converts ticks → nanoseconds.
+      return time_point(std::chrono::duration_cast<duration>(
+          tsc_clock::now().time_since_epoch()));
+    }
+#endif
+    // ARM64 (and other arches): drop a cntvct-based path here when ready.
+    return time_point(std::chrono::duration_cast<duration>(
+        coarse_mono_clock::now().time_since_epoch()));
+  }
+
+  static bool
+  is_zero(const time_point& t)
+  {
+    return t == zero();
+  }
+
+  static time_point
+  zero()
+  {
+    return time_point();
+  }
+
+  /// True when now() uses the arch-specific fast counter (not coarse).
+  static bool
+  using_arch_counter() noexcept
+  {
+#if defined __x86_64__ || defined __i386__
+    return tsc_clock::is_available;
+#else
+    return false;
+#endif
+  }
+};
+
+using fast_mono_time = fast_mono_clock::time_point;
+
+/// Deadline = now + max_duration; nullopt means "no time limit".
+inline std::optional<fast_mono_time>
+make_fast_mono_deadline(std::chrono::milliseconds max_duration)
+{
+  if (max_duration <= std::chrono::milliseconds::zero()) {
+    return std::nullopt;
+  }
+  return fast_mono_clock::now() + max_duration;
+}
+
+inline bool
+past_fast_mono_deadline(const std::optional<fast_mono_time>& deadline)
+{
+  return deadline && fast_mono_clock::now() >= *deadline;
+}
 
 } // namespace ceph
 
