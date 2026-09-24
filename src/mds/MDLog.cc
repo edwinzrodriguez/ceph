@@ -813,6 +813,8 @@ MDLog::trim(std::chrono::milliseconds max_duration)
 
   if (mds->mdcache->is_readonly()) {
     dout(10) << "trim, ignoring read-only FS" <<  dendl;
+    trim_expire_resume_seq = 0;
+    trim_finish_pending = false;
     return false;
   }
 
@@ -832,6 +834,8 @@ MDLog::trim(std::chrono::milliseconds max_duration)
 	   << dendl;
 
   if (segments.empty()) {
+    trim_expire_resume_seq = 0;
+    trim_finish_pending = false;
     return false;
   }
 
@@ -846,8 +850,6 @@ MDLog::trim(std::chrono::milliseconds max_duration)
   if (pre_segments_size > 0) {
     ceph_assert(segments.size() >= pre_segments_size);
   }
-
-  map<uint64_t,LogSegmentRef>::iterator p = segments.begin();
 
   const auto trim_start = ceph::coarse_mono_clock::now();
   const auto deadline = make_trim_deadline(max_duration);
@@ -868,78 +870,125 @@ MDLog::trim(std::chrono::milliseconds max_duration)
     return false;
   };
 
+  auto remember_expire_resume = [&](uint64_t seq) {
+    dout(20) << __func__ << ": remember expire resume seq=" << seq << dendl;
+    trim_expire_resume_seq = seq;
+  };
+  auto clear_expire_resume = [&] {
+    dout(20) << __func__ << ": clear expire resume seq (was "
+             << trim_expire_resume_seq << ")" << dendl;
+    trim_expire_resume_seq = 0;
+  };
+
   bool more = false;
 
-  while (p != segments.end()) {
-    // throttle - break out of trimmming if we've hit the threshold
-    if (log_trim_counter_start + new_expiring_segments >= log_trim_threshold) {
-      auto time_spent = std::chrono::duration<double>::zero();
-      if (trim_end) {
-	time_spent = std::chrono::duration<double>(*trim_end - trim_start);
-      }
-      dout(10) << __func__ << ": breaking out of trim loop - trimmed "
-	       << new_expiring_segments << " segment(s) in " << time_spent.count()
-	       << "s" << dendl;
-      more = above_trim_ceiling();
-      break;
-    }
-
-    if (past_trim_deadline(deadline)) {
+  // A prior tick finished expire-initiation but deferred open-file-table / expired-segment
+  // trim on the deadline. Skip rescanning the expire prefix.
+  if (!trim_finish_pending) {
+    map<uint64_t, LogSegmentRef>::iterator p =
+        (trim_expire_resume_seq == 0)
+            ? segments.begin()
+            : segments.lower_bound(trim_expire_resume_seq);
+    if (trim_expire_resume_seq != 0) {
       dout(10) << __func__
-               << ": breaking out of trim loop - past deadline after "
-               << new_expiring_segments << " segment(s)" << dendl;
-      more = true;
-      break;
+               << ": resuming expire scan at seq=" << trim_expire_resume_seq
+               << (p == segments.end() ? " (past end)" : "") << dendl;
     }
 
-    unsigned num_remaining_segments = (segments.size() - expired_segments.size() - expiring_segments.size());
-    dout(10) << __func__ << ": new_expiring_segments=" << new_expiring_segments
-	     << ", num_remaining_segments=" << num_remaining_segments
-	     << ", max_segments=" << max_segments << dendl;
+    while (p != segments.end()) {
+      // throttle - break out of trimmming if we've hit the threshold
+      if (log_trim_counter_start + new_expiring_segments >= log_trim_threshold) {
+        auto time_spent = std::chrono::duration<double>::zero();
+        if (trim_end) {
+          time_spent = std::chrono::duration<double>(*trim_end - trim_start);
+        }
+        dout(10) << __func__ << ": breaking out of trim loop - trimmed "
+                 << new_expiring_segments << " segment(s) in "
+                 << time_spent.count() << "s" << dendl;
+        more = above_trim_ceiling();
+        if (more) {
+          remember_expire_resume(p->first);
+        } else {
+          clear_expire_resume();
+          trim_finish_pending = true;
+        }
+        break;
+      }
 
-    if (!above_trim_ceiling()) {
-      dout(10) << __func__ << ": breaking out of trim loop - segments/events fell below ceiling"
-	       << " max_segments/max_ev" << dendl;
-      more = false;
-      break;
+      if (past_trim_deadline(deadline)) {
+        dout(10) << __func__
+                 << ": breaking out of trim loop - past deadline after "
+                 << new_expiring_segments
+                 << " segment(s), resume_seq=" << p->first << dendl;
+        more = true;
+        remember_expire_resume(p->first);
+        break;
+      }
+
+      unsigned num_remaining_segments =
+          (segments.size() - expired_segments.size() - expiring_segments.size());
+      dout(10) << __func__
+               << ": new_expiring_segments=" << new_expiring_segments
+               << ", num_remaining_segments=" << num_remaining_segments
+               << ", max_segments=" << max_segments << dendl;
+
+      if (!above_trim_ceiling()) {
+        dout(10) << __func__
+                 << ": breaking out of trim loop - segments/events fell below "
+                    "ceiling max_segments/max_ev"
+                 << dendl;
+        more = false;
+        clear_expire_resume();
+        trim_finish_pending = true;
+        break;
+      }
+
+      auto&& ls = p->second;
+      ceph_assert(ls);
+      const uint64_t ls_seq = ls->seq;
+      ++p;
+
+      if (pending_events.count(ls_seq) || ls->end > safe_pos) {
+        dout(5) << "trim " << *ls << " is not fully flushed yet: safe "
+                << journaler->get_write_safe_pos() << " < end " << ls->end
+                << dendl;
+        // Resume at this segment so we do not rescan the expired prefix.
+        more = false;
+        remember_expire_resume(ls_seq);
+        break;
+      }
+
+      if (expiring_segments.count(ls)) {
+        dout(20) << "trim already expiring " << *ls << dendl;
+      } else if (expired_segments.count(ls)) {
+        dout(20) << "trim already expired " << *ls << dendl;
+      } else {
+        ceph_assert(expiring_segments.count(ls) == 0);
+        new_expiring_segments++;
+        expiring_segments.insert(ls);
+        expiring_events += ls->num_events;
+        locker.unlock();
+
+        try_expire(ls, op_prio);
+        log_trim_counter.hit();
+        trim_end = ceph::coarse_mono_clock::now();
+
+        locker.lock();
+        p = segments.lower_bound(ls_seq + 1);
+      }
     }
 
-    // look at first segment
-    auto&& ls = p->second;
-    ceph_assert(ls);
-    ++p;
-    
-    if (pending_events.count(ls->seq) ||
-	ls->end > safe_pos) {
-      dout(5) << "trim " << *ls << " is not fully flushed yet: safe "
-	      << journaler->get_write_safe_pos() << " < end " << ls->end << dendl;
-      // Cannot make progress until flush completes; let the upkeep interval retry.
-      more = false;
-      break;
+    ceph_assert(locker.owns_lock());
+
+    // Expire-initiation scan reached the end without needing another scan.
+    if (p == segments.end() && !more) {
+      clear_expire_resume();
+      trim_finish_pending = true;
     }
-
-    if (expiring_segments.count(ls)) {
-      dout(5) << "trim already expiring " << *ls << dendl;
-    } else if (expired_segments.count(ls)) {
-      dout(5) << "trim already expired " << *ls << dendl;
-    } else {
-      ceph_assert(expiring_segments.count(ls) == 0);
-      new_expiring_segments++;
-      expiring_segments.insert(ls);
-      expiring_events += ls->num_events;
-      locker.unlock();
-
-      uint64_t last_seq = ls->seq;
-      try_expire(ls, op_prio);
-      log_trim_counter.hit();
-      trim_end = ceph::coarse_mono_clock::now();
-
-      locker.lock();
-      p = segments.lower_bound(last_seq + 1);
-    }
+  } else {
+    dout(10) << __func__ << ": skipping expire scan; finish work pending"
+             << dendl;
   }
-
-  ceph_assert(locker.owns_lock());
 
   // Finish work is part of the same wall-clock budget so a tick that
   // spent its quota in the expire loop does not still hold mds_lock for
@@ -955,10 +1004,16 @@ MDLog::trim(std::chrono::milliseconds max_duration)
   if (past_trim_deadline(deadline)) {
     dout(10) << __func__ << ": past deadline after open_file_table commit, "
              << "deferring expired-segment trim" << dendl;
+    trim_finish_pending = true;
     return true;
   }
 
   const bool expired_more = _trim_expired_segments(locker, nullptr, deadline);
+  if (expired_more) {
+    trim_finish_pending = true;
+  } else if (!more) {
+    trim_finish_pending = false;
+  }
   return more || expired_more;
 }
 
