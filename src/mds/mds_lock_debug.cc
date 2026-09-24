@@ -10,7 +10,6 @@
  * modify it under the terms of the GNU Lesser General Public
  * License version 2.1, as published by the Free Software
  * Foundation.  See file COPYING.
- *
  */
 
 #include "mds_lock_debug.h"
@@ -26,6 +25,13 @@
 #define dout_subsys ceph_subsys_mds
 
 namespace mds {
+
+namespace {
+
+std::atomic<std::thread::id> reactor_op_thread{};
+std::atomic<bool> reactor_op_thread_registered{false};
+
+} // namespace
 
 const char*
 work_kind_owner_token(WorkKind kind)
@@ -65,23 +71,6 @@ dispatch_lane_owner_token(DispatchLane lane)
   return "classic:unknown";
 }
 
-#ifdef CEPH_DEBUG_MUTEX
-
-namespace {
-
-std::atomic<std::thread::id> reactor_op_thread{};
-std::atomic<bool> reactor_op_thread_registered{false};
-
-bool
-is_reactor_rank_token(std::string_view token)
-{
-  static constexpr std::string_view prefix = "reactor:";
-  return token.size() >= prefix.size() &&
-         token.compare(0, prefix.size(), prefix) == 0;
-}
-
-} // namespace
-
 void
 reactor_register_op_thread()
 {
@@ -96,25 +85,44 @@ reactor_deregister_op_thread()
   reactor_op_thread.store(std::thread::id{}, std::memory_order_release);
 }
 
+bool
+reactor_is_op_thread()
+{
+  if (!reactor_op_thread_registered.load(std::memory_order_acquire)) {
+    return false;
+  }
+  return reactor_op_thread.load(std::memory_order_acquire) ==
+         std::this_thread::get_id();
+}
+
+#ifdef CEPH_DEBUG_MUTEX
+
+namespace {
+
+bool
+is_reactor_rank_token(std::string_view token)
+{
+  static constexpr std::string_view prefix = "reactor:";
+  return token.size() >= prefix.size() &&
+         token.compare(0, prefix.size(), prefix) == 0;
+}
+
+} // namespace
+
 void
 reactor_assert_op_thread(std::string_view token)
 {
   if (!is_reactor_rank_token(token)) {
     return;
   }
-  if (!reactor_op_thread_registered.load(std::memory_order_acquire)) {
-    return;
+  if (!reactor_is_op_thread()) {
+    if (!reactor_op_thread_registered.load(std::memory_order_acquire)) {
+      return;
+    }
+    derr << "reactor rank lock token=" << token << " taken on unexpected thread"
+         << dendl;
+    ceph_abort_msg("reactor mds_lock owner thread mismatch");
   }
-
-  const auto expected = reactor_op_thread.load(std::memory_order_acquire);
-  const auto self = std::this_thread::get_id();
-  if (expected == self) {
-    return;
-  }
-
-  derr << "reactor rank lock token=" << token << " taken on unexpected thread"
-       << dendl;
-  ceph_abort_msg("reactor mds_lock owner thread mismatch");
 }
 
 MdsLockGuard::MdsLockGuard(ceph::fair_mutex& lock_, const char* token) :
@@ -153,6 +161,24 @@ assert_mds_lock_held_by_me(ceph::fair_mutex& lock, const char* site)
        << " owner_token=" << (token ? token : "(none)")
        << " locked=" << (lock.is_locked() ? "yes" : "no") << dendl;
   ceph_abort_msg("mds_lock not held by me");
+}
+
+void
+assert_rank_exclusive(ceph::fair_mutex& lock, const char* site)
+{
+  if (lock.is_locked_by_me() || reactor_is_op_thread()) {
+    return;
+  }
+
+  const char* token = lock.debug_get_owner_token();
+  derr << "rank exclusivity violated at " << site
+       << " owner_token=" << (token ? token : "(none)")
+       << " locked=" << (lock.is_locked() ? "yes" : "no")
+       << " reactor_op_thread_registered="
+       << (reactor_op_thread_registered.load(std::memory_order_acquire) ? "yes"
+                                                                        : "no")
+       << dendl;
+  ceph_abort_msg("rank exclusivity violated");
 }
 
 #endif
