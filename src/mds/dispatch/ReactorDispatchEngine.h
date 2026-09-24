@@ -93,7 +93,7 @@ private:
   void record_wait_metrics(const OpWorkItem& item);
   void record_execute_metrics(
       const OpWorkItem& item,
-      ceph::coarse_mono_time exec_start);
+      ceph::fast_mono_time exec_start);
   void note_enqueued();
   void maybe_abort_on_queue_depth(size_t depth);
   void publish_queue_depth_metrics();
@@ -101,9 +101,7 @@ private:
   void finish_log_trim(bool more);
   void refresh_cached_conf();
   int64_t lane_slice_ms(DispatchLane lane) const;
-  void advance_lane_slice(
-      size_t& lane_idx,
-      ceph::coarse_mono_time& slice_deadline);
+  void advance_lane_slice(size_t& lane_idx, ceph::fast_mono_time& slice_deadline);
   uint64_t avg_exec_us(DispatchLane lane) const;
   uint64_t estimated_backlog_us(DispatchLane lane) const;
   uint64_t client_backlog_us() const;

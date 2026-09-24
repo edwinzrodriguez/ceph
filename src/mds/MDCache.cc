@@ -6973,17 +6973,10 @@ MDCache::trim_lru(
               << dendl;
 
   const uint64_t trim_counter_start = trim_counter.get();
-  const auto deadline = [&]() -> std::optional<ceph::coarse_mono_time> {
-    if (max_duration <= std::chrono::milliseconds::zero()) {
-      return std::nullopt;
-    }
-    return ceph::coarse_mono_clock::now() + max_duration;
-  }();
+  const auto deadline = ceph::make_fast_mono_deadline(max_duration);
   bool throttled = false;
 
-  auto past_deadline = [&] {
-    return deadline && ceph::coarse_mono_clock::now() >= *deadline;
-  };
+  auto past_deadline = [&] { return ceph::past_fast_mono_deadline(deadline); };
 
   while (1) {
     throttled |= trim_counter_start+trimmed >= trim_threshold;
