@@ -750,6 +750,38 @@ past_trim_deadline(const std::optional<ceph::fast_mono_time>& deadline)
   return ceph::past_fast_mono_deadline(deadline);
 }
 
+/**
+ * Amortize past_trim_deadline() in tight segment walks.
+ *
+ * Checking the clock every iteration showed up under SPECStorage inside
+ * _trim_expired_segments.  Sample every INTERVAL steps; overshoot is bounded
+ * and the next cooperative tick continues the work.
+ */
+class TrimDeadlineChecker {
+  const std::optional<ceph::fast_mono_time>& m_deadline;
+  unsigned m_since = 0;
+  static constexpr unsigned INTERVAL = 32;
+
+public:
+  explicit TrimDeadlineChecker(
+      const std::optional<ceph::fast_mono_time>& deadline) :
+    m_deadline(deadline)
+  {}
+
+  bool
+  should_yield()
+  {
+    if (!m_deadline) {
+      return false;
+    }
+    if (++m_since < INTERVAL) {
+      return false;
+    }
+    m_since = 0;
+    return past_trim_deadline(m_deadline);
+  }
+};
+
 } // namespace
 
 bool
@@ -850,6 +882,7 @@ MDLog::trim(std::chrono::milliseconds max_duration)
 
   const auto trim_start = ceph::fast_mono_clock::now();
   const auto deadline = make_trim_deadline(max_duration);
+  TrimDeadlineChecker expire_deadline(deadline);
   std::optional<ceph::fast_mono_time> trim_end;
 
   auto log_trim_counter_start = log_trim_counter.get();
@@ -912,7 +945,7 @@ MDLog::trim(std::chrono::milliseconds max_duration)
         break;
       }
 
-      if (past_trim_deadline(deadline)) {
+      if (expire_deadline.should_yield()) {
         dout(10) << __func__
                  << ": breaking out of trim loop - past deadline after "
                  << new_expiring_segments
@@ -1139,8 +1172,9 @@ MDLog::_trim_expired_segments(
   // major check is amortized O(1) instead of major_segments.find() per segment
   // (hot under time-sliced trim that restarts from begin each tick).
   auto msit = major_segments.begin();
+  TrimDeadlineChecker trim_deadline(deadline);
   for (auto it = segments.begin(); it != segments.end(); ++it) {
-    if (past_trim_deadline(deadline)) {
+    if (trim_deadline.should_yield()) {
       dout(10) << __func__ << ": past deadline, deferring remaining expired "
                << "segment trim" << dendl;
       deferred = true;
