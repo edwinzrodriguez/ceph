@@ -74,6 +74,8 @@ class LogSegment {
            !dirty_dirfrag_dirfragtree.empty();
   }
 
+  /// Dump dirty elists if any.  Returns true when all dirty elists are empty.
+  bool check_elists_empty(const char* where);
   void assert_elists_empty(const char* where);
 
   const seq_t seq;
