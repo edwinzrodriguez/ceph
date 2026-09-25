@@ -312,6 +312,8 @@ class MDSRank {
     }
 
     void handle_write_error(int err);
+    /// Off-thread entry: takes mds_lock (classic) or submit_callable(Control)
+    /// (reactor). Prefer handle_write_error when already rank-exclusive.
     void handle_write_error_with_lock(int err);
 
     void update_mlogger();

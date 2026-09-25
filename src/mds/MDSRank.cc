@@ -95,6 +95,60 @@ using std::vector;
 using TOPNSPC::common::cmd_getval;
 using TOPNSPC::common::cmd_getval_or;
 
+namespace {
+
+// Off-thread rank mutators (purge/write-error, conf-change, metrics) must
+// not take mds_lock on finisher/messenger threads under reactor.  Hop onto
+// the Control lane; already on the op thread: run inline; classic/shutdown:
+// take mds_lock on the calling thread.
+template <typename Fn>
+void
+run_rank_exclusive_async(MDSRank* mds, Fn&& fn)
+{
+  if (auto* engine = mds->get_dispatch_engine();
+      engine && engine->is_reactor() && !mds::reactor_is_op_thread() &&
+      !mds->is_daemon_stopping()) {
+    engine->submit_callable(
+        DispatchLane::Control, [fn = std::forward<Fn>(fn)]() mutable { fn(); });
+    return;
+  }
+
+  if (mds::reactor_is_op_thread()) {
+    fn();
+    return;
+  }
+
+  std::lock_guard locker(mds->mds_lock);
+  fn();
+}
+
+// MetricsHandler (and similar) needs a synchronous result.  Same routing as
+// async, but the caller blocks on a future under reactor.
+template <typename R, typename Fn>
+R
+run_rank_exclusive_sync(MDSRank* mds, Fn&& fn)
+{
+  if (auto* engine = mds->get_dispatch_engine();
+      engine && engine->is_reactor() && !mds::reactor_is_op_thread() &&
+      !mds->is_daemon_stopping()) {
+    std::promise<R> p;
+    auto f = p.get_future();
+    engine->submit_callable(
+        DispatchLane::Control,
+        [fn = std::forward<Fn>(fn), &p]() mutable { p.set_value(fn()); });
+    return f.get();
+  }
+
+  if (mds::reactor_is_op_thread()) {
+    return fn();
+  }
+
+  std::lock_guard locker(mds->mds_lock);
+  return fn();
+}
+
+} // namespace
+
 class C_Flush_Journal : public MDSInternalContext {
 public:
   C_Flush_Journal(MDCache *mdcache, MDLog *mdlog, MDSRank *mds,
@@ -516,10 +570,9 @@ MDSRank::MDSRank(
       whoami_,
       mdsmap_->get_metadata_pool(),
       objecter,
-      new LambdaContext([this](int r) {
-        std::lock_guard l(mds_lock);
-        handle_write_error(r);
-      })),
+      // PurgeQueue's finisher thread must not take mds_lock under reactor;
+      // handle_write_error_with_lock routes via submit_callable(Control).
+      new LambdaContext([this](int r) { handle_write_error_with_lock(r); })),
   metrics_handler(cct, this),
   beacon(beacon_),
   messenger(msgr),
@@ -1023,6 +1076,7 @@ double MDSRank::last_cleared_laggy() const
 
 void MDSRank::handle_write_error(int err)
 {
+  MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
   if (err == -EBLOCKLISTED) {
     derr << "we have been blocklisted (fenced), respawning..." << dendl;
     respawn();
@@ -1043,8 +1097,10 @@ void MDSRank::handle_write_error(int err)
 
 void MDSRank::handle_write_error_with_lock(int err)
 {
-  std::scoped_lock l(mds_lock);
-  handle_write_error(err);
+  // Objecter / purge / dir-commit finisher threads call this without
+  // exclusivity.  Under reactor, hop onto Control rather than taking
+  // mds_lock on those threads (Phase 1c).
+  run_rank_exclusive_async(this, [this, err]() { handle_write_error(err); });
 }
 
 void *MDSRank::ProgressThread::entry()
@@ -4395,38 +4451,6 @@ epoch_t MDSRank::get_osd_epoch() const
   return objecter->with_osdmap(std::mem_fn(&OSDMap::get_epoch));
 }
 
-namespace {
-
-// MetricsHandler (messenger + mds-metrics threads) needs synchronous cache
-// reads.  Under reactor, take those reads on the Control lane so they do not
-// race unlocked execute_item; the caller blocks on a future.  Classic and
-// shutdown fall back to locking mds_lock on the calling thread.  Already on
-// the op thread: run inline (rank-exclusive).
-template <typename R, typename Fn>
-R
-run_rank_exclusive_sync(MDSRank* mds, Fn&& fn)
-{
-  if (auto* engine = mds->get_dispatch_engine();
-      engine && engine->is_reactor() && !mds::reactor_is_op_thread() &&
-      !mds->is_daemon_stopping()) {
-    std::promise<R> p;
-    auto f = p.get_future();
-    engine->submit_callable(
-        DispatchLane::Control,
-        [fn = std::forward<Fn>(fn), &p]() mutable { p.set_value(fn()); });
-    return f.get();
-  }
-
-  if (mds::reactor_is_op_thread()) {
-    return fn();
-  }
-
-  std::lock_guard locker(mds->mds_lock);
-  return fn();
-}
-
-} // namespace
-
 std::string MDSRank::get_path(inodeno_t ino) {
   return run_rank_exclusive_sync<std::string>(this, [this, ino]() {
     MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
@@ -4607,8 +4631,10 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
 
       if (log_level < 10 && gather_level >= 10) {
         dout(0) << __func__ << " Enabling in-memory log dump..." << dendl;
-        std::scoped_lock lock(mds_lock);
-        schedule_inmemory_logger();
+        run_rank_exclusive_async(this, [this]() {
+          MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
+          schedule_inmemory_logger();
+        });
       }
       else {
         dout(0) << __func__ << " Enabling in-memory log dump failed. debug_mds=" << log_level
@@ -4639,9 +4665,11 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
     dispatch_engine->handle_conf_change(changed);
   }
 
-  finisher->queue(new LambdaContext([this, changed](int) {
-    std::scoped_lock lock(mds_lock);
-
+  // Flush component conf handlers under rank exclusivity.  Under reactor,
+  // submit_callable(Control) from this observer thread (do not lock
+  // mds_lock here).  Classic keeps the historical finisher + lock path.
+  auto apply_components = [this, changed]() {
+    MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
     dout(10) << "flushing conf change to components: " << changed << dendl;
 
     sessionmap.handle_conf_change(changed);
@@ -4651,7 +4679,24 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
     purge_queue.handle_conf_change(changed, *mdsmap);
     scrubstack->handle_conf_change(changed);
     mds_dmclock_scheduler->handle_conf_change(changed);
-  }));
+  };
+
+  if (auto* engine = get_dispatch_engine();
+      engine && engine->is_reactor() && !is_daemon_stopping()) {
+    if (mds::reactor_is_op_thread()) {
+      apply_components();
+    } else {
+      engine->submit_callable(
+          DispatchLane::Control, std::move(apply_components));
+    }
+    return;
+  }
+
+  finisher->queue(new LambdaContext(
+      [this, apply_components = std::move(apply_components)](int) {
+        std::scoped_lock lock(mds_lock);
+        apply_components();
+      }));
 }
 
 void MDSRank::get_task_status(std::map<std::string, std::string> *status) {
