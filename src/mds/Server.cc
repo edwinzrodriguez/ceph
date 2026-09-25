@@ -3670,10 +3670,14 @@ CInode* Server::prepare_new_inode(const MDRequestRef& mdr, CDir *dir, inodeno_t 
   inodeno_t _useino = useino;
 
   // assign ino
+  bool inject_taken_once = false;
   do {
     if (allow_prealloc_inos && (mdr->used_prealloc_ino = _inode->ino = mdr->session->take_ino(_useino))) {
-      if (g_conf()->mds_inject_prealloc_taken_retry) {
+      // Dev inject: poison only once per call so the retry loop can progress.
+      // Always re-inserting the same ino busy-spins and fills the MDS log.
+      if (g_conf()->mds_inject_prealloc_taken_retry && !inject_taken_once) {
         mdcache->insert_taken_inos(mdr->used_prealloc_ino);
+        inject_taken_once = true;
       }
       if (mdcache->test_and_clear_taken_inos(_inode->ino)) {
         inodeno_t taken = mdr->used_prealloc_ino;
@@ -4999,6 +5003,14 @@ void Server::handle_client_openc(const MDRequestRef& mdr)
   if (!check_dir_max_entries(mdr, dir))
     return;
 
+  // path_traverse deferred parent scatter wrlocks for CREATE so we do not
+  // revoke Fs from the requesting client while it waits for this reply.
+  // After process_request_cap_release that client has already dropped Fs;
+  // re-acquire here *before* projecting the new inode so a wait/retry does
+  // not leave the mdr half-mutated (which hit is_rdlocked on reopen).
+  if (!ensure_parent_dir_wrlocks(mdr, diri))
+    return;
+
   if (mds_allow_async_dirops && mdr->dn[0].size() == 1)
     mds->locker->create_lock_cache(mdr, diri, &mdr->dir_layout);
 
@@ -5037,14 +5049,6 @@ void Server::handle_client_openc(const MDRequestRef& mdr)
     newi->mark_clientwriteable();
     cap->mark_clientwriteable();
   }
-
-  // path_traverse deferred parent scatter wrlocks for CREATE so we do not
-  // revoke Fs from the requesting client while it waits for this reply.
-  // After process_request_cap_release that client has already dropped Fs;
-  // re-acquire the wrlocks here so sibling clients lose Fs/COMPLETE before
-  // the new name is journaled.
-  if (!ensure_parent_dir_wrlocks(mdr, diri))
-    return;
 
   // prepare finisher
   mdr->ls = mdlog->get_current_segment();
