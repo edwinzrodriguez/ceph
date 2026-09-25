@@ -30,6 +30,7 @@ namespace {
 
 std::atomic<std::thread::id> reactor_op_thread{};
 std::atomic<bool> reactor_op_thread_registered{false};
+thread_local unsigned reactor_op_mds_lock_depth = 0;
 
 } // namespace
 
@@ -95,6 +96,24 @@ reactor_is_op_thread()
          std::this_thread::get_id();
 }
 
+bool
+reactor_op_holds_mds_lock()
+{
+  return reactor_op_mds_lock_depth > 0;
+}
+
+ReactorOpMdsLockHold::ReactorOpMdsLockHold()
+{
+  ceph_assert(reactor_is_op_thread());
+  ++reactor_op_mds_lock_depth;
+}
+
+ReactorOpMdsLockHold::~ReactorOpMdsLockHold()
+{
+  ceph_assert(reactor_op_mds_lock_depth > 0);
+  --reactor_op_mds_lock_depth;
+}
+
 #ifdef CEPH_DEBUG_MUTEX
 
 namespace {
@@ -148,6 +167,21 @@ MdsLockToken::MdsLockToken(ceph::fair_mutex& lock_, const char* token) :
 }
 
 MdsLockToken::~MdsLockToken() { lock.debug_set_owner_token(prev_token); }
+
+ReactorOwnerToken::ReactorOwnerToken(ceph::fair_mutex& lock_, const char* token) :
+  lock(lock_), prev_token(lock.debug_get_owner_token())
+{
+  // Drop-lock execute_item: exclusivity is the op thread, not the mutex.
+  ceph_assert(reactor_is_op_thread());
+  ceph_assert(!lock.is_locked_by_me());
+  lock.debug_set_owner_token(token);
+  reactor_assert_op_thread(token);
+}
+
+ReactorOwnerToken::~ReactorOwnerToken()
+{
+  lock.debug_set_owner_token(prev_token);
+}
 
 void
 assert_mds_lock_held_by_me(ceph::fair_mutex& lock, const char* site)
