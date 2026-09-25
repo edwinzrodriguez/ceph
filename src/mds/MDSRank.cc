@@ -72,6 +72,7 @@
 #include "Server.h"
 #include "SnapClient.h"
 #include "SnapServer.h"
+#include "mds_rank_exclusive.h"
 
 #ifdef CEPH_LOCKSTAT
 #include "common/lockstat.h"
@@ -94,60 +95,6 @@ using std::string;
 using std::vector;
 using TOPNSPC::common::cmd_getval;
 using TOPNSPC::common::cmd_getval_or;
-
-namespace {
-
-// Off-thread rank mutators (purge/write-error, conf-change, metrics) must
-// not take mds_lock on finisher/messenger threads under reactor.  Hop onto
-// the Control lane; already on the op thread: run inline; classic/shutdown:
-// take mds_lock on the calling thread.
-template <typename Fn>
-void
-run_rank_exclusive_async(MDSRank* mds, Fn&& fn)
-{
-  if (auto* engine = mds->get_dispatch_engine();
-      engine && engine->is_reactor() && !mds::reactor_is_op_thread() &&
-      !mds->is_daemon_stopping()) {
-    engine->submit_callable(
-        DispatchLane::Control, [fn = std::forward<Fn>(fn)]() mutable { fn(); });
-    return;
-  }
-
-  if (mds::reactor_is_op_thread()) {
-    fn();
-    return;
-  }
-
-  std::lock_guard locker(mds->mds_lock);
-  fn();
-}
-
-// MetricsHandler (and similar) needs a synchronous result.  Same routing as
-// async, but the caller blocks on a future under reactor.
-template <typename R, typename Fn>
-R
-run_rank_exclusive_sync(MDSRank* mds, Fn&& fn)
-{
-  if (auto* engine = mds->get_dispatch_engine();
-      engine && engine->is_reactor() && !mds::reactor_is_op_thread() &&
-      !mds->is_daemon_stopping()) {
-    std::promise<R> p;
-    auto f = p.get_future();
-    engine->submit_callable(
-        DispatchLane::Control,
-        [fn = std::forward<Fn>(fn), &p]() mutable { p.set_value(fn()); });
-    return f.get();
-  }
-
-  if (mds::reactor_is_op_thread()) {
-    return fn();
-  }
-
-  std::lock_guard locker(mds->mds_lock);
-  return fn();
-}
-
-} // namespace
 
 class C_Flush_Journal : public MDSInternalContext {
 public:
@@ -1100,7 +1047,9 @@ void MDSRank::handle_write_error_with_lock(int err)
   // Objecter / purge / dir-commit finisher threads call this without
   // exclusivity.  Under reactor, hop onto Control rather than taking
   // mds_lock on those threads (Phase 1c).
-  run_rank_exclusive_async(this, [this, err]() { handle_write_error(err); });
+  mds::run_rank_exclusive_async(this, [this, err]() {
+    handle_write_error(err);
+  });
 }
 
 void *MDSRank::ProgressThread::entry()
@@ -4452,7 +4401,7 @@ epoch_t MDSRank::get_osd_epoch() const
 }
 
 std::string MDSRank::get_path(inodeno_t ino) {
-  return run_rank_exclusive_sync<std::string>(this, [this, ino]() {
+  return mds::run_rank_exclusive_sync<std::string>(this, [this, ino]() {
     MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
     CInode* inode = mdcache->get_inode(ino);
     if (!inode) {
@@ -4465,7 +4414,7 @@ std::string MDSRank::get_path(inodeno_t ino) {
 }
 
 uint64_t MDSRank::get_inode_rbytes(inodeno_t ino) {
-  return run_rank_exclusive_sync<uint64_t>(this, [this, ino]() {
+  return mds::run_rank_exclusive_sync<uint64_t>(this, [this, ino]() {
     MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
     CInode* inode = mdcache->get_inode(ino);
     if (!inode) {
@@ -4631,7 +4580,7 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
 
       if (log_level < 10 && gather_level >= 10) {
         dout(0) << __func__ << " Enabling in-memory log dump..." << dendl;
-        run_rank_exclusive_async(this, [this]() {
+        mds::run_rank_exclusive_async(this, [this]() {
           MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
           schedule_inmemory_logger();
         });

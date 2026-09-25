@@ -27,6 +27,7 @@
 #include "MDSRank.h"
 #include "QuiesceAgent.h"
 #include "QuiesceDbManager.h"
+#include "mds_rank_exclusive.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds_quiesce
@@ -272,39 +273,51 @@ void MDSRank::quiesce_cluster_update() {
     << (mdsmap->is_degraded() ? " (degraded)" : "") << dendl;
 
   if (membership.leader != QuiesceClusterMembership::INVALID_MEMBER) {
+    // QuiesceDbManager runs these on mds-q-db; under reactor hop onto
+    // Control so send_message_mds / mdsmap reads are rank-exclusive.
     membership.send_ack = [=, this](QuiesceMap&& ack) {
       if (me == membership.leader) {
         // loopback
         quiesce_db_manager->submit_peer_ack({me, std::move(ack)});
         return 0;
-      } else {
-        std::lock_guard guard(mds_lock);
-
-        if (mdsmap->get_state_gid(membership.leader) == MDSMap::STATE_NULL) {
-          dout(5) << "couldn't find the leader " << membership.leader << " in the map" << dendl;
-          return -ENOENT;
-        }
-        auto addrs = mdsmap->get_info_gid(membership.leader).addrs;
-
-        dout(10) << "sending ack " << ack << " to the leader " << membership.leader << dendl;
-        auto ack_msg = make_message<MMDSQuiesceDbAck>(
-            QuiesceDbPeerAck{me, std::move(ack)});
-        return send_message_mds(ack_msg, addrs);
       }
+      return mds::run_rank_exclusive_sync<int>(
+          this, [this, me, leader = membership.leader,
+                 ack = std::move(ack)]() mutable {
+            MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
+            if (mdsmap->get_state_gid(leader) == MDSMap::STATE_NULL) {
+              dout(5) << "couldn't find the leader " << leader << " in the map"
+                      << dendl;
+              return -ENOENT;
+            }
+            auto addrs = mdsmap->get_info_gid(leader).addrs;
+
+            dout(10) << "sending ack " << ack << " to the leader " << leader
+                     << dendl;
+            auto ack_msg = make_message<MMDSQuiesceDbAck>(
+                QuiesceDbPeerAck{me, std::move(ack)});
+            return send_message_mds(ack_msg, addrs);
+          });
     };
 
-    membership.send_listing_to = [=, this](QuiesceInterface::PeerId to, QuiesceDbListing&& db) {
-      std::lock_guard guard(mds_lock);
-      if (mdsmap->get_state_gid(to) == MDSMap::STATE_NULL) {
-        dout(5) << "couldn't find the peer " << to << " in the map" << dendl;
-        return -ENOENT;
-      }
-      auto addrs = mdsmap->get_info_gid(to).addrs;
-      dout(10) << "sending listing " << db << " to the peer " << to << dendl;
-      auto listing_msg = make_message<MMDSQuiesceDbListing>(
-          QuiesceDbPeerListing{me, std::move(db)});
-      return send_message_mds(listing_msg, addrs);
-    };
+    membership.send_listing_to =
+        [=, this](QuiesceInterface::PeerId to, QuiesceDbListing&& db) {
+          return mds::run_rank_exclusive_sync<int>(
+              this, [this, me, to, db = std::move(db)]() mutable {
+                MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
+                if (mdsmap->get_state_gid(to) == MDSMap::STATE_NULL) {
+                  dout(5) << "couldn't find the peer " << to << " in the map"
+                          << dendl;
+                  return -ENOENT;
+                }
+                auto addrs = mdsmap->get_info_gid(to).addrs;
+                dout(10) << "sending listing " << db << " to the peer " << to
+                         << dendl;
+                auto listing_msg = make_message<MMDSQuiesceDbListing>(
+                    QuiesceDbPeerListing{me, std::move(db)});
+                return send_message_mds(listing_msg, addrs);
+              });
+        };
   }
 
   QuiesceDbManager::RequestContext* inject_request = nullptr;
@@ -510,103 +523,127 @@ void MDSRank::quiesce_agent_setup() {
 
     auto path = uri->path();
 
-    std::lock_guard l(mds_lock);
+    // QuiesceAgent calls this off the op thread; under reactor take
+    // mdcache mutations on Control (sync so we can return the handle).
+    return mds::run_rank_exclusive_sync<std::optional<RequestHandle>>(
+        this,
+        [this, dummy_requests, path, c, the_real_deal, quiesce_delay_ms
+#ifdef QUIESCE_ROOT_DEBUG_PARAMS
+         ,
+         debug_quiesce_after, debug_fail_after, debug_rank
+#endif
+    ]() -> std::optional<RequestHandle> {
+          MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
 
-    if (the_real_deal) {
-      if (mdsmap->is_degraded()) {
-        dout(3) << "DEGRADED: refusing to quiesce" << dendl;
-        c->complete(EPERM);
-        return std::nullopt;
-      }
-      auto qc = new MDCache::C_MDS_QuiescePath(mdcache, c);
-      auto mdr = mdcache->quiesce_path(filepath(path), qc, nullptr, quiesce_delay_ms);
-      return mdr ? mdr->reqid : std::optional<RequestHandle>();
-    } else {
+          if (the_real_deal) {
+            if (mdsmap->is_degraded()) {
+              dout(3) << "DEGRADED: refusing to quiesce" << dendl;
+              c->complete(EPERM);
+              return std::nullopt;
+            }
+            auto qc = new MDCache::C_MDS_QuiescePath(mdcache, c);
+            auto mdr = mdcache->quiesce_path(
+                filepath(path), qc, nullptr, quiesce_delay_ms);
+            return mdr ? mdr->reqid : std::optional<RequestHandle>();
+          } else {
 #ifndef QUIESCE_ROOT_DEBUG_PARAMS
-      ceph_abort("quiesce debug parameters are disabled");
+            ceph_abort("quiesce debug parameters are disabled");
 #else
-      /* we use this branch to allow for quiesce emulation for testing purposes */
-      // always create a new request id
-      auto req_id = metareqid_t(entity_name_t::MDS(whoami), issue_tid());
-      auto [it, inserted] = dummy_requests->try_emplace(path, req_id, c);
+            /* we use this branch to allow for quiesce emulation for testing purposes */
+            // always create a new request id
+            auto req_id = metareqid_t(entity_name_t::MDS(whoami), issue_tid());
+            auto [it, inserted] = dummy_requests->try_emplace(path, req_id, c);
 
-      if (!inserted) {
-        dout(3) << "duplicate quiesce request for root '" << it->first << "'" << dendl;
-        // report error for the duplicate request, just as MDCache would do
-        c->complete(-EINPROGRESS);
-        return std::nullopt;
-      } else if (debug_rank && (debug_rank != whoami)) {
-        // the root was pinned to a different rank
-        // we should acknowledge the quiesce regardless of the other flags
-        it->second.second->complete(0);
-        it->second.second = nullptr;
-      } else {
-        // do quiesce or fail
+            if (!inserted) {
+              dout(3) << "duplicate quiesce request for root '" << it->first
+                      << "'" << dendl;
+              // report error for the duplicate request, just as MDCache would do
+              c->complete(-EINPROGRESS);
+              return std::nullopt;
+            } else if (debug_rank && (debug_rank != whoami)) {
+              // the root was pinned to a different rank
+              // we should acknowledge the quiesce regardless of the other flags
+              it->second.second->complete(0);
+              it->second.second = nullptr;
+            } else {
+              // do quiesce or fail
 
-        bool do_fail = false;
-        double delay;
-        if (debug_quiesce_after.has_value() && debug_fail_after.has_value()) {
-          do_fail = debug_fail_after < debug_quiesce_after;
-        } else {
-          do_fail = debug_fail_after.has_value();
-        }
+              bool do_fail = false;
+              double delay;
+              if (debug_quiesce_after.has_value() &&
+                  debug_fail_after.has_value()) {
+                do_fail = debug_fail_after < debug_quiesce_after;
+              } else {
+                do_fail = debug_fail_after.has_value();
+              }
 
-        if (do_fail) {
-          delay = debug_fail_after.value();
-        } else {
-          delay = debug_quiesce_after.value();
-        }
+              if (do_fail) {
+                delay = debug_fail_after.value();
+              } else {
+                delay = debug_quiesce_after.value();
+              }
 
-        auto quiesce_task = new LambdaContext([dummy_requests, req_id, do_fail, this](int) {
-          // the mds lock should be held by the timer
-          MDS_ASSERT_MDS_LOCK(mds_lock);
-          dout(20) << "quiesce_task: callback by the timer" << dendl;
-          auto it = std::ranges::find(*dummy_requests, req_id, [](auto x) { return x.second.first; });
-          if (it != dummy_requests->end() && it->second.second != nullptr) {
-            dout(20) << "quiesce_task: completing the root '" << it->first << "' as failed: " << do_fail << dendl;
-            it->second.second->complete(do_fail ? -EBADF : 0);
-            it->second.second = nullptr;
-          }
-          dout(20) << "quiesce_task: done" << dendl;
-        });
+              auto quiesce_task = new LambdaContext([dummy_requests, req_id,
+                                                     do_fail, this](int) {
+                // the mds lock should be held by the timer
+                MDS_ASSERT_MDS_LOCK(mds_lock);
+                dout(20) << "quiesce_task: callback by the timer" << dendl;
+                auto it = std::ranges::find(*dummy_requests, req_id, [](auto x) {
+                  return x.second.first;
+                });
+                if (it != dummy_requests->end() &&
+                    it->second.second != nullptr) {
+                  dout(20) << "quiesce_task: completing the root '" << it->first
+                           << "' as failed: " << do_fail << dendl;
+                  it->second.second->complete(do_fail ? -EBADF : 0);
+                  it->second.second = nullptr;
+                }
+                dout(20) << "quiesce_task: done" << dendl;
+              });
 
-        dout(20) << "scheduling a quiesce_task (" << quiesce_task
-                 << ") to fire after " << delay
-                 << " seconds on timer " << &timer << dendl;
-        timer.add_event_after(delay, quiesce_task);
-      }
-      return it->second.first;
+              dout(20) << "scheduling a quiesce_task (" << quiesce_task
+                       << ") to fire after " << delay << " seconds on timer "
+                       << &timer << dendl;
+              timer.add_event_after(delay, quiesce_task);
+            }
+            return it->second.first;
 #endif // QUIESCE_ROOT_DEBUG_PARAMS
-    }
+          }
+        });
   };
 
   ci.cancel_request = [this, dummy_requests](RequestHandle h) {
-    std::lock_guard l(mds_lock);
+    return mds::run_rank_exclusive_sync<int>(this, [this, dummy_requests, h]() {
+      MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
 
-    if (mdcache->have_request(h)) {
-      auto qimdr = mdcache->request_get(h);
-      mdcache->request_kill(qimdr);
-      // no reason to waste time checking for dummy requests
-      return 0;
-    }
+      if (mdcache->have_request(h)) {
+        auto qimdr = mdcache->request_get(h);
+        mdcache->request_kill(qimdr);
+        // no reason to waste time checking for dummy requests
+        return 0;
+      }
 
 #ifdef QUIESCE_ROOT_DEBUG_PARAMS
-    // if we get here then it could be a test (dummy) quiesce
-    auto it = std::ranges::find(*dummy_requests, h, [](auto x) { return x.second.first; });
-    if (it != dummy_requests->end()) {
-      if (auto ctx = it->second.second; ctx) {
-        dout(20) << "canceling request with id '" << h << "' for root '" << it->first << "'" << dendl;
-        ctx->complete(-ECANCELED);
+      // if we get here then it could be a test (dummy) quiesce
+      auto it = std::ranges::find(*dummy_requests, h, [](auto x) {
+        return x.second.first;
+      });
+      if (it != dummy_requests->end()) {
+        if (auto ctx = it->second.second; ctx) {
+          dout(20) << "canceling request with id '" << h << "' for root '"
+                   << it->first << "'" << dendl;
+          ctx->complete(-ECANCELED);
+        }
+        dummy_requests->erase(it);
+        return 0;
       }
-      dummy_requests->erase(it);
-      return 0;
-    }
 #endif // QUIESCE_ROOT_DEBUG_PARAMS
 
-    // we must indicate that the handle wasn't found
-    // so that the agent can properly report a missing
-    // outstanding quiesce, preventing a RELEASED transition 
-    return ENOENT;
+      // we must indicate that the handle wasn't found
+      // so that the agent can properly report a missing
+      // outstanding quiesce, preventing a RELEASED transition
+      return ENOENT;
+    });
   };
 
   std::weak_ptr<QuiesceDbManager> weak_db_manager = quiesce_db_manager;
