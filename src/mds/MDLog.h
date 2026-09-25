@@ -356,6 +356,10 @@ private:
   /// Next segments.seq to examine in trim()'s expire-initiation loop after a
   /// time-budgeted yield. 0 means start at segments.begin().
   uint64_t trim_expire_resume_seq = 0;
+  /// Next segments.seq for _trim_expired_segments after a deadline yield.
+  /// 0 means start at segments.begin(). Seeded so a following major can still
+  /// batch-expire the already-walked expired prefix.
+  uint64_t trim_expired_resume_seq = 0;
   /// True when expire-initiation is done for this pass but OFT commit /
   /// expired-segment trim still need another cooperative tick.
   bool trim_finish_pending = false;

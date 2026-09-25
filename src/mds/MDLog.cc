@@ -1171,12 +1171,32 @@ MDLog::_trim_expired_segments(
   // Both segments and major_segments are ordered by seq.  Co-iterate so each
   // major check is amortized O(1) instead of major_segments.find() per segment
   // (hot under time-sliced trim that restarts from begin each tick).
+  auto it = segments.begin();
+  if (trim_expired_resume_seq != 0) {
+    it = segments.lower_bound(trim_expired_resume_seq);
+    dout(10) << __func__ << ": resuming at seq=" << trim_expired_resume_seq
+             << (it == segments.end() ? " (past end)" : "") << dendl;
+    // Predecessors were already walked as expired; seed end so the next major
+    // can still batch-expire that prefix.
+    if (it != segments.begin() && it != segments.end()) {
+      auto prev = std::prev(it);
+      if (prev->second->expired) {
+        end = prev->first;
+      }
+    }
+  }
   auto msit = major_segments.begin();
+  if (it != segments.end()) {
+    while (msit != major_segments.end() && *msit < it->first) {
+      ++msit;
+    }
+  }
   TrimDeadlineChecker trim_deadline(deadline);
-  for (auto it = segments.begin(); it != segments.end(); ++it) {
+  for (; it != segments.end(); ++it) {
     if (trim_deadline.should_yield()) {
       dout(10) << __func__ << ": past deadline, deferring remaining expired "
-               << "segment trim" << dendl;
+               << "segment trim at seq=" << it->first << dendl;
+      trim_expired_resume_seq = it->first;
       deferred = true;
       break;
     }
@@ -1238,6 +1258,10 @@ MDLog::_trim_expired_segments(
 
     end = seq;
     dout(10) << __func__ << ": maybe expiring " << *ls << dendl;
+  }
+
+  if (!deferred) {
+    trim_expired_resume_seq = 0;
   }
 
   const bool more_expired = deferred || !expired_segments.empty();
