@@ -25,6 +25,13 @@
  * backlog (depth * rolling avg execute time) once backlog exceeds
  * mds_reactor_slice_backlog_target.
  * TrimQuantum/LogTrim are single-flight and cooperatively time-sliced.
+ *
+ * Boot exclusivity: while MDSRank is creating, starting,
+ * or in any replay state, drain only Control and IOComplete. Client and
+ * Maintenance items remain queued so MDLog::_replay_thread /
+ * _recovery_thread can hold mds_lock without racing the op thread on
+ * those lanes. Cleared via set_boot_exclusive(false) when leaving those
+ * states.
  */
 
 #pragma once
@@ -63,6 +70,7 @@ public:
   void submit_log_trim_tick() override;
   void submit_callable(DispatchLane lane, std::function<void()> fn) override;
   void note_finished_queued() override;
+  void set_boot_exclusive(bool exclusive) override;
   void handle_conf_change(const std::set<std::string>& changed) override;
 
 private:
@@ -106,11 +114,15 @@ private:
   uint64_t estimated_backlog_us(DispatchLane lane) const;
   uint64_t client_backlog_us() const;
   double client_adapt_t() const;
+  bool lane_drain_allowed(DispatchLane lane) const;
+  bool has_drainable_work() const;
 
   MDSDispatchContext ctx;
   MDSOpWorkQueue queue;
   std::thread op_thread;
   std::atomic<bool> stop{false};
+  /// True while creating/starting/replay: skip Client + Maintenance drain.
+  std::atomic<bool> boot_exclusive{true};
   std::atomic<uint64_t> queue_len_max{0};
   std::atomic<bool> queue_len_abort_armed{false};
   /// Cached conf (avoid string-keyed get_val on enqueue/execute).

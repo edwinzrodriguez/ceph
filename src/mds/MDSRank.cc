@@ -647,6 +647,10 @@ void MDSRankDispatcher::init()
   purge_queue.init();
 
   finisher->start();
+
+  // Align reactor Client/Maintenance drain with current daemon state
+  // (creating/starting/replay => boot exclusive).
+  update_reactor_boot_policy();
 }
 
 void MDSRank::update_targets()
@@ -2385,6 +2389,24 @@ void MDSRank::stopping_done()
   request_state(MDSMap::STATE_STOPPED);
 }
 
+void
+MDSRank::update_reactor_boot_policy()
+{
+  auto* engine = get_dispatch_engine();
+  if (!engine || !engine->is_reactor()) {
+    return;
+  }
+
+  // While journal replay/recovery (or create/start boot) holds mds_lock on
+  // dedicated threads, keep Client and Maintenance off the op thread.
+  // Control + IOComplete still drain so boot gathers and maps progress.
+  const bool exclusive = is_creating() || is_starting() || is_any_replay() ||
+                         is_standby();
+  dout(10) << __func__ << " exclusive=" << exclusive
+           << " state=" << ceph_mds_state_name(state) << dendl;
+  engine->set_boot_exclusive(exclusive);
+}
+
 void MDSRankDispatcher::handle_mds_map(
     const cref_t<MMDSMap> &m,
     const MDSMap &oldmap)
@@ -2406,6 +2428,10 @@ void MDSRankDispatcher::handle_mds_map(
     last_state = oldstate;
     incarnation = mdsmap->get_inc_gid(mds_gid);
   }
+
+  // Entering/leaving creating, starting, or replay changes whether the
+  // reactor may drain Client/Maintenance (Phase 2 Option A).
+  update_reactor_boot_policy();
 
   version_t epoch = m->get_epoch();
 
