@@ -34,6 +34,7 @@
  *   - Messenger accept/reset           -> submit_callable(Control) (reactor)
  *   - Metrics get_path/rbytes          -> submit_callable(Control)+future
  *   - Write-error / purge / conf-change -> submit_callable(Control) (reactor)
+ *   - Quiesce send_ack/listing/agent    -> submit_callable(Control)+future
  *
  * Owned by MDSRank; started in MDSRankDispatcher::init(), stopped in shutdown().
  */
