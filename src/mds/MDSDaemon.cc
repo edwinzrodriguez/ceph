@@ -19,6 +19,7 @@
 
 #include "common/debug.h"
 #include "mds_lock_debug.h"
+#include "mds_rank_exclusive.h"
 
 #include "auth/AuthAuthorizeHandler.h"
 #include "auth/KeyRing.h"
@@ -72,7 +73,9 @@ using std::string;
 using std::vector;
 using TOPNSPC::common::cmd_getval;
 
-static bool
+/// Historically mutating asoks (kept for documentation). Under reactor all
+/// rank asoks now run on Control; see MDSDaemon::asok_command.
+[[maybe_unused]] static bool
 mds_asok_command_mutates(std::string_view command)
 {
   return command == "lockup" || command == "exit" || command == "respawn" ||
@@ -166,7 +169,12 @@ void MDSDaemon::asok_command(
   const bufferlist& inbl,
   asok_finisher on_finish)
 {
-  if (use_reactor_dispatch() && mds_asok_command_mutates(command)) {
+  // Phase 3: under reactor, run any rank-touching asok on Control so
+  // nested mds_lock guards become RankExclusiveGuard asserts instead of
+  // deadlocking fair_mutex.  Daemon-only commands stay on the asok thread.
+  const bool daemon_only =
+      command == "status" || command == "heap" || command == "cpu_profiler";
+  if (use_reactor_dispatch() && !daemon_only) {
     MDSDispatchEngine* engine = mds_rank->get_dispatch_engine();
     engine->submit_callable(
         DispatchLane::Control,
@@ -201,7 +209,7 @@ MDSDaemon::do_asok_command(
     int64_t millisecs{};
     if (cmd_getval(cmdmap, "millisecs", millisecs)) {
       derr << "(lockup) sleeping with mds_lock for " << millisecs << dendl;
-      std::lock_guard l(mds_lock);
+      mds::RankExclusiveGuard l(mds_lock);
       std::this_thread::sleep_for(std::chrono::milliseconds(millisecs));
       r = 0;
     } else {

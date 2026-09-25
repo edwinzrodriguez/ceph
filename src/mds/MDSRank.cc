@@ -19,6 +19,7 @@
 #include <fstream>
 #include <future>
 #include <iterator>
+#include <optional>
 #include <typeinfo>
 #include <vector>
 
@@ -191,7 +192,7 @@ private:
         mds, new LambdaContext([this, mds = mds](int r) {
           ceph_assert(r == 0); // MDLog is not allowed to raise errors via
           // wait_for_expiry
-          std::lock_guard locker(mds->mds_lock);
+          mds::RankExclusiveGuard locker(mds->mds_lock);
           trim_expired_segments();
         }));
     expiry_gather.set_finisher(new MDSInternalContextWrapper(mds, ctx));
@@ -1025,7 +1026,7 @@ void MDSRank::damaged()
 
 void MDSRank::damaged_unlocked()
 {
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   damaged();
 }
 
@@ -2837,7 +2838,7 @@ void MDSRankDispatcher::handle_asok_command(
     cmd_getval(cmdmap, "flags", flags);
     string path;
     cmd_getval(cmdmap, "path", path);
-    std::unique_lock l(mds_lock, std::defer_lock);
+    std::optional<mds::RankExclusiveGuard> exclusive;
     auto lambda = OpTracker::default_dumper;
     if (flags.size()) {
       /* use std::function if we actually want to capture flags someday */
@@ -2849,7 +2850,7 @@ void MDSRankDispatcher::handle_asok_command(
           op.dump_type(f);
         }
       };
-      l.lock();
+      exclusive.emplace(mds_lock);
     }
     if (!path.empty()) {
       auto ff = JSONFormatterFile(path, false);
@@ -2898,7 +2899,7 @@ void MDSRankDispatcher::handle_asok_command(
       }
     }
 
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     if (!mdcache->have_request(mrid)) {
       *css << "request does not exist";
       r = -ENOENT;
@@ -2925,7 +2926,7 @@ void MDSRankDispatcher::handle_asok_command(
       r = -EINVAL;
       goto out;
     }
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     if (!mdcache->have_request(mrid)) {
       *css << "request does not exist";
       r = -ENOENT;
@@ -2957,7 +2958,7 @@ void MDSRankDispatcher::handle_asok_command(
       *css << "op_tracker disabled; set mds_enable_op_tracker=true to enable";
     }
   } else if (command == "dump_export_states") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     mdcache->migrator->dump_export_states(f);
   } else if (command == "osdmap barrier") {
     int64_t target_epoch = 0;
@@ -2969,7 +2970,7 @@ void MDSRankDispatcher::handle_asok_command(
       goto out;
     }
     {
-      std::lock_guard l(mds_lock);
+      mds::RankExclusiveGuard l(mds_lock);
       set_osd_epoch_barrier(target_epoch);
     }
     boost::system::error_code ec;
@@ -2977,7 +2978,7 @@ void MDSRankDispatcher::handle_asok_command(
     objecter->wait_for_map(target_epoch, ceph::async::use_blocked[ec]);
   } else if (command == "session ls" ||
 	     command == "client ls") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     bool cap_dump = false;
     std::vector<std::string> filter_args;
     cmd_getval(cmdmap, "cap_dump", cap_dump);
@@ -2991,7 +2992,7 @@ void MDSRankDispatcher::handle_asok_command(
     dump_sessions(filter, f, cap_dump);
   } else if (command == "session evict" ||
 	     command == "client evict") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     std::vector<std::string> filter_args;
     cmd_getval(cmdmap, "filters", filter_args);
 
@@ -3010,7 +3011,7 @@ void MDSRankDispatcher::handle_asok_command(
       r = -ENOENT;
       goto out;
     }
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     bool evicted = evict_client(strtol(client_id.c_str(), 0, 10), true,
         g_conf()->mds_session_blocklist_on_evict, *css);
     if (!evicted) {
@@ -3027,7 +3028,7 @@ void MDSRankDispatcher::handle_asok_command(
     cmd_getval(cmdmap, "option", option);
     bool got_value = cmd_getval(cmdmap, "value", value);
 
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     r = config_client(client_id, !got_value, option, value, *css);
   } else if (command == "scrub start" ||
 	     command == "scrub_start") {
@@ -3049,17 +3050,14 @@ void MDSRankDispatcher::handle_asok_command(
     cmd_getval(cmdmap, "path", path);
     cmd_getval(cmdmap, "tag", tag);
 
-    finisher->queue(
-      new LambdaContext(
-	[this, on_finish, f, path, tag, scrubop_vec](int r) {
-	  command_scrub_start(
-	    f, path, tag, scrubop_vec,
-	    new LambdaContext(
-	      [on_finish](int r) {
-		bufferlist outbl;
-		on_finish(r, {}, outbl);
-	      }));
-	}));
+    // Run inline under rank exclusivity (asok is already on Control under
+    // reactor). Avoid finisher+lock_guard nesting / op-thread blocking.
+    command_scrub_start(
+        f, path, tag, scrubop_vec,
+        new LambdaContext([on_finish](int r) {
+          bufferlist outbl;
+          on_finish(r, {}, outbl);
+        }));
     return;
   } else if (command == "scrub abort") {
     if (!is_active()) {
@@ -3074,12 +3072,8 @@ void MDSRankDispatcher::handle_asok_command(
     }
 
     auto respond = new AsyncResponse(f, std::move(on_finish));
-    finisher->queue(
-      new LambdaContext(
-        [this, respond](int r) {
-          std::lock_guard l(mds_lock);
-          scrubstack->scrub_abort(respond);
-        }));
+    mds::RankExclusiveGuard l(mds_lock);
+    scrubstack->scrub_abort(respond);
     return;
   } else if (command == "scrub pause") {
     if (!is_active()) {
@@ -3094,12 +3088,8 @@ void MDSRankDispatcher::handle_asok_command(
     }
 
     auto respond = new AsyncResponse(f, std::move(on_finish));
-    finisher->queue(
-      new LambdaContext(
-        [this, respond](int r) {
-          std::lock_guard l(mds_lock);
-          scrubstack->scrub_pause(respond);
-        }));
+    mds::RankExclusiveGuard l(mds_lock);
+    scrubstack->scrub_pause(respond);
     return;
   } else if (command == "scrub resume") {
     if (!is_active()) {
@@ -3134,19 +3124,23 @@ void MDSRankDispatcher::handle_asok_command(
     cmd_getval(cmdmap, "path", path);
     string tag;
     cmd_getval(cmdmap, "tag", tag);
-    command_tag_path(f, path, tag);
+    // Async: do not block the op thread waiting on scrub completion.
+    auto respond = new AsyncResponse(f, std::move(on_finish));
+    mds::RankExclusiveGuard l(mds_lock);
+    mdcache->enqueue_scrub(path, tag, true, true, false, false, f, respond);
+    return;
   } else if (command == "flush_path") {
     string path;
     cmd_getval(cmdmap, "path", path);
 
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     mdcache->flush_dentry(path, new AsyncResponse(f, std::move(on_finish)));
     return;
   } else if (command == "flush journal") {
     auto respond = new AsyncResponse(f, std::move(on_finish));
     C_Flush_Journal* flush_journal = new C_Flush_Journal(mdcache, mdlog, this, &respond->ss, respond);
 
-    std::lock_guard locker(mds_lock);
+    mds::RankExclusiveGuard locker(mds_lock);
     flush_journal->send();
     return;
   } else if (command == "get subtrees") {
@@ -3166,7 +3160,7 @@ void MDSRankDispatcher::handle_asok_command(
     }
     command_export_dir(f, path, (mds_rank_t)rank);
   } else if (command == "dump cache") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     int64_t timeout = 0;
     cmd_getval(cmdmap, "timeout", timeout);
     auto mds_beacon_interval = g_conf().get_val<double>("mds_beacon_interval");
@@ -3183,20 +3177,15 @@ void MDSRankDispatcher::handle_asok_command(
   } else if (command == "cache drop") {
     int64_t timeout = 0;
     cmd_getval(cmdmap, "timeout", timeout);
-    finisher->queue(
-      new LambdaContext(
-	[this, on_finish, f, timeout](int r) {
-	  command_cache_drop(
-	    timeout, f,
-	    new LambdaContext(
-	      [on_finish](int r) {
-		bufferlist outbl;
-		on_finish(r, {}, outbl);
-	      }));
-	}));
+    command_cache_drop(
+        timeout, f,
+        new LambdaContext([on_finish](int r) {
+          bufferlist outbl;
+          on_finish(r, {}, outbl);
+        }));
     return;
   } else if (command == "cache status") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     mdcache->cache_status(f);
   } else if (command == "quiesce path") {
     command_quiesce_path(f, cmdmap, std::move(on_finish));
@@ -3207,7 +3196,7 @@ void MDSRankDispatcher::handle_asok_command(
   } else if (command == "dump tree") {
     command_dump_tree(cmdmap, *css, f);
   } else if (command == "dump loads") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     int64_t depth = -1;
     bool got = cmd_getval(cmdmap, "depth", depth);
     if (!got || depth < 0) {
@@ -3215,7 +3204,7 @@ void MDSRankDispatcher::handle_asok_command(
     }
     r = balancer->dump_loads(f, depth);
   } else if (command == "dump snaps") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     string server;
     cmd_getval(cmdmap, "server", server);
     if (server == "--server") {
@@ -3229,7 +3218,7 @@ void MDSRankDispatcher::handle_asok_command(
       r = snapclient->dump_cache(f);
     }
   } else if (command == "force_readonly") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     mdcache->force_readonly();
   } else if (command == "dirfrag split") {
     command_dirfrag_split(cmdmap, *css);
@@ -3244,10 +3233,10 @@ void MDSRankDispatcher::handle_asok_command(
   } else if (command == "dump dir") {
     command_dump_dir(f, cmdmap, *css);
   } else if (command == "damage ls") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     damage_table.dump(f);
   } else if (command == "damage rm") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     damage_entry_id_t id = 0;
     if (!cmd_getval(cmdmap, "damage_id", (int64_t&)id)) {
       r = -EINVAL;
@@ -3261,7 +3250,7 @@ void MDSRankDispatcher::handle_asok_command(
     dout(10) << "dump_stray start" <<  dendl;
     // the context is a wrapper for formatter to be used while scanning stray dir
     auto ctx = new MDCache::C_MDS_DumpStrayDirCtx(mdcache, f, on_finish);
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     mdcache->stray_status(ctx);
     return;
   } else if (command == "dump phase times") {
@@ -3270,16 +3259,16 @@ void MDSRankDispatcher::handle_asok_command(
      * whatever phase we are trying to measure */
     phase_tracker.dump(f);
   } else if (command == "dump qos") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     mds_dmclock_scheduler->dump(f);
   } else if (command == "qos set") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     mds_dmclock_scheduler->process_asok_qos_set(cmdmap, *css, f);
   } else if (command == "qos rm") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     mds_dmclock_scheduler->process_asok_qos_rm(cmdmap, *css, f);
   } else if (command == "qos get") {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     mds_dmclock_scheduler->process_asok_qos_get(cmdmap, *css, f);
   } else if (command == "quarantine enable") {
     command_quarantine_dir(cmdmap, std::move(on_finish), QUARANTINE_ADD);
@@ -3383,7 +3372,7 @@ void MDSRank::command_scrub_start(Formatter *f,
       scrub_mdsdir = true;
   }
 
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   mdcache->enqueue_scrub(path, tag, force, recursive, repair, scrub_mdsdir,
                          f, on_finish);
   // scrub_dentry() finishers will dump the data for us; we're done!
@@ -3394,14 +3383,16 @@ void MDSRank::command_tag_path(Formatter *f,
 {
   C_SaferCond scond;
   {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     mdcache->enqueue_scrub(path, tag, true, true, false, false, f, &scond);
   }
+  // Must not block the reactor op thread waiting for scrub IO.
+  ceph_assert(!mds::reactor_is_op_thread());
   scond.wait();
 }
 
 void MDSRank::command_scrub_resume(Formatter *f) {
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   int r = scrubstack->scrub_resume();
 
   f->open_object_section("result");
@@ -3410,19 +3401,19 @@ void MDSRank::command_scrub_resume(Formatter *f) {
 }
 
 void MDSRank::command_scrub_status(Formatter *f) {
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   scrubstack->scrub_status(f);
 }
 
 void MDSRank::command_scrub_purge_status(std::string_view tag) {
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   scrubstack->purge_scrub_counters(tag);
 }
 
 void MDSRank::command_get_subtrees(Formatter *f)
 {
   ceph_assert(f != NULL);
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
 
   std::vector<CDir*> subtrees;
   mdcache->get_subtrees(subtrees);
@@ -3465,8 +3456,7 @@ int MDSRank::_command_export_dir(
     mds_rank_t target)
 {
   auto fp = filepath(path, {.drop_trailing = true});
-
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
 
   if (target == whoami || !mdsmap->is_up(target) || !mdsmap->is_in(target)) {
     derr << "bad MDS target " << target << dendl;
@@ -3504,7 +3494,7 @@ void MDSRank::command_dump_tree(const cmdmap_t &cmdmap, std::ostream &ss, Format
 
   auto dump = [&](Formatter *f) {
     auto fp = filepath(root, {.drop_trailing = true});
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     CInode *in = mdcache->cache_traverse(fp);
     if (!in) {
       ss << "inode for path '" << fp << "' is not in cache";
@@ -3580,7 +3570,7 @@ bool MDSRank::command_dirfrag_split(
     cmdmap_t cmdmap,
     std::ostream &ss)
 {
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   int64_t by = 0;
   if (!cmd_getval(cmdmap, "bits", by)) {
     ss << "missing bits argument";
@@ -3606,7 +3596,7 @@ bool MDSRank::command_dirfrag_merge(
     cmdmap_t cmdmap,
     std::ostream &ss)
 {
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   std::string path;
   bool got = cmd_getval(cmdmap, "path", path);
   if (!got) {
@@ -3643,7 +3633,7 @@ bool MDSRank::command_dirfrag_ls(
     std::ostream &ss,
     Formatter *f)
 {
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   std::string path;
   bool got = cmd_getval(cmdmap, "path", path);
   if (!got) {
@@ -3679,7 +3669,7 @@ bool MDSRank::command_dirfrag_ls(
 
 void MDSRank::command_openfiles_ls(Formatter *f) 
 {
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   mdcache->dump_openfiles(f);
 }
 
@@ -3722,7 +3712,7 @@ void MDSRank::command_quiesce_path(Formatter* f, const cmdmap_t& cmdmap, asok_fi
     respond(rc, "", bl);
   };
 
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
 
   auto mdr = mdcache->quiesce_path(filepath(path), quiesce_ctx, f);
 
@@ -3773,7 +3763,7 @@ void MDSRank::command_lock_path(Formatter* f, const cmdmap_t& cmdmap, asok_finis
   };
 
   {
-    std::lock_guard l(mds_lock);
+    mds::RankExclusiveGuard l(mds_lock);
     if (await) {
       mdcache->lock_path(std::move(config), std::move(respond));
     } else {
@@ -3786,7 +3776,7 @@ void MDSRank::command_lock_path(Formatter* f, const cmdmap_t& cmdmap, asok_finis
 
 void MDSRank::command_dump_inode(Formatter *f, const cmdmap_t &cmdmap, std::ostream &ss)
 {
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   int64_t number;
   bool got = cmd_getval(cmdmap, "number", number);
   if (!got) {
@@ -3802,7 +3792,7 @@ void MDSRank::command_dump_inode(Formatter *f, const cmdmap_t &cmdmap, std::ostr
 
 void MDSRank::command_dump_dir(Formatter *f, const cmdmap_t &cmdmap, std::ostream &ss)
 {
-  std::lock_guard l(mds_lock);
+  mds::RankExclusiveGuard l(mds_lock);
   std::string path;
   bool got = cmd_getval(cmdmap, "path", path);
   if (!got) {
@@ -4374,7 +4364,7 @@ bool MDSRank::evict_client(int64_t session_id,
     Context* on_blocklist_done = new LambdaContext([this, fn](int r) {
       objecter->wait_for_latest_osdmap(lambdafy(mds_wrap_finisher(
           this, new LambdaContext([this, fn](int r) {
-            std::lock_guard l(mds_lock);
+            mds::RankExclusiveGuard l(mds_lock);
             auto epoch = objecter->with_osdmap([](const OSDMap& o) {
               return o.get_epoch();
             });
@@ -4455,7 +4445,7 @@ MDSRankDispatcher::MDSRankDispatcher(
 void MDSRank::command_cache_drop(uint64_t timeout, Formatter *f, Context *on_finish) {
   dout(20) << __func__ << dendl;
 
-  std::lock_guard locker(mds_lock);
+  mds::RankExclusiveGuard locker(mds_lock);
   C_Drop_Cache *request = new C_Drop_Cache(server, mdcache, mdlog, this,
                                            timeout, f, on_finish);
   request->send();
@@ -4714,7 +4704,7 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
 
   finisher->queue(new LambdaContext(
       [this, apply_components = std::move(apply_components)](int) {
-        std::scoped_lock lock(mds_lock);
+        mds::RankExclusiveGuard lock(mds_lock);
         apply_components();
       }));
 }
