@@ -22,6 +22,10 @@
  *
  * IO completions remain in MDSIOContextBase::complete (finisher / inline lock).
  * submit_io_completion() mirrors the reactor execute path but is unused in classic.
+ *
+ * Dispatch latency PerfCounters: if classic records them, call
+ * mds::dispatch_perf::note_*_logger() directly. Reactor stages into
+ * LocalDispatchMetrics on the op thread and flushes periodically.
  */
 
 #include "ClassicDispatchEngine.h"
