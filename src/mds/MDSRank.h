@@ -468,6 +468,8 @@ class MDSRank {
       return inject_journal_corrupt_dentry_first;
     }
 
+    /// Sync cache lookups for MetricsHandler.  Under reactor these hop to
+    /// the Control lane (caller blocks); classic takes mds_lock inline.
     std::string get_path(inodeno_t ino);
     uint64_t get_inode_rbytes(inodeno_t ino);
 
