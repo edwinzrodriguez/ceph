@@ -31,6 +31,9 @@
  *   - MDLog log_trim_upkeep           -> submit_log_trim_tick() (reactor)
  *   - MDSRank finished_queue           -> note_finished_queued() (reactor)
  *   - MDSDaemon timer / mutating asok -> submit_callable(Control) (reactor)
+ *   - Messenger accept/reset           -> submit_callable(Control) (reactor)
+ *   - Metrics get_path/rbytes          -> submit_callable(Control)+future
+ *   - Write-error / purge / conf-change -> submit_callable(Control) (reactor)
  *
  * Owned by MDSRank; started in MDSRankDispatcher::init(), stopped in shutdown().
  */
