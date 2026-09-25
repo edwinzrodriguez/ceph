@@ -17,6 +17,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <typeinfo>
 #include <vector>
@@ -4394,21 +4395,61 @@ epoch_t MDSRank::get_osd_epoch() const
   return objecter->with_osdmap(std::mem_fn(&OSDMap::get_epoch));
 }
 
+namespace {
+
+// MetricsHandler (messenger + mds-metrics threads) needs synchronous cache
+// reads.  Under reactor, take those reads on the Control lane so they do not
+// race unlocked execute_item; the caller blocks on a future.  Classic and
+// shutdown fall back to locking mds_lock on the calling thread.  Already on
+// the op thread: run inline (rank-exclusive).
+template <typename R, typename Fn>
+R
+run_rank_exclusive_sync(MDSRank* mds, Fn&& fn)
+{
+  if (auto* engine = mds->get_dispatch_engine();
+      engine && engine->is_reactor() && !mds::reactor_is_op_thread() &&
+      !mds->is_daemon_stopping()) {
+    std::promise<R> p;
+    auto f = p.get_future();
+    engine->submit_callable(
+        DispatchLane::Control,
+        [fn = std::forward<Fn>(fn), &p]() mutable { p.set_value(fn()); });
+    return f.get();
+  }
+
+  if (mds::reactor_is_op_thread()) {
+    return fn();
+  }
+
+  std::lock_guard locker(mds->mds_lock);
+  return fn();
+}
+
+} // namespace
+
 std::string MDSRank::get_path(inodeno_t ino) {
-  std::lock_guard locker(mds_lock);
-  CInode* inode = mdcache->get_inode(ino);
-  if (!inode) return {};
-  std::string res;
-  inode->make_path_string(res);
-  return res;
+  return run_rank_exclusive_sync<std::string>(this, [this, ino]() {
+    MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
+    CInode* inode = mdcache->get_inode(ino);
+    if (!inode) {
+      return std::string{};
+    }
+    std::string res;
+    inode->make_path_string(res);
+    return res;
+  });
 }
 
 uint64_t MDSRank::get_inode_rbytes(inodeno_t ino) {
-  std::lock_guard locker(mds_lock);
-  CInode* inode = mdcache->get_inode(ino);
-  if (!inode) return 0;
-  const auto& pi = inode->get_projected_inode();
-  return pi->rstat.rbytes > 0 ? static_cast<uint64_t>(pi->rstat.rbytes) : 0;
+  return run_rank_exclusive_sync<uint64_t>(this, [this, ino]() {
+    MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
+    CInode* inode = mdcache->get_inode(ino);
+    if (!inode) {
+      return uint64_t{0};
+    }
+    const auto& pi = inode->get_projected_inode();
+    return pi->rstat.rbytes > 0 ? static_cast<uint64_t>(pi->rstat.rbytes) : 0;
+  });
 }
 
 std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
