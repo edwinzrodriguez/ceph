@@ -584,7 +584,7 @@ ReactorDispatchEngine::execute_io_completion(MDSIOContextBase* ioctx, int r)
   MDSRank* mds = ctx.rank;
 
   dout(10) << "MDSIOContextBase::complete: " << typeid(*ioctx).name() << dendl;
-  MDS_ASSERT_MDS_LOCK(*ctx.mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(*ctx.mds_lock);
 
   if (mds->is_daemon_stopping()) {
     dout(4) << "MDSIOContextBase::complete: dropping for stopping "

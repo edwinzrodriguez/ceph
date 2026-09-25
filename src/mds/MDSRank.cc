@@ -101,7 +101,7 @@ public:
   }
 
   void send() {
-    MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+    MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
 
     dout(20) << __func__ << dendl;
 
@@ -141,7 +141,7 @@ private:
   }
 
   void handle_clear_mdlog(int r) {
-    MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+    MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
     dout(20) << __func__ << ": r=" << r << dendl;
 
     if (r != 0) {
@@ -200,7 +200,7 @@ private:
   }
 
   void trim_expired_segments() {
-    MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+    MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
     dout(5) << __func__ << ": expiry complete, expire_pos/trim_pos is now "
             << std::hex << mdlog->get_journaler()->get_expire_pos() << "/"
             << mdlog->get_journaler()->get_trimmed_pos() << dendl;
@@ -226,7 +226,7 @@ private:
     /* We don't need the mds_lock but MDLog::write_head takes an MDSContext so
      * we are expected to have it.
      */
-    MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+    MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
     dout(20) << __func__ << ": r=" << r << dendl;
 
     dout(5) << __func__ << ": trimming is complete; wait for journal head write. Journal expire_pos/trim_pos is now "
@@ -1010,7 +1010,7 @@ void MDSRank::abort(std::string_view msg)
 void MDSRank::damaged()
 {
   ceph_assert(whoami != MDS_RANK_NONE);
-  MDS_ASSERT_MDS_LOCK(mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
 
   beacon.set_want_state(*mdsmap, MDSMap::STATE_DAMAGED);
   monc->flush_log();  // Flush any clog error from before we were called
@@ -1408,7 +1408,7 @@ MDSRank::notify_finished_queue()
  */
 void MDSRank::_advance_queues()
 {
-  MDS_ASSERT_MDS_LOCK(mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
 
   if (!finished_queue.empty()) {
     MDSPhaseTracker::Timer phase_timer(&phase_tracker, l_mdsp_finished_contexts);
@@ -1855,7 +1855,7 @@ void MDSRank::boot_start(BootStep step, int r)
 
 void MDSRank::validate_sessions()
 {
-  MDS_ASSERT_MDS_LOCK(mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
   bool valid = true;
 
   // Identify any sessions which have state inconsistent with other,
@@ -4297,7 +4297,7 @@ bool MDSRank::evict_client(int64_t session_id,
     bool wait, bool blocklist, std::ostream& err_ss,
     Context *on_killed)
 {
-  MDS_ASSERT_MDS_LOCK(mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
 
   // Mutually exclusive args
   ceph_assert(!(wait && on_killed != nullptr));
@@ -4332,7 +4332,7 @@ bool MDSRank::evict_client(int64_t session_id,
   std::vector<std::string> cmd = {css->str()};
 
   auto kill_client_session = [this, session_id, wait, on_killed]() {
-    MDS_ASSERT_MDS_LOCK(mds_lock);
+    MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
     Session *session = sessionmap.get_session(
         entity_name_t(CEPH_ENTITY_TYPE_CLIENT, session_id));
     if (session) {
@@ -4359,7 +4359,7 @@ bool MDSRank::evict_client(int64_t session_id,
   };
 
   auto apply_blocklist = [this, &cmd](std::function<void()> fn) {
-    MDS_ASSERT_MDS_LOCK(mds_lock);
+    MDS_ASSERT_RANK_EXCLUSIVE(mds_lock);
 
     Context* on_blocklist_done = new LambdaContext([this, fn](int r) {
       objecter->wait_for_latest_osdmap(lambdafy(mds_wrap_finisher(

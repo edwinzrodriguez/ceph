@@ -15045,7 +15045,7 @@ bool MDCache::is_ready_to_trim_cache(void)
 std::optional<bool>
 MDCache::trim_quantum(std::chrono::milliseconds max_duration)
 {
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
 
   {
     MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_cache_memory);
