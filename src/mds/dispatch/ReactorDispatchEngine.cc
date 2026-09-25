@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 
 #include "common/debug.h"
 #include "mds_lock_debug.h"
@@ -609,9 +610,20 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
   record_wait_metrics(*item);
 
   const auto exec_start = ceph::fast_mono_clock::now();
+  const char* token = mds::work_kind_owner_token(item->kind);
 
-  mds::MdsLockGuard mds_lock_guard{
-      *ctx.mds_lock, mds::work_kind_owner_token(item->kind)};
+  // Boot/replay: MDLog replay/recovery still take mds_lock on dedicated
+  // threads. Keep a real MdsLockGuard so Control/IOComplete serialize with
+  // them. After boot, exclusivity is the registered op thread alone.
+  std::optional<mds::MdsLockGuard> boot_lock;
+  std::optional<mds::ReactorOpMdsLockHold> boot_hold;
+  std::optional<mds::ReactorOwnerToken> owner_token;
+  if (boot_exclusive.load(std::memory_order_acquire)) {
+    boot_lock.emplace(*ctx.mds_lock, token);
+    boot_hold.emplace();
+  } else {
+    owner_token.emplace(*ctx.mds_lock, token);
+  }
 
   switch (item->kind) {
   case WorkKind::InboundMessage:

@@ -81,8 +81,11 @@
  * that would deadlock once execute_item already holds exclusivity).
  *
  * ReactorDispatchEngine registers the op thread via reactor_register_op_thread()
- * at thread start and deregisters on shutdown.  Dispatch engines pass
- * work_kind_owner_token() / dispatch_lane_owner_token() into MdsLockGuard.
+ * at thread start and deregisters on shutdown.  After boot, execute_item uses
+ * ReactorOwnerToken (debug) instead of MdsLockGuard; boot_exclusive still
+ * takes a real MdsLockGuard to serialize with MDLog replay/recovery.
+ * ClassicDispatchEngine still passes work_kind_owner_token() /
+ * dispatch_lane_owner_token() into MdsLockGuard.
  *
  * In non-debug builds (without CEPH_DEBUG_MUTEX), MdsLockGuard is a thin
  * lock_guard wrapper and MDS_ASSERT_MDS_LOCK falls back to the standard macro.
@@ -110,6 +113,20 @@ void reactor_register_op_thread();
 void reactor_deregister_op_thread();
 /// True while this thread is the registered mds-rank-op thread.
 bool reactor_is_op_thread();
+/// True while execute_item holds a real MdsLockGuard on the op thread (boot).
+bool reactor_op_holds_mds_lock();
+
+/**
+ * RAII: mark that the reactor op thread currently holds mds_lock.
+ * Paired with MdsLockGuard in execute_item during boot_exclusive.
+ */
+class ReactorOpMdsLockHold {
+public:
+  ReactorOpMdsLockHold();
+  ~ReactorOpMdsLockHold();
+  ReactorOpMdsLockHold(const ReactorOpMdsLockHold&) = delete;
+  ReactorOpMdsLockHold& operator=(const ReactorOpMdsLockHold&) = delete;
+};
 
 #ifdef CEPH_DEBUG_MUTEX
 
@@ -139,6 +156,24 @@ public:
   MdsLockToken& operator=(const MdsLockToken&) = delete;
 };
 
+/**
+ * Debug-only virtual owner for reactor execute_item after drop-lock.
+ *
+ * Sets the fair_mutex owner token without acquiring mds_lock.  Valid only
+ * on the registered op thread; exclusivity is the thread itself.
+ */
+class ReactorOwnerToken {
+  ceph::fair_mutex& lock;
+  const char* prev_token;
+
+public:
+  ReactorOwnerToken(ceph::fair_mutex& lock_, const char* token);
+  ~ReactorOwnerToken();
+
+  ReactorOwnerToken(const ReactorOwnerToken&) = delete;
+  ReactorOwnerToken& operator=(const ReactorOwnerToken&) = delete;
+};
+
 /// Abort if a reactor:* token is set on a non-op thread.
 void reactor_assert_op_thread(std::string_view token);
 /// Assert current thread holds @p lock; log @p site and owner token on failure.
@@ -163,6 +198,12 @@ public:
 
   MdsLockGuard(const MdsLockGuard&) = delete;
   MdsLockGuard& operator=(const MdsLockGuard&) = delete;
+};
+
+/// No-op outside CEPH_DEBUG_MUTEX (token is debug-only).
+class ReactorOwnerToken {
+public:
+  ReactorOwnerToken(ceph::fair_mutex&, const char*) {}
 };
 
 #define MDS_ASSERT_MDS_LOCK(lock) ceph_assert(ceph_mutex_is_locked_by_me(lock))

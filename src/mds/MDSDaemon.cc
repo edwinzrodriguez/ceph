@@ -17,9 +17,10 @@
 
 #include <unistd.h>
 
+#include <optional>
+
 #include "common/debug.h"
 #include "mds_lock_debug.h"
-#include "mds_rank_exclusive.h"
 
 #include "auth/AuthAuthorizeHandler.h"
 #include "auth/KeyRing.h"
@@ -63,6 +64,7 @@
 #include "Server.h"
 #include "SnapClient.h"
 #include "SnapServer.h"
+#include "mds_rank_exclusive.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -781,8 +783,22 @@ int MDSDaemon::init()
 
 void MDSDaemon::reset_tick()
 {
+  // SafeTimer cancel/add require mds_lock. Classic timer callbacks already
+  // hold it; post-drop reactor tick runs on the op thread unlocked and must
+  // take it here. During boot_exclusive, execute_item already holds the lock.
+  std::optional<std::lock_guard<ceph::fair_mutex>> take;
+  if (mds::reactor_is_op_thread()) {
+    if (!mds::reactor_op_holds_mds_lock()) {
+      take.emplace(mds_lock);
+    }
+  } else {
+    MDS_ASSERT_MDS_LOCK(mds_lock);
+  }
+
   // cancel old
-  if (tick_event) timer.cancel_event(tick_event);
+  if (tick_event) {
+    timer.cancel_event(tick_event);
+  }
 
   // schedule
   tick_event = timer.add_event_after(

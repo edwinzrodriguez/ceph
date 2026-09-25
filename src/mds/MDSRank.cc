@@ -2399,8 +2399,9 @@ MDSRank::update_reactor_boot_policy()
   }
 
   // While journal replay/recovery (or create/start boot) holds mds_lock on
-  // dedicated threads, keep Client and Maintenance off the op thread.
-  // Control + IOComplete still drain so boot gathers and maps progress.
+  // dedicated threads, keep Client and Maintenance off the op thread and
+  // have execute_item take a real MdsLockGuard for Control/IOComplete so
+  // they serialize with those threads. Cleared after leaving those states.
   const bool exclusive = is_creating() || is_starting() || is_any_replay() ||
                          is_standby();
   dout(10) << __func__ << " exclusive=" << exclusive
