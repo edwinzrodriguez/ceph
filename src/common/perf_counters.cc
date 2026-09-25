@@ -340,6 +340,32 @@ void PerfCounters::tinc(int idx, ceph::timespan amt)
   }
 }
 
+void
+PerfCounters::tinc_n(int idx, ceph::timespan sum, uint64_t n)
+{
+#ifndef WITH_CRIMSON
+  if (!m_cct->_conf->perf)
+    return;
+#endif
+
+  if (n == 0) {
+    return;
+  }
+
+  ceph_assert(idx > m_lower_bound);
+  ceph_assert(idx < m_upper_bound);
+  perf_counter_data_any_d& data(m_data[idx - m_lower_bound - 1]);
+  if (!(data.type & PERFCOUNTER_TIME))
+    return;
+  if (data.type & PERFCOUNTER_LONGRUNAVG) {
+    data.avgcount += n;
+    data.u64 += sum.count();
+    data.avgcount2 += n;
+  } else {
+    data.u64 += sum.count();
+  }
+}
+
 void PerfCounters::tinc_with_max(int idx, ceph::timespan amt)
 {
 #ifndef WITH_CRIMSON
@@ -418,10 +444,44 @@ utime_t PerfCounters::tget(int idx) const
 
 void PerfCounters::hinc(int idx, int64_t x, int64_t y)
 {
+  hinc(idx, x, y, 1);
+}
+
+void
+PerfCounters::hinc(int idx, int64_t x, int64_t y, uint64_t n)
+{
 #ifndef WITH_CRIMSON
   if (!m_cct->_conf->perf)
     return;
 #endif
+
+  if (n == 0) {
+    return;
+  }
+
+  ceph_assert(idx > m_lower_bound);
+  ceph_assert(idx < m_upper_bound);
+
+  perf_counter_data_any_d& data(m_data[idx - m_lower_bound - 1]);
+  ceph_assert(
+      data.type ==
+      (PERFCOUNTER_HISTOGRAM | PERFCOUNTER_COUNTER | PERFCOUNTER_U64));
+  ceph_assert(data.histogram);
+
+  data.histogram->add(n, x, y);
+}
+
+void
+PerfCounters::hinc_bucket(int idx, int64_t bx, int64_t by, uint64_t n)
+{
+#ifndef WITH_CRIMSON
+  if (!m_cct->_conf->perf)
+    return;
+#endif
+
+  if (n == 0) {
+    return;
+  }
 
   ceph_assert(idx > m_lower_bound);
   ceph_assert(idx < m_upper_bound);
@@ -430,7 +490,7 @@ void PerfCounters::hinc(int idx, int64_t x, int64_t y)
   ceph_assert(data.type == (PERFCOUNTER_HISTOGRAM | PERFCOUNTER_COUNTER | PERFCOUNTER_U64));
   ceph_assert(data.histogram);
 
-  data.histogram->inc(x, y);
+  data.histogram->add_bucket(n, bx, by);
 }
 
 pair<uint64_t, uint64_t> PerfCounters::get_tavg_ns(int idx) const

@@ -9,6 +9,7 @@ set(mds_srcs
   dispatch/OpWorkItem.cc
   dispatch/MDSOpWorkQueue.cc
   dispatch/classify.cc
+  dispatch/dispatch_perf.cc
   dispatch/ReactorDispatchEngine.cc
   Beacon.cc
   flock.cc

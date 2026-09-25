@@ -36,6 +36,7 @@
 #include "MDSRank.h"
 #include "OpWorkItem.h"
 #include "classify.h"
+#include "dispatch_perf.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -49,30 +50,6 @@ dispatch_usec_since(ceph::fast_mono_time t)
   return std::chrono::duration_cast<std::chrono::microseconds>(
              ceph::fast_mono_clock::now() - t)
       .count();
-}
-
-static int
-dispatch_enqueue_latency_lane_counter(DispatchLane lane)
-{
-  static const int counters[] = {
-      l_mds_dispatch_enqueue_latency_control,
-      l_mds_dispatch_enqueue_latency_io,
-      l_mds_dispatch_enqueue_latency_maintenance,
-      l_mds_dispatch_enqueue_latency_client,
-  };
-  return counters[static_cast<size_t>(lane)];
-}
-
-static int
-dispatch_execute_latency_lane_counter(DispatchLane lane)
-{
-  static const int counters[] = {
-      l_mds_dispatch_execute_latency_control,
-      l_mds_dispatch_execute_latency_io,
-      l_mds_dispatch_execute_latency_maintenance,
-      l_mds_dispatch_execute_latency_client,
-  };
-  return counters[static_cast<size_t>(lane)];
 }
 
 void
@@ -328,6 +305,8 @@ ReactorDispatchEngine::publish_queue_depth_metrics()
     return;
   }
 
+  flush_logger_metrics();
+
   PerfCounters* logger = ctx.rank->logger;
   logger->set(l_mds_reactor_dispatch_queue_len, queue.count());
   logger->set(
@@ -348,6 +327,15 @@ ReactorDispatchEngine::publish_queue_depth_metrics()
 }
 
 void
+ReactorDispatchEngine::flush_logger_metrics()
+{
+  if (!ctx.rank || !ctx.rank->logger) {
+    return;
+  }
+  mds::dispatch_perf::flush_to_logger(ctx.rank->logger, local_metrics);
+}
+
+void
 ReactorDispatchEngine::enqueue_item(OpWorkItem* item, DispatchLane lane)
 {
   queue.enqueue(item, lane);
@@ -357,18 +345,8 @@ ReactorDispatchEngine::enqueue_item(OpWorkItem* item, DispatchLane lane)
 void
 ReactorDispatchEngine::record_wait_metrics(const OpWorkItem& item)
 {
-  if (!ctx.rank || !ctx.rank->logger) {
-    return;
-  }
-
-  PerfCounters* logger = ctx.rank->logger;
-  const int64_t wait_usec = dispatch_usec_since(item.enqueued_at);
-  const auto wait = std::chrono::microseconds(wait_usec);
-
-  logger->tinc(l_mds_dispatch_enqueue_latency, wait);
-  logger->tinc(dispatch_enqueue_latency_lane_counter(item.lane), wait);
-  logger->hinc(
-      l_mds_dispatch_enqueue_hist, wait_usec, static_cast<int64_t>(item.lane));
+  // Stage on the op thread; flush_logger_metrics publishes to PerfCounters.
+  local_metrics.note_enqueue(dispatch_usec_since(item.enqueued_at), item.lane);
 }
 
 void
@@ -393,21 +371,8 @@ ReactorDispatchEngine::record_execute_metrics(
     w.record(usec);
   }
 
-  if (!ctx.rank || !ctx.rank->logger) {
-    return;
-  }
-
-  PerfCounters* logger = ctx.rank->logger;
-  const auto exec = std::chrono::microseconds(exec_usec);
-
-  logger->tinc(l_mds_dispatch_execute_latency, exec);
-  logger->tinc(dispatch_execute_latency_lane_counter(item.lane), exec);
-  if (auto wc = classify_dispatch_work_class(item); wc) {
-    logger->tinc(
-        l_mds_dispatch_execute_latency_wc_first + static_cast<int>(*wc), exec);
-  }
-  logger->hinc(
-      l_mds_dispatch_execute_hist, exec_usec, static_cast<int64_t>(item.lane));
+  local_metrics.note_execute(
+      exec_usec, item.lane, classify_dispatch_work_class(item));
 }
 
 ReactorDispatchEngine::ReactorDispatchEngine(const MDSDispatchContext& ctx_) :
@@ -443,6 +408,8 @@ ReactorDispatchEngine::shutdown()
   }
 
   queue.flush_and_clear();
+
+  flush_logger_metrics();
 
   queue_len_max.store(0, std::memory_order_relaxed);
   trim_quantum_queued.store(false, std::memory_order_relaxed);
@@ -627,18 +594,14 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
 
   switch (item->kind) {
   case WorkKind::InboundMessage:
-    if (ctx.rank && ctx.rank->logger) {
-      ctx.rank->logger->inc(l_mds_dispatch_inbound);
-    }
+    ++local_metrics.inbound;
     if (ctx.daemon && !ctx.daemon->stopping) {
       (void)ctx.daemon->dispatch_inbound_locked(item->msg);
     }
     break;
 
   case WorkKind::IOCompletion:
-    if (ctx.rank && ctx.rank->logger) {
-      ctx.rank->logger->inc(l_mds_dispatch_io_completions);
-    }
+    ++local_metrics.io_completions;
     execute_io_completion(item->io_ctx, item->rval);
     break;
 
