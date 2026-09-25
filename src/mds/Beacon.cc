@@ -308,8 +308,8 @@ void Beacon::notify_health(MDSRank const *mds)
     return;
   }
 
-  // I'm going to touch this MDS, so it must be locked
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  // Touching MDSRank state: mds_lock held, or reactor op-thread exclusivity
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
 
   health.metrics.clear();
 
