@@ -1565,9 +1565,8 @@ class C_Locker_Eval : public LockerContext {
   int mask;
 public:
   C_Locker_Eval(Locker *l, MDSCacheObject *pp, int m) : LockerContext(l), p(pp), mask(m) {
-    // We are used as an MDSCacheObject waiter, so should
-    // only be invoked by someone already holding the big lock.
-    MDS_ASSERT_MDS_LOCK(locker->mds->mds_lock);
+    // MDSCacheObject waiter: caller holds mds_lock or is the reactor op thread
+    MDS_ASSERT_RANK_EXCLUSIVE(locker->mds->mds_lock);
     p->get(MDSCacheObject::PIN_PTRWAITER);    
   }
   void finish(int r) override {

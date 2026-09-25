@@ -75,7 +75,7 @@ void ScrubStack::dequeue(MDSCacheObject *obj)
 
 int ScrubStack::_enqueue(MDSCacheObject *obj, ScrubHeaderRef& header, bool top)
 {
-  MDS_ASSERT_MDS_LOCK(mdcache->mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mdcache->mds->mds_lock);
   if (CInode *in = dynamic_cast<CInode*>(obj)) {
     if (in->scrub_is_in_progress()) {
       dout(10) << __func__ << " with {" << *in << "}" << ", already in scrubbing" << dendl;
@@ -632,7 +632,7 @@ void ScrubStack::_validate_inode_done(CInode *in, int r,
 }
 
 void ScrubStack::complete_control_contexts(int r) {
-  MDS_ASSERT_MDS_LOCK(mdcache->mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mdcache->mds->mds_lock);
 
   for (auto &ctx : control_ctxs) {
     ctx->complete(r);
@@ -650,7 +650,7 @@ void ScrubStack::set_state(State next_state) {
 }
 
 bool ScrubStack::scrub_in_transition_state() {
-  MDS_ASSERT_MDS_LOCK(mdcache->mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mdcache->mds->mds_lock);
   dout(20) << __func__ << ": state=" << state << dendl;
 
   // STATE_RUNNING is considered as a transition state so as to
@@ -663,7 +663,7 @@ bool ScrubStack::scrub_in_transition_state() {
 }
 
 std::string_view ScrubStack::scrub_summary() {
-  MDS_ASSERT_MDS_LOCK(mdcache->mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mdcache->mds->mds_lock);
 
   bool have_more = false;
   CachedStackStringStream cs;
@@ -717,7 +717,7 @@ std::string_view ScrubStack::scrub_summary() {
 }
 
 void ScrubStack::scrub_status(Formatter *f) {
-  MDS_ASSERT_MDS_LOCK(mdcache->mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mdcache->mds->mds_lock);
 
   f->open_object_section("result");
 
@@ -838,7 +838,7 @@ void ScrubStack::scrub_status(Formatter *f) {
 }
 
 void ScrubStack::abort_pending_scrubs() {
-  MDS_ASSERT_MDS_LOCK(mdcache->mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mdcache->mds->mds_lock);
   ceph_assert(clear_stack);
 
   auto abort_one = [this](MDSCacheObject *obj) {
@@ -880,7 +880,7 @@ void ScrubStack::send_state_message(int op) {
 }
 
 void ScrubStack::scrub_abort(Context *on_finish) {
-  MDS_ASSERT_MDS_LOCK(mdcache->mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mdcache->mds->mds_lock);
 
   dout(10) << __func__ << ": aborting with " << scrubs_in_progress
            << " scrubs in progress and " << stack_size << " in the"
@@ -908,7 +908,7 @@ void ScrubStack::scrub_abort(Context *on_finish) {
 }
 
 void ScrubStack::scrub_pause(Context *on_finish) {
-  MDS_ASSERT_MDS_LOCK(mdcache->mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mdcache->mds->mds_lock);
 
   dout(10) << __func__ << ": pausing with " << scrubs_in_progress
            << " scrubs in progress and " << stack_size << " in the"
@@ -938,7 +938,7 @@ void ScrubStack::scrub_pause(Context *on_finish) {
 }
 
 bool ScrubStack::scrub_resume() {
-  MDS_ASSERT_MDS_LOCK(mdcache->mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mdcache->mds->mds_lock);
   dout(20) << __func__ << ": state=" << state << dendl;
 
   if (mdcache->mds->get_nodeid() == 0)

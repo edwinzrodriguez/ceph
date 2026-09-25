@@ -536,7 +536,7 @@ void Server::finish_reclaim_session(Session *session, const ref_t<MClientReclaim
     if (reply) {
       int64_t session_id = session->get_client().v;
       send_reply = new LambdaContext([this, session_id, reply](int r) {
-        MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+        MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
         Session* session =
             mds->sessionmap.get_session(entity_name_t::CLIENT(session_id));
         if (!session) {
@@ -1503,7 +1503,7 @@ void Server::handle_conf_change(const std::set<std::string>& changed) {
  */
 void Server::kill_session(Session *session, Context *on_safe)
 {
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
 
   if ((session->is_opening() ||
        session->is_open() ||

@@ -29,7 +29,7 @@
 void MDSContext::complete(int r) {
   MDSRank *mds = get_mds();
   ceph_assert(mds != nullptr);
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
   dout(10) << "MDSContext::complete: " << typeid(*this).name() << dendl;
   mds->heartbeat_reset();
   return Context::complete(r);

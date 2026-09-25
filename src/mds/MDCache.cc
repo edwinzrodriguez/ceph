@@ -14703,7 +14703,7 @@ bool MDCache::is_ready_to_trim_cache(void)
 std::optional<bool>
 MDCache::trim_quantum(std::chrono::milliseconds max_duration)
 {
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
 
   check_memory_usage();
   if (!mds->is_cache_trimmable()) {
