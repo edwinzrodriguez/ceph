@@ -1264,7 +1264,12 @@ MDLog::_trim_expired_segments(
     trim_expired_resume_seq = 0;
   }
 
-  const bool more_expired = deferred || !expired_segments.empty();
+  // Requeue only when we yielded on the time budget.  Remaining
+  // expired_segments that cannot be trimmed yet (blocked on a non-expired
+  // predecessor, or waiting for a major-segment boundary) must not return
+  // true: that busy-loops ReactorDispatchEngine::finish_log_trim on the op
+  // thread.  log_trim_upkeep will try again on its interval.
+  const bool more_expired = deferred;
   locker.unlock();
 
   write_head(ctx);

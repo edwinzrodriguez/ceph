@@ -193,9 +193,12 @@ public:
   // beacon needs me too
   bool is_trim_slow() const;
 
-  /// Run journal segment trim; caller must hold mds_lock.
+  /// Run journal segment trim; caller must hold rank exclusivity.
   /// @param max_duration wall-clock budget; zero means no time limit.
-  /// @return true if more trim work remains (caller may re-enqueue).
+  /// @return true if the tick yielded on its budget and more sliced work
+  ///         remains (caller may re-enqueue immediately).  false when idle
+  ///         or blocked waiting on expiry/flush — do not busy-loop; upkeep
+  ///         will try again later.
   bool trim_tick(
       std::chrono::milliseconds max_duration = std::chrono::milliseconds::zero());
 
