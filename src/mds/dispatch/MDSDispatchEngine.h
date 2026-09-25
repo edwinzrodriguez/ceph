@@ -36,6 +36,11 @@
  *   - Write-error / purge / conf-change -> submit_callable(Control) (reactor)
  *   - Quiesce send_ack/listing/agent    -> submit_callable(Control)+future
  *
+ * Phase 2 (reactor boot exclusivity): while creating/starting/replay,
+ * Client and Maintenance lanes are not drained so MDLog replay/recovery
+ * threads can keep taking mds_lock without racing unlocked execute_item.
+ * Control + IOComplete still drain (boot gathers, maps, tick).
+ *
  * Owned by MDSRank; started in MDSRankDispatcher::init(), stopped in shutdown().
  */
 
@@ -78,6 +83,12 @@ public:
   virtual void submit_callable(DispatchLane lane, std::function<void()> fn) = 0;
   /// Hint that finished_queue has new continuations (reactor).
   virtual void note_finished_queued() = 0;
+
+  /// Phase 2 Option A: when true, reactor drains only Control + IOComplete
+  /// (Client/Maintenance stay queued). Classic ignores.
+  virtual void
+  set_boot_exclusive(bool exclusive)
+  {}
 
   /// Refresh cached runtime options used on enqueue/execute hot paths.
   virtual void

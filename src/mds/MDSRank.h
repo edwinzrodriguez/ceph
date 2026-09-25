@@ -654,6 +654,9 @@ class MDSRank {
     void stopping_start();
     void stopping_done();
 
+    /// Phase 2 Option A: gate Client/Maintenance drain during boot/replay.
+    void update_reactor_boot_policy();
+
     void validate_sessions();
 
     void handle_mds_recovery(mds_rank_t who);

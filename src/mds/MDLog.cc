@@ -1619,8 +1619,9 @@ void MDLog::_reformat_journal(JournalPointer const &jp_in, Journaler *old_journa
   }
 }
 
-
-// i am a separate thread
+// boot exclusivity: this thread takes mds_lock per event.
+// ReactorDispatchEngine holds Client/Maintenance drain while is_any_replay()
+// (etc.) so unlocked execute_item cannot race these lock acquisitions.
 void MDLog::_replay_thread()
 {
   dout(10) << __func__ << ": start time: " << replay_start_time << ", now: "

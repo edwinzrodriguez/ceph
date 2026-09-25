@@ -540,6 +540,42 @@ ReactorDispatchEngine::note_finished_queued()
 }
 
 void
+ReactorDispatchEngine::set_boot_exclusive(bool exclusive)
+{
+  const bool was = boot_exclusive.exchange(exclusive, std::memory_order_acq_rel);
+  if (was && !exclusive) {
+    // Leaving boot exclusivity: wake so queued Client/Maintenance can drain.
+    queue.wake();
+  }
+  dout(5) << __func__ << " exclusive=" << exclusive << " (was " << was << ")"
+          << dendl;
+}
+
+bool
+ReactorDispatchEngine::lane_drain_allowed(DispatchLane lane) const
+{
+  if (!boot_exclusive.load(std::memory_order_acquire)) {
+    return true;
+  }
+  // Boot/replay: Control (maps, tick, Phase-1 callbacks) and IOComplete
+  // (boot gathers / journal wrappers) only. Client and Maintenance stay
+  // queued until set_boot_exclusive(false).
+  return lane == DispatchLane::Control || lane == DispatchLane::IOComplete;
+}
+
+bool
+ReactorDispatchEngine::has_drainable_work() const
+{
+  for (size_t i = 0; i < static_cast<size_t>(DispatchLane::Count); ++i) {
+    const auto lane = static_cast<DispatchLane>(i);
+    if (lane_drain_allowed(lane) && queue.count(lane) > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void
 ReactorDispatchEngine::execute_io_completion(MDSIOContextBase* ioctx, int r)
 {
   ceph_assert(ctx.rank != nullptr);
@@ -661,12 +697,19 @@ ReactorDispatchEngine::op_thread_main()
       OpWorkItem* item = nullptr;
       size_t lanes_visited = 0;
       while (lanes_visited < static_cast<size_t>(DispatchLane::Count)) {
+        const auto lane = static_cast<DispatchLane>(lane_idx);
+        if (!lane_drain_allowed(lane)) {
+          // Boot exclusivity: leave Client/Maintenance queued.
+          advance_lane_slice(lane_idx, slice_deadline);
+          ++lanes_visited;
+          continue;
+        }
         if (ceph::fast_mono_clock::now() >= slice_deadline) {
           advance_lane_slice(lane_idx, slice_deadline);
           ++lanes_visited;
           continue;
         }
-        item = queue.dequeue_lane(static_cast<DispatchLane>(lane_idx));
+        item = queue.dequeue_lane(lane);
         if (item) {
           break;
         }
@@ -675,7 +718,7 @@ ReactorDispatchEngine::op_thread_main()
         ++lanes_visited;
       }
       if (!item) {
-        break; // all lanes empty
+        break; // all drainable lanes empty
       }
       execute_item(item);
       ++processed;
@@ -688,7 +731,7 @@ ReactorDispatchEngine::op_thread_main()
 
     std::unique_lock lock(queue.wait_lock());
     queue.wait_cond().wait_for(lock, std::chrono::milliseconds(10), [this] {
-      return stop.load() || queue.has_work_for_consumer();
+      return stop.load() || has_drainable_work();
     });
   }
 
