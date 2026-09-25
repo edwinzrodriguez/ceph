@@ -264,11 +264,17 @@ public:
   void tset(int idx, ceph::timespan v);
   void tinc(int idx, utime_t v);
   void tinc(int idx, ceph::timespan v);
+  /// Add @p sum across @p n samples to a time-average counter (one atomic update).
+  void tinc_n(int idx, ceph::timespan sum, uint64_t n);
   void tinc_with_max(int idx, utime_t v);
   void tinc_with_max(int idx, ceph::timespan v);
   utime_t tget(int idx) const;
 
   void hinc(int idx, int64_t x, int64_t y);
+  /// Add @p n to the histogram bucket for axis values (@p x, @p y).
+  void hinc(int idx, int64_t x, int64_t y, uint64_t n);
+  /// Add @p n to histogram bucket indices (@p bx, @p by).
+  void hinc_bucket(int idx, int64_t bx, int64_t by, uint64_t n);
 
   void reset();
   void dump_formatted(

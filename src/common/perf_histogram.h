@@ -52,12 +52,12 @@ public:
     {}
   };
 
+  /// Quantize given value and convert to bucket number on given axis
+  static int64_t get_bucket_for_axis(int64_t value, const axis_config_d& ac);
+
 protected:
   /// Dump configuration of one axis to a formatter
   static void dump_formatted_axis(ceph::Formatter *f, const axis_config_d &ac);
-
-  /// Quantize given value and convert to bucket number on given axis
-  static int64_t get_bucket_for_axis(int64_t value, const axis_config_d &ac);
 
   /// Calculate inclusive ranges of axis values for each bucket on that axis
   static std::vector<std::pair<int64_t, int64_t>> get_axis_bucket_ranges(
@@ -112,15 +112,31 @@ public:
   /// Increase counter for given axis values by one
   template <typename... T>
   void inc(T... axis) {
+    add(1, axis...);
+  }
+
+  /// Increase counter for given axis values by @p n
+  template <typename... T>
+  void
+  add(uint64_t n, T... axis)
+  {
     auto index = get_raw_index_for_value(axis...);
-    m_rawData[index]++;
+    m_rawData[index].fetch_add(n, std::memory_order_relaxed);
   }
 
   /// Increase counter for given axis buckets by one
   template <typename... T>
   void inc_bucket(T... bucket) {
+    add_bucket(1, bucket...);
+  }
+
+  /// Increase counter for given axis buckets by @p n
+  template <typename... T>
+  void
+  add_bucket(uint64_t n, T... bucket)
+  {
     auto index = get_raw_index_for_bucket(bucket...);
-    m_rawData[index]++;
+    m_rawData[index].fetch_add(n, std::memory_order_relaxed);
   }
 
   /// Read value from given bucket
