@@ -1135,6 +1135,10 @@ MDLog::_trim_expired_segments(
   // trim expired segments?
   uint64_t end = 0;
   bool deferred = false;
+  // Both segments and major_segments are ordered by seq.  Co-iterate so each
+  // major check is amortized O(1) instead of major_segments.find() per segment
+  // (hot under time-sliced trim that restarts from begin each tick).
+  auto msit = major_segments.begin();
   for (auto it = segments.begin(); it != segments.end(); ++it) {
     if (past_trim_deadline(deadline)) {
       dout(10) << __func__ << ": past deadline, deferring remaining expired "
@@ -1146,7 +1150,12 @@ MDLog::_trim_expired_segments(
     auto& [seq, ls] = *it;
     dout(20) << __func__ << ": examining " << *ls << dendl;
 
-    if (auto msit = major_segments.find(seq); msit != major_segments.end() && end > 0) {
+    while (msit != major_segments.end() && *msit < seq) {
+      ++msit;
+    }
+    // Batch-expire only once we have at least one expired predecessor
+    // (end > 0).  Matching major: msit points at seq.
+    if (end > 0 && msit != major_segments.end() && *msit == seq) {
       dout(10) << __func__ << ": expiring up to this major segment seq=" << seq << dendl;
       uint64_t expire_pos = 0;
       auto erase_it = segments.begin();
@@ -1173,6 +1182,7 @@ MDLog::_trim_expired_segments(
       if (erase_it != segments.begin()) {
         segments.erase(segments.begin(), erase_it);
         logger->set(l_mdl_seg, segments.size());
+        // erase [begin, msit) leaves msit valid at the current major.
         major_segments.erase(major_segments.begin(), msit);
         logger->set(l_mdl_segmjr, major_segments.size());
 
