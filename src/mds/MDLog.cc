@@ -957,7 +957,7 @@ MDLog::trim(std::chrono::milliseconds max_duration)
 
       if (expiring_segments.count(ls)) {
         dout(20) << "trim already expiring " << *ls << dendl;
-      } else if (expired_segments.count(ls)) {
+      } else if (ls->expired) {
         dout(20) << "trim already expired " << *ls << dendl;
       } else {
         ceph_assert(expiring_segments.count(ls) == 0);
@@ -1065,7 +1065,7 @@ int MDLog::trim_to(SegmentBoundary::seq_t seq)
 
     if (expiring_segments.count(ls)) {
       dout(5) << "trim already expiring " << *ls << dendl;
-    } else if (expired_segments.count(ls)) {
+    } else if (ls->expired) {
       dout(5) << "trim already expired " << *ls << dendl;
     } else {
       ceph_assert(expiring_segments.count(ls) == 0);
@@ -1161,7 +1161,7 @@ MDLog::_trim_expired_segments(
       auto erase_it = segments.begin();
       for (auto eit = segments.begin(); eit != it; ++eit) {
         auto& ls2 = eit->second;
-        if (!expired_segments.count(ls2)) {
+        if (!ls2->expired) {
           dout(10) << __func__ << ": stopping batch trim at non-expired "
                    << *ls2 << dendl;
           break;
@@ -1170,6 +1170,7 @@ MDLog::_trim_expired_segments(
         dout(20) << __func__ << ": expiring " << *ls2 << dendl;
         expired_events -= ls2->num_events;
         expired_segments.erase(ls2);
+        ls2->expired = false;
         if (pre_segments_size > 0)
           pre_segments_size--;
         num_events -= ls2->num_events;
@@ -1196,7 +1197,7 @@ MDLog::_trim_expired_segments(
       }
     }
 
-    if (!expired_segments.count(ls)) {
+    if (!ls->expired) {
       dout(10) << __func__ << " waiting for expiry " << *ls << dendl;
       break;
     }
@@ -1222,6 +1223,8 @@ void MDLog::_expired(LogSegmentRef const& ls)
     dout(5) << "_expired not expiring current segment, and !mds_is_shutting_down" << dendl;
   } else {
     // expired.
+    ceph_assert(!ls->expired);
+    ls->expired = true;
     expired_segments.insert(ls);
     expired_events += ls->num_events;
 
