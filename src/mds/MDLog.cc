@@ -1122,7 +1122,7 @@ int MDLog::trim_to(SegmentBoundary::seq_t seq)
 
 void MDLog::try_expire(LogSegmentRef const& ls, int op_prio)
 {
-  ceph_assert(ceph_mutex_is_locked(mds->mds_lock));
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
   MDSGatherBuilder gather_bld(g_ceph_context);
   ls->try_to_expire(mds, gather_bld, op_prio);
 
@@ -1220,7 +1220,18 @@ MDLog::_trim_expired_segments(
                    << *ls2 << dendl;
           break;
         }
-        ls2->assert_elists_empty("_trim_expired_segments");
+        // A segment can be re-dirtied after try_expire (e.g. an MDRequest
+        // still holding this LogSegmentRef calls mark_dirty).  Do not erase
+        // it — un-expire so a later trim tick can try_expire again.
+        if (!ls2->check_elists_empty("_trim_expired_segments")) {
+          dout(0) << __func__ << ": un-expiring re-dirtied " << *ls2 << dendl;
+          expired_events -= ls2->num_events;
+          expired_segments.erase(ls2);
+          ls2->expired = false;
+          logger->set(l_mdl_evexd, expired_events);
+          logger->set(l_mdl_segexd, expired_segments.size());
+          break;
+        }
         dout(20) << __func__ << ": expiring " << *ls2 << dendl;
         expired_events -= ls2->num_events;
         expired_segments.erase(ls2);

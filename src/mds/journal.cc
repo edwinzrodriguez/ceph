@@ -367,11 +367,11 @@ void LogSegment::try_to_expire(MDSRank *mds, MDSGatherBuilder &gather_bld, int o
   }
 }
 
-void
-LogSegment::assert_elists_empty(const char* where)
+bool
+LogSegment::check_elists_empty(const char* where)
 {
   if (!has_dirty_elists()) {
-    return;
+    return true;
   }
 
   generic_derr << where << ": " << *this << " has dirty elists" << dendl;
@@ -403,7 +403,13 @@ LogSegment::assert_elists_empty(const char* where)
        ++p) {
     generic_derr << "  dirty_dirfrag_dirfragtree " << **p << dendl;
   }
-  ceph_assert(!has_dirty_elists());
+  return false;
+}
+
+void
+LogSegment::assert_elists_empty(const char* where)
+{
+  ceph_assert(check_elists_empty(where));
 }
 
 void LogSegment::purge_inodes_finish(interval_set<inodeno_t>& inos){
