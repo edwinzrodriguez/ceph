@@ -26,6 +26,12 @@
  * mds_reactor_slice_backlog_target.
  * TrimQuantum/LogTrim are single-flight and cooperatively time-sliced.
  *
+ * Client enqueue backpressure: when Client lane depth reaches
+ * mds_reactor_client_enqueue_high, producers stall in enqueue_item until the
+ * op thread drains to mds_reactor_client_enqueue_low (messenger/TCP
+ * backpressure, analogous to classic inline dispatch). Control and IOComplete
+ * are never stalled. Disabled when high is 0; skipped during boot exclusivity.
+ *
  * Rank exclusivity: after boot, execute_item does not take mds_lock; the
  * registered op thread owns exclusivity (MDS_ASSERT_RANK_EXCLUSIVE /
  * ReactorOwnerToken). Classic mode, SafeTimer, and lifecycle paths still use
@@ -48,6 +54,8 @@
 #include <set>
 #include <string>
 #include <thread>
+
+#include "common/ceph_mutex.h"
 
 #include "MDSDispatchContext.h"
 #include "MDSDispatchEngine.h"
@@ -109,6 +117,9 @@ private:
       ceph::fast_mono_time exec_start);
   void note_enqueued();
   void maybe_abort_on_queue_depth(size_t depth);
+  void maybe_throttle_client_enqueue();
+  void maybe_notify_client_enqueue_throttle();
+  uint64_t client_enqueue_low_watermark(uint64_t high) const;
   void publish_queue_depth_metrics();
   void flush_logger_metrics();
   void finish_trim_quantum(bool more);
@@ -133,6 +144,8 @@ private:
   std::atomic<bool> queue_len_abort_armed{false};
   /// Cached conf (avoid string-keyed get_val on enqueue/execute).
   std::atomic<uint64_t> queue_len_abort_limit{0};
+  std::atomic<uint64_t> client_enqueue_high{0};
+  std::atomic<uint64_t> client_enqueue_low{0};
   std::atomic<int64_t> cache_trim_max_duration_ms{0};
   std::atomic<int64_t> log_trim_max_duration_ms{0};
   std::array<std::atomic<int64_t>, static_cast<size_t>(DispatchLane::Count)>
@@ -144,6 +157,13 @@ private:
   /// At most one TrimQuantum / LogTrim outstanding (queued or running).
   std::atomic<bool> trim_quantum_queued{false};
   std::atomic<bool> log_trim_queued{false};
+
+  /// Client enqueue backpressure (producers wait; op thread notifies).
+  ceph::mutex client_enqueue_throttle_lock{
+      ceph::make_mutex("ReactorDispatchEngine::client_enqueue_throttle")};
+  ceph::condition_variable client_enqueue_throttle_cond;
+  std::atomic<uint64_t> client_enqueue_throttle_waiters{0};
+  std::atomic<uint64_t> client_enqueue_throttle_waits{0};
 
   /// Written only by the op thread.
   std::array<ExecWindow, static_cast<size_t>(DispatchLane::Count)> exec_windows{};

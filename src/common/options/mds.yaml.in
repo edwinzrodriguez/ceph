@@ -99,10 +99,51 @@ options:
     level) and aborts as soon as ``MDSOpWorkQueue`` depth reaches the limit.
     Use together with a large ``log_max_recent`` and ``debug_mds=N/M``
     (``N`` low, ``M`` high) so the abort captures recent detail without writing
-    a full high-verbosity log to disk. ``0`` disables (default).
+    a full high-verbosity log to disk. ``0`` disables (default). Keep this
+    above ``mds_reactor_client_enqueue_high`` when both are set so enqueue
+    backpressure engages before the abort fuse.
   default: 0
   services:
   - mds
+  see_also:
+  - mds_reactor_client_enqueue_high
+  - mds_reactor_client_enqueue_low
+  flags:
+  - runtime
+- name: mds_reactor_client_enqueue_high
+  type: uint
+  level: advanced
+  desc: Stall Client-lane reactor enqueues when Client depth reaches this value
+  long_desc: When ``mds_dispatch_engine=reactor`` and this value is non-zero,
+    producers (typically ``ms_dispatch``) that enqueue onto the Client lane
+    block once Client lane depth reaches this high watermark, until the op
+    thread drains depth to ``mds_reactor_client_enqueue_low``. That restores
+    classic-like messenger backpressure under CLIENT_CAPS floods instead of
+    letting the reactor queue grow without bound. Control and IOComplete
+    enqueues are never stalled. Throttling is skipped while boot exclusivity
+    holds Client drained. ``0`` disables.
+  default: 250000
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_client_enqueue_low
+  - mds_reactor_queue_len_abort
+  flags:
+  - runtime
+- name: mds_reactor_client_enqueue_low
+  type: uint
+  level: advanced
+  desc: Resume Client-lane reactor enqueues once Client depth falls to this value
+  long_desc: Low watermark for ``mds_reactor_client_enqueue_high`` hysteresis.
+    Waiters unblock when Client lane depth is at or below this value. If set
+    to ``0`` while high is non-zero, low defaults to half of high. If low is
+    greater than or equal to high, low is clamped to high/2.
+  default: 125000
+  services:
+  - mds
+  see_also:
+  - mds_reactor_client_enqueue_high
   flags:
   - runtime
 - name: mds_reactor_lane_slice_control
