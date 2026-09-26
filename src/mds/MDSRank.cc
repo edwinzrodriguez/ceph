@@ -4006,6 +4006,16 @@ void MDSRank::create_logger()
           "dispatch_slice_maintenance_effective_ms",
           "Effective Maintenance lane slice after backlog adaptation (ms)",
           "dsme", PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_client_enqueue_throttle_waiters,
+          "dispatch_client_enqueue_throttle_waiters",
+          "Threads blocked on Client-lane enqueue backpressure", "cetw",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64_counter(
+          l_mds_reactor_client_enqueue_throttle_waits,
+          "dispatch_client_enqueue_throttle_waits",
+          "Client-lane enqueue backpressure wait entries", "cets",
+          PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_u64_counter(
           l_mds_dispatch_io_completions, "dispatch_io_completions",
           "IO completions executed on reactor op thread", "dioc",
@@ -4534,6 +4544,8 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
        "mds_op_history_duration",
        "mds_op_history_size",
        "mds_op_log_threshold",
+       "mds_reactor_client_enqueue_high",
+       "mds_reactor_client_enqueue_low",
        "mds_reactor_lane_slice_client",
        "mds_reactor_lane_slice_client_max",
        "mds_reactor_lane_slice_control",
