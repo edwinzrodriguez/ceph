@@ -594,6 +594,51 @@ def _lane_stats(lane_q, opts):
     }
 
 
+def _frame_is_reactor_method(fn):
+    """True only for ReactorDispatchEngine member frames.
+
+    Substring match is unsafe: idle op threads sit in
+    ``wait_for<...ReactorDispatchEngine::op_thread_main()::<lambda()> >``,
+    whose demangled name contains ``ReactorDispatchEngine::`` but whose
+    ``this`` is the condition_variable (offset into the engine). Using that
+    pointer yields garbage queue_len / slice fields and MemoryError on walk.
+    """
+    if not fn:
+        return False
+    # Drop any leading ABI / namespace junk; require the *function* to be a
+    # ReactorDispatchEngine method, not a template argument mentioning one.
+    # Examples that must match:
+    #   ReactorDispatchEngine::op_thread_main
+    #   ReactorDispatchEngine::execute_item
+    # Examples that must not:
+    #   ...::wait_for<..., ReactorDispatchEngine::op_thread_main()::<lambda()> >
+    if fn.startswith("ReactorDispatchEngine::"):
+        return True
+    # Some GDBs prepend namespaces / return types; take the last
+    # ``ReactorDispatchEngine::method`` occurrence only at a call-operator
+    # boundary (not inside ``<...>`` template args).
+    marker = "ReactorDispatchEngine::"
+    idx = fn.find(marker)
+    if idx < 0:
+        return False
+    # If a '<' appears before this marker, we are inside template args.
+    if "<" in fn[:idx]:
+        return False
+    return True
+
+
+def _engine_this_from_frame(frame):
+    """Read and validate ReactorDispatchEngine* ``this`` from a method frame."""
+    try:
+        this = frame.read_var("this")
+        engine = this.cast(gdb.lookup_type("ReactorDispatchEngine").pointer())
+        # Sanity: must have a usable queue member (rejects condvar ``this``).
+        _ = engine["queue"]
+        return engine
+    except (gdb.error, ValueError, TypeError, KeyError):
+        return None
+
+
 def _find_engine_from_selected_frame():
     """If the selected frame is inside ReactorDispatchEngine, use its `this`."""
     try:
@@ -605,14 +650,10 @@ def _find_engine_from_selected_frame():
             fn = frame.name() or ""
         except gdb.error:
             fn = ""
-        if "ReactorDispatchEngine::" in fn:
-            try:
-                this = frame.read_var("this")
-                return this.cast(
-                    gdb.lookup_type("ReactorDispatchEngine").pointer()
-                )
-            except (gdb.error, ValueError):
-                pass
+        if _frame_is_reactor_method(fn):
+            engine = _engine_this_from_frame(frame)
+            if engine is not None:
+                return engine
         try:
             frame = frame.older()
         except gdb.error:
@@ -649,14 +690,10 @@ def _find_engine_from_op_thread():
                     fn = frame.name() or ""
                 except gdb.error:
                     fn = ""
-                if "ReactorDispatchEngine::" in fn:
-                    try:
-                        this = frame.read_var("this")
-                        return this.cast(
-                            gdb.lookup_type("ReactorDispatchEngine").pointer()
-                        )
-                    except (gdb.error, ValueError):
-                        pass
+                if _frame_is_reactor_method(fn):
+                    engine = _engine_this_from_frame(frame)
+                    if engine is not None:
+                        return engine
                 try:
                     frame = frame.older()
                 except gdb.error:
