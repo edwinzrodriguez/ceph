@@ -4,7 +4,10 @@
 #pragma once
 
 #include <utility>
+
 #include "common/containers.h"
+
+#include "acconfig.h"
 
 // What and why
 // ============
@@ -13,6 +16,11 @@
 // The key requirement is that you make use of the ceph::make_mutex()
 // and make_recursive_mutex() factory methods, which take a string
 // naming the mutex for the purposes of the lockdep debug variant.
+//
+// For adaptive spinning on Linux, use ceph::make_adaptive_mutex() /
+// ceph::adaptive_mutex (and the matching adaptive_condition_variable).
+// Build with -DWITH_CEPH_ADAPTIVE_MUTEX=ON to make ceph::mutex alias
+// the adaptive type for whole-tree performance experiments.
 
 #ifdef WITH_CRIMSON
 #include <seastar/core/condition-variable.hh>
@@ -65,8 +73,10 @@ namespace ceph {
 
   using mutex = dummy_mutex;
   using recursive_mutex = dummy_mutex;
+  using adaptive_mutex = dummy_mutex;
   using shared_mutex = dummy_shared_mutex;
   using condition_variable = green_condition_variable;
+  using adaptive_condition_variable = green_condition_variable;
 
   template <typename ...Args>
   dummy_mutex make_mutex(Args&& ...args) {
@@ -75,6 +85,13 @@ namespace ceph {
 
   template <typename ...Args>
   recursive_mutex make_recursive_mutex(Args&& ...args) {
+    return {};
+  }
+
+  template <typename... Args>
+  adaptive_mutex
+  make_adaptive_mutex(Args&&... args)
+  {
     return {};
   }
 
@@ -107,20 +124,38 @@ namespace ceph {
 #include "common/shared_mutex_debug.h"
 
 namespace ceph {
-  typedef ceph::mutex_debug mutex;
-  typedef ceph::mutex_recursive_debug recursive_mutex;
-  typedef ceph::condition_variable_debug condition_variable;
-  typedef ceph::shared_mutex_debug shared_mutex;
+typedef ceph::mutex_recursive_debug recursive_mutex;
+typedef ceph::mutex_adaptive_debug adaptive_mutex;
+typedef ceph::condition_variable_adaptive_debug adaptive_condition_variable;
+typedef ceph::shared_mutex_debug shared_mutex;
 
-  // pass arguments to mutex_debug ctor
-  template <typename ...Args>
-  mutex make_mutex(Args&& ...args) {
-    return {std::forward<Args>(args)...};
-  }
+#if defined(WITH_CEPH_ADAPTIVE_MUTEX) && defined(HAVE_PTHREAD_MUTEX_ADAPTIVE_NP)
+typedef ceph::mutex_adaptive_debug mutex;
+typedef ceph::condition_variable_adaptive_debug condition_variable;
+#else
+typedef ceph::mutex_debug mutex;
+typedef ceph::condition_variable_debug condition_variable;
+#endif
+
+// pass arguments to mutex ctor
+template <typename... Args>
+mutex
+make_mutex(Args&&... args)
+{
+  return {std::forward<Args>(args)...};
+}
 
   // pass arguments to recursive_mutex_debug ctor
   template <typename ...Args>
   recursive_mutex make_recursive_mutex(Args&& ...args) {
+    return {std::forward<Args>(args)...};
+  }
+
+  // pass arguments to adaptive_mutex ctor
+  template <typename... Args>
+  adaptive_mutex
+  make_adaptive_mutex(Args&&... args)
+  {
     return {std::forward<Args>(args)...};
   }
 
@@ -131,13 +166,13 @@ namespace ceph {
   }
 
   // debug methods
-  #define ceph_mutex_is_locked(m) ((m).is_locked())
-  #define ceph_mutex_is_not_locked(m) (!(m).is_locked())
-  #define ceph_mutex_is_rlocked(m) ((m).is_rlocked())
-  #define ceph_mutex_is_wlocked(m) ((m).is_wlocked())
-  #define ceph_mutex_is_locked_by_me(m) ((m).is_locked_by_me())
-  #define ceph_mutex_is_not_locked_by_me(m) (!(m).is_locked_by_me())
-}
+#define ceph_mutex_is_locked(m) ((m).is_locked())
+#define ceph_mutex_is_not_locked(m) (!(m).is_locked())
+#define ceph_mutex_is_rlocked(m) ((m).is_rlocked())
+#define ceph_mutex_is_wlocked(m) ((m).is_wlocked())
+#define ceph_mutex_is_locked_by_me(m) ((m).is_locked_by_me())
+#define ceph_mutex_is_not_locked_by_me(m) (!(m).is_locked_by_me())
+  } // namespace ceph
 
 #else
 
@@ -147,6 +182,8 @@ namespace ceph {
 
 #include <condition_variable>
 #include <mutex>
+
+#include "common/adaptive_mutex.h"
 
 // The winpthreads shared mutex implementation is broken.
 // We'll use boost::shared_mutex instead.
@@ -159,9 +196,15 @@ namespace ceph {
 
 namespace ceph {
 
-  typedef std::mutex mutex;
   typedef std::recursive_mutex recursive_mutex;
+
+#if defined(WITH_CEPH_ADAPTIVE_MUTEX) && defined(HAVE_PTHREAD_MUTEX_ADAPTIVE_NP)
+  typedef ceph::adaptive_mutex mutex;
+  typedef ceph::adaptive_condition_variable condition_variable;
+#else
+  typedef std::mutex mutex;
   typedef std::condition_variable condition_variable;
+#endif
 
 #if defined(__MINGW32__) && !defined(__clang__)
   typedef boost::shared_mutex shared_mutex;
@@ -178,8 +221,18 @@ namespace ceph {
   recursive_mutex make_recursive_mutex(Args&& ...args) {
     return {};
   }
-  template <typename ...Args>
-  shared_mutex make_shared_mutex(Args&& ...args) {
+
+  template <typename... Args>
+  adaptive_mutex
+  make_adaptive_mutex(Args&&... args)
+  {
+    return {};
+  }
+
+  template <typename... Args>
+  shared_mutex
+  make_shared_mutex(Args&&... args)
+  {
     return {};
   }
 
@@ -215,4 +268,3 @@ ceph::containers::tiny_vector<LockT> make_lock_container(
   };
 }
 } // namespace ceph
-

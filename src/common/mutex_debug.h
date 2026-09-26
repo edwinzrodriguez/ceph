@@ -16,15 +16,16 @@
 #ifndef CEPH_COMMON_MUTEX_DEBUG_H
 #define CEPH_COMMON_MUTEX_DEBUG_H
 
+#include <pthread.h>
+
 #include <atomic>
 #include <system_error>
 #include <thread>
 
-#include <pthread.h>
-
 #include "include/ceph_assert.h"
 #include "include/common_fwd.h"
 
+#include "acconfig.h"
 #include "ceph_time.h"
 #include "likely.h"
 #include "lockdep.h"
@@ -71,10 +72,13 @@ public:
 };
 
 // Since this is a /debugging/ mutex just define it in terms of the
-// pthread error check mutex.
-template<bool Recursive>
-class mutex_debug_impl : public mutex_debugging_base
-{
+// pthread error check mutex (or adaptive / recursive when selected).
+template <bool Recursive, bool Adaptive = false>
+class mutex_debug_impl : public mutex_debugging_base {
+  static_assert(
+      !(Recursive && Adaptive),
+      "recursive and adaptive mutexes are mutually exclusive");
+
 private:
   pthread_mutex_t m;
 
@@ -82,13 +86,23 @@ private:
     pthread_mutexattr_t a;
     pthread_mutexattr_init(&a);
     int r;
-    if (recursive)
+    if constexpr (Recursive) {
       r = pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
-    else
+    } else if constexpr (Adaptive) {
+#ifdef HAVE_PTHREAD_MUTEX_ADAPTIVE_NP
+      r = pthread_mutexattr_settype(&a, PTHREAD_MUTEX_ADAPTIVE_NP);
+#else
+      static_assert(
+          !Adaptive, "adaptive mutex requires PTHREAD_MUTEX_ADAPTIVE_NP");
+      r = -1;
+#endif
+    } else {
       r = pthread_mutexattr_settype(&a, PTHREAD_MUTEX_ERRORCHECK);
+    }
     ceph_assert(r == 0);
     r = pthread_mutex_init(&m, &a);
     ceph_assert(r == 0);
+    pthread_mutexattr_destroy(&a);
   }
 
   bool enable_lockdep(bool no_lockdep) const {
@@ -103,6 +117,7 @@ private:
 
 public:
   static constexpr bool recursive = Recursive;
+  static constexpr bool adaptive = Adaptive;
 
   mutex_debug_impl(std::string group, bool ld = true, bool bt = false)
     : mutex_debugging_base(group, ld, bt) {
@@ -215,8 +230,14 @@ private:
 
 
 } // namespace mutex_debug_detail
-typedef mutex_debug_detail::mutex_debug_impl<false> mutex_debug;
-typedef mutex_debug_detail::mutex_debug_impl<true> mutex_recursive_debug;
+
+typedef mutex_debug_detail::mutex_debug_impl<false, false> mutex_debug;
+typedef mutex_debug_detail::mutex_debug_impl<true, false> mutex_recursive_debug;
+#ifdef HAVE_PTHREAD_MUTEX_ADAPTIVE_NP
+typedef mutex_debug_detail::mutex_debug_impl<false, true> mutex_adaptive_debug;
+#else
+typedef mutex_debug mutex_adaptive_debug;
+#endif
 } // namespace ceph
 
 #endif
