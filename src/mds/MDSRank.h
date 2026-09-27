@@ -140,6 +140,7 @@ enum {
   l_mds_reactor_client_avg_exec_us,
   l_mds_reactor_client_backlog_us,
   l_mds_reactor_slice_client_effective_ms,
+  l_mds_reactor_slice_io_effective_ms,
   l_mds_reactor_slice_maintenance_effective_ms,
   l_mds_reactor_client_enqueue_throttle_waiters,
   l_mds_reactor_client_enqueue_throttle_waits,

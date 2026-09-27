@@ -4002,6 +4002,10 @@ void MDSRank::create_logger()
           "Effective Client lane slice after backlog adaptation (ms)", "dsce",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_u64(
+          l_mds_reactor_slice_io_effective_ms, "dispatch_slice_io_effective_ms",
+          "Effective IOComplete lane slice after backlog adaptation (ms)",
+          "dsie", PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
           l_mds_reactor_slice_maintenance_effective_ms,
           "dispatch_slice_maintenance_effective_ms",
           "Effective Maintenance lane slice after backlog adaptation (ms)",
@@ -4548,9 +4552,13 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
        "mds_reactor_client_enqueue_low",
        "mds_reactor_lane_slice_client",
        "mds_reactor_lane_slice_client_max",
+       "mds_reactor_lane_slice_client_min",
        "mds_reactor_lane_slice_control",
        "mds_reactor_lane_slice_io",
+       "mds_reactor_lane_slice_io_max",
+       "mds_reactor_lane_slice_io_min",
        "mds_reactor_lane_slice_maintenance",
+       "mds_reactor_lane_slice_maintenance_max",
        "mds_reactor_lane_slice_maintenance_min",
        "mds_reactor_queue_len_abort",
        "mds_reactor_slice_backlog_target",

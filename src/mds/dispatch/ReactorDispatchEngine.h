@@ -21,9 +21,11 @@
  * Lane order (high -> low): Control, IOComplete, Maintenance, Client.
  * Each scheduling round visits lanes in that order and runs each lane until
  * empty or its wall-clock budget expires. Base budgets come from
- * mds_reactor_lane_slice_*; Client/Maintenance may adapt from estimated Client
- * backlog (depth * rolling avg execute time) once backlog exceeds
- * mds_reactor_slice_backlog_target.
+ * mds_reactor_lane_slice_*. Among IOComplete/Maintenance/Client, the lane
+ * with the highest estimated backlog (depth * rolling avg execute time) is
+ * boosted toward its *_max once backlog exceeds
+ * mds_reactor_slice_backlog_target; the other adaptable lanes are cut toward
+ * their *_min so each still gets time. Control keeps its base slice.
  * TrimQuantum/LogTrim are single-flight and cooperatively time-sliced.
  *
  * Client enqueue backpressure: when Client lane depth reaches
@@ -54,6 +56,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "common/ceph_mutex.h"
 
@@ -130,7 +133,12 @@ private:
   uint64_t avg_exec_us(DispatchLane lane) const;
   uint64_t estimated_backlog_us(DispatchLane lane) const;
   uint64_t client_backlog_us() const;
-  double client_adapt_t() const;
+  double backlog_adapt_t(uint64_t backlog_us) const;
+  /// Dominant adaptable lane (IO/Maint/Client) and its backlog; for metrics.
+  std::pair<DispatchLane, uint64_t> dominant_adaptable_backlog() const;
+  int64_t lane_slice_max_ms(DispatchLane lane) const;
+  int64_t lane_slice_min_ms(DispatchLane lane) const;
+  static int64_t lerp_slice_ms(int64_t base, int64_t bound, double t);
   bool lane_drain_allowed(DispatchLane lane) const;
   bool has_drainable_work() const;
 
@@ -152,6 +160,10 @@ private:
       lane_slice_ms_cached{};
   std::atomic<uint64_t> slice_backlog_target_us{500'000};
   std::atomic<int64_t> client_slice_max_ms{20};
+  std::atomic<int64_t> client_slice_min_ms{1};
+  std::atomic<int64_t> io_slice_max_ms{20};
+  std::atomic<int64_t> io_slice_min_ms{2};
+  std::atomic<int64_t> maintenance_slice_max_ms{5};
   std::atomic<int64_t> maintenance_slice_min_ms{1};
   std::atomic<uint32_t> exec_window_n{256};
   /// At most one TrimQuantum / LogTrim outstanding (queued or running).

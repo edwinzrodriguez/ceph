@@ -159,6 +159,28 @@ ReactorDispatchEngine::refresh_cached_conf()
               "mds_reactor_lane_slice_client_max")
           .count(),
       std::memory_order_relaxed);
+  client_slice_min_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>(
+              "mds_reactor_lane_slice_client_min")
+          .count(),
+      std::memory_order_relaxed);
+  io_slice_max_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_reactor_lane_slice_io_max")
+          .count(),
+      std::memory_order_relaxed);
+  io_slice_min_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_reactor_lane_slice_io_min")
+          .count(),
+      std::memory_order_relaxed);
+  maintenance_slice_max_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>(
+              "mds_reactor_lane_slice_maintenance_max")
+          .count(),
+      std::memory_order_relaxed);
   maintenance_slice_min_ms.store(
       g_conf()
           .get_val<std::chrono::milliseconds>(
@@ -187,6 +209,10 @@ ReactorDispatchEngine::handle_conf_change(const std::set<std::string>& changed)
       changed.count("mds_reactor_slice_exec_window") ||
       changed.count("mds_reactor_slice_backlog_target") ||
       changed.count("mds_reactor_lane_slice_client_max") ||
+      changed.count("mds_reactor_lane_slice_client_min") ||
+      changed.count("mds_reactor_lane_slice_io_max") ||
+      changed.count("mds_reactor_lane_slice_io_min") ||
+      changed.count("mds_reactor_lane_slice_maintenance_max") ||
       changed.count("mds_reactor_lane_slice_maintenance_min")) {
     refresh_cached_conf();
   }
@@ -218,21 +244,87 @@ ReactorDispatchEngine::client_backlog_us() const
 }
 
 double
-ReactorDispatchEngine::client_adapt_t() const
+ReactorDispatchEngine::backlog_adapt_t(uint64_t backlog_us) const
 {
   const uint64_t target =
       slice_backlog_target_us.load(std::memory_order_relaxed);
   if (target == 0) {
     return 0.0;
   }
-  const uint64_t backlog = client_backlog_us();
   constexpr double max_ratio = 4.0;
-  const double ratio = static_cast<double>(backlog) /
+  const double ratio = static_cast<double>(backlog_us) /
                        static_cast<double>(target);
   if (ratio < 1.0) {
     return 0.0;
   }
   return std::min(1.0, (std::min(ratio, max_ratio) - 1.0) / (max_ratio - 1.0));
+}
+
+std::pair<DispatchLane, uint64_t>
+ReactorDispatchEngine::dominant_adaptable_backlog() const
+{
+  // Control is not adapted. Pick the busiest among the other three.
+  static constexpr DispatchLane k_adaptable[] = {
+      DispatchLane::IOComplete,
+      DispatchLane::Maintenance,
+      DispatchLane::Client,
+  };
+  DispatchLane dominant = DispatchLane::Client;
+  uint64_t max_bl = 0;
+  for (const auto lane : k_adaptable) {
+    const uint64_t bl = estimated_backlog_us(lane);
+    if (bl > max_bl) {
+      max_bl = bl;
+      dominant = lane;
+    }
+  }
+  return {dominant, max_bl};
+}
+
+int64_t
+ReactorDispatchEngine::lane_slice_max_ms(DispatchLane lane) const
+{
+  switch (lane) {
+  case DispatchLane::IOComplete:
+    return io_slice_max_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Maintenance:
+    return maintenance_slice_max_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Client:
+    return client_slice_max_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Control:
+  case DispatchLane::Count:
+    break;
+  }
+  return 0;
+}
+
+int64_t
+ReactorDispatchEngine::lane_slice_min_ms(DispatchLane lane) const
+{
+  switch (lane) {
+  case DispatchLane::IOComplete:
+    return io_slice_min_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Maintenance:
+    return maintenance_slice_min_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Client:
+    return client_slice_min_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Control:
+  case DispatchLane::Count:
+    break;
+  }
+  return 0;
+}
+
+int64_t
+ReactorDispatchEngine::lerp_slice_ms(int64_t base, int64_t bound, double t)
+{
+  if (t <= 0.0) {
+    return base;
+  }
+  if (t >= 1.0) {
+    return bound;
+  }
+  return base + static_cast<int64_t>((bound - base) * t);
 }
 
 int64_t
@@ -244,32 +336,35 @@ ReactorDispatchEngine::lane_slice_ms(DispatchLane lane) const
   if (base <= 0) {
     return base;
   }
-  if (lane != DispatchLane::Client && lane != DispatchLane::Maintenance) {
+  // Control keeps a stable slice so maps/session traffic still get a turn.
+  if (lane == DispatchLane::Control) {
     return base;
   }
 
-  const double t = client_adapt_t();
+  const auto [dominant, dom_backlog] = dominant_adaptable_backlog();
+  const double t = backlog_adapt_t(dom_backlog);
   if (t <= 0.0) {
     return base;
   }
 
-  if (lane == DispatchLane::Client) {
-    int64_t max_ms = client_slice_max_ms.load(std::memory_order_relaxed);
+  if (lane == dominant) {
+    int64_t max_ms = lane_slice_max_ms(lane);
     if (max_ms < base) {
       max_ms = base;
     }
-    return base + static_cast<int64_t>((max_ms - base) * t);
+    return lerp_slice_ms(base, max_ms, t);
   }
 
-  // Maintenance: cut toward floor under Client backlog pressure.
-  int64_t min_ms = maintenance_slice_min_ms.load(std::memory_order_relaxed);
+  // Non-dominant adaptable lane: cut toward floor so the busy lane gets more
+  // relative time without starving anyone completely.
+  int64_t min_ms = lane_slice_min_ms(lane);
   if (min_ms < 0) {
     min_ms = 0;
   }
   if (min_ms > base) {
     min_ms = base;
   }
-  return base - static_cast<int64_t>((base - min_ms) * t);
+  return lerp_slice_ms(base, min_ms, t);
 }
 
 void
@@ -417,6 +512,9 @@ ReactorDispatchEngine::publish_queue_depth_metrics()
   logger->set(
       l_mds_reactor_slice_client_effective_ms,
       lane_slice_ms(DispatchLane::Client));
+  logger->set(
+      l_mds_reactor_slice_io_effective_ms,
+      lane_slice_ms(DispatchLane::IOComplete));
   logger->set(
       l_mds_reactor_slice_maintenance_effective_ms,
       lane_slice_ms(DispatchLane::Maintenance));
