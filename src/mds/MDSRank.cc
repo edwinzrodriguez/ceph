@@ -4060,6 +4060,16 @@ void MDSRank::create_logger()
           "dispatch_client_enqueue_throttle_waits",
           "Client-lane enqueue backpressure wait entries", "cets",
           PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_io_enqueue_throttle_waiters,
+          "dispatch_io_enqueue_throttle_waiters",
+          "Threads blocked on IOComplete-lane enqueue backpressure", "ietw",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64_counter(
+          l_mds_reactor_io_enqueue_throttle_waits,
+          "dispatch_io_enqueue_throttle_waits",
+          "IOComplete-lane enqueue backpressure wait entries", "iets",
+          PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_u64_counter(
           l_mds_dispatch_io_completions, "dispatch_io_completions",
           "IO completions executed on reactor op thread", "dioc",

@@ -153,6 +153,8 @@ enum {
   l_mds_reactor_slice_maintenance_effective_ms,
   l_mds_reactor_client_enqueue_throttle_waiters,
   l_mds_reactor_client_enqueue_throttle_waits,
+  l_mds_reactor_io_enqueue_throttle_waiters,
+  l_mds_reactor_io_enqueue_throttle_waits,
   l_mds_dispatch_enqueue_latency_control,
   l_mds_dispatch_enqueue_latency_io,
   l_mds_dispatch_enqueue_latency_client,
