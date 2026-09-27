@@ -28,11 +28,12 @@
  * their *_min so each still gets time. Control keeps its base slice.
  * TrimQuantum/LogTrim are single-flight and cooperatively time-sliced.
  *
- * Client enqueue backpressure: when Client lane depth reaches
- * mds_reactor_client_enqueue_high, producers stall in enqueue_item until the
- * op thread drains to mds_reactor_client_enqueue_low (messenger/TCP
- * backpressure, analogous to classic inline dispatch). Control and IOComplete
- * are never stalled. Disabled when high is 0; skipped during boot exclusivity.
+ * Client/IOComplete enqueue backpressure: when lane depth reaches the
+ * configured high watermark, producers stall in enqueue_item until the op
+ * thread drains to the low watermark. While any producer is waiting for that
+ * drain, new producers join the wait (they must not refill the mid band
+ * between low and high). Control is never stalled. Disabled when high is 0;
+ * Client throttle is skipped during boot exclusivity.
  *
  * Rank exclusivity: after boot, execute_item does not take mds_lock; the
  * registered op thread owns exclusivity (MDS_ASSERT_RANK_EXCLUSIVE /

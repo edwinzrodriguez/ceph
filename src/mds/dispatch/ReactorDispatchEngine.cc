@@ -478,7 +478,10 @@ ReactorDispatchEngine::maybe_throttle_client_enqueue()
   if (high == 0) {
     return;
   }
-  if (queue.count(DispatchLane::Client) < high) {
+  // Fast path only when below high and no cohort is draining to low.
+  // Otherwise new producers refill the (low, high) band and defeat hysteresis.
+  if (queue.count(DispatchLane::Client) < high &&
+      client_enqueue_throttle_waiters.load(std::memory_order_relaxed) == 0) {
     return;
   }
 
@@ -489,7 +492,9 @@ ReactorDispatchEngine::maybe_throttle_client_enqueue()
          !(ctx.daemon && ctx.daemon->stopping) &&
          (high = client_enqueue_high.load(std::memory_order_relaxed)) != 0 &&
          queue.count(DispatchLane::Client) >
-             (low = client_enqueue_low_watermark(high))) {
+             (low = client_enqueue_low_watermark(high)) &&
+         (queue.count(DispatchLane::Client) >= high || counted_wait ||
+          client_enqueue_throttle_waiters.load(std::memory_order_relaxed) > 0)) {
     if (!counted_wait) {
       client_enqueue_throttle_waits.fetch_add(1, std::memory_order_relaxed);
       counted_wait = true;
@@ -555,7 +560,11 @@ ReactorDispatchEngine::maybe_throttle_io_enqueue()
   if (high == 0) {
     return;
   }
-  if (queue.count(DispatchLane::IOComplete) < high) {
+  // Fast path only when below high and no cohort is draining to low.
+  // Otherwise Objecter/io-pool threads refill the (low, high) band while the
+  // original waiters hold, and IOComplete depth races past the abort fuse.
+  if (queue.count(DispatchLane::IOComplete) < high &&
+      io_enqueue_throttle_waiters.load(std::memory_order_relaxed) == 0) {
     return;
   }
 
@@ -566,7 +575,9 @@ ReactorDispatchEngine::maybe_throttle_io_enqueue()
          !(ctx.daemon && ctx.daemon->stopping) &&
          (high = io_enqueue_high.load(std::memory_order_relaxed)) != 0 &&
          queue.count(DispatchLane::IOComplete) >
-             (low = io_enqueue_low_watermark(high))) {
+             (low = io_enqueue_low_watermark(high)) &&
+         (queue.count(DispatchLane::IOComplete) >= high || counted_wait ||
+          io_enqueue_throttle_waiters.load(std::memory_order_relaxed) > 0)) {
     if (!counted_wait) {
       io_enqueue_throttle_waits.fetch_add(1, std::memory_order_relaxed);
       counted_wait = true;
