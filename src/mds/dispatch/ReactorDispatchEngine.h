@@ -123,6 +123,9 @@ private:
   void maybe_throttle_client_enqueue();
   void maybe_notify_client_enqueue_throttle();
   uint64_t client_enqueue_low_watermark(uint64_t high) const;
+  void maybe_throttle_io_enqueue();
+  void maybe_notify_io_enqueue_throttle();
+  uint64_t io_enqueue_low_watermark(uint64_t high) const;
   void publish_queue_depth_metrics();
   void flush_logger_metrics();
   void finish_trim_quantum(bool more);
@@ -154,6 +157,8 @@ private:
   std::atomic<uint64_t> queue_len_abort_limit{0};
   std::atomic<uint64_t> client_enqueue_high{0};
   std::atomic<uint64_t> client_enqueue_low{0};
+  std::atomic<uint64_t> io_enqueue_high{0};
+  std::atomic<uint64_t> io_enqueue_low{0};
   std::atomic<int64_t> cache_trim_max_duration_ms{0};
   std::atomic<int64_t> log_trim_max_duration_ms{0};
   std::array<std::atomic<int64_t>, static_cast<size_t>(DispatchLane::Count)>
@@ -176,6 +181,13 @@ private:
   ceph::condition_variable client_enqueue_throttle_cond;
   std::atomic<uint64_t> client_enqueue_throttle_waiters{0};
   std::atomic<uint64_t> client_enqueue_throttle_waits{0};
+
+  /// IOComplete enqueue backpressure (Objecter/io pool wait; op thread notifies).
+  ceph::mutex io_enqueue_throttle_lock{
+      ceph::make_mutex("ReactorDispatchEngine::io_enqueue_throttle")};
+  ceph::condition_variable io_enqueue_throttle_cond;
+  std::atomic<uint64_t> io_enqueue_throttle_waiters{0};
+  std::atomic<uint64_t> io_enqueue_throttle_waits{0};
 
   /// Written only by the op thread.
   std::array<ExecWindow, static_cast<size_t>(DispatchLane::Count)> exec_windows{};
