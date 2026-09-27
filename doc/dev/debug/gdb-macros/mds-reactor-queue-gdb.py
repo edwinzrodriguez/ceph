@@ -13,8 +13,8 @@
 #   (gdb) mds-reactor-queue ((MDSRank*)0x... )
 #
 # Also prints adaptive lane-slice state when engine symbols exist:
-#   Client avg_exec / estimated backlog, adapt_t, effective Client /
-#   Maintenance slice ms (mirrors ReactorDispatchEngine::lane_slice_ms).
+#   dominant backlog lane, adapt_t, effective IO/Maint/Client slice ms
+#   (mirrors ReactorDispatchEngine::lane_slice_ms).
 #
 # Auto-discovery (no arg): prefers `this` in a ReactorDispatchEngine frame
 # (e.g. abort stack); falls back to mds-rank-op / MDSDaemon.
@@ -890,12 +890,18 @@ def _exec_window_avg_us(engine, lane_idx):
 
 def _adaptive_slice_state(engine, queue):
     """
-    Read adaptive-slice caches / Client backlog without walking lists.
+    Read adaptive-slice caches / dominant backlog without walking lists.
     Returns a dict or None if symbols are missing (older binary).
     """
     try:
         target_us = _atomic_load_opt(engine["slice_backlog_target_us"])
         client_max = _atomic_load_opt(engine["client_slice_max_ms"])
+        client_min = _atomic_load_opt(engine["client_slice_min_ms"], default=1)
+        io_max = _atomic_load_opt(engine["io_slice_max_ms"], default=20)
+        io_min = _atomic_load_opt(engine["io_slice_min_ms"], default=2)
+        maint_max = _atomic_load_opt(
+            engine["maintenance_slice_max_ms"], default=5
+        )
         maint_min = _atomic_load_opt(engine["maintenance_slice_min_ms"])
         win_n = _atomic_load_opt(engine["exec_window_n"])
         bases = []
@@ -913,26 +919,59 @@ def _adaptive_slice_state(engine, queue):
     for i in range(len(LANE_NAMES)):
         depths.append(_lane_depth_atomic(lanes[i]))
 
-    client_idx = LANE_NAMES.index("Client")
-    client_avg = _exec_window_avg_us(engine, client_idx)
-    if client_avg is None:
-        return None
-    avg_us, filled, win_filled_n = client_avg
-    client_depth = depths[client_idx]
-    if client_depth is None:
-        backlog_us = None
-    else:
-        backlog_us = int(client_depth) * int(avg_us)
+    avgs = []
+    samples = []
+    win_ns = []
+    backlogs = []
+    for i in range(len(LANE_NAMES)):
+        avg_info = _exec_window_avg_us(engine, i)
+        if avg_info is None:
+            return None
+        avg_us, filled, win_filled_n = avg_info
+        avgs.append(avg_us)
+        samples.append(filled)
+        win_ns.append(win_filled_n)
+        depth = depths[i]
+        if depth is None:
+            backlogs.append(None)
+        else:
+            backlogs.append(int(depth) * int(avg_us))
 
-    # Mirror client_adapt_t() / lane_slice_ms().
+    # Dominant among IOComplete / Maintenance / Client (not Control).
+    adaptable = [
+        LANE_NAMES.index("IOComplete"),
+        LANE_NAMES.index("Maintenance"),
+        LANE_NAMES.index("Client"),
+    ]
+    dominant_idx = adaptable[0]
+    max_bl = -1
+    for i in adaptable:
+        bl = backlogs[i]
+        if bl is not None and bl > max_bl:
+            max_bl = bl
+            dominant_idx = i
+    if max_bl < 0:
+        max_bl = 0
+
     adapt_t = 0.0
-    if target_us and target_us > 0 and backlog_us is not None:
+    if target_us and target_us > 0:
         max_ratio = 4.0
-        ratio = float(backlog_us) / float(target_us)
+        ratio = float(max_bl) / float(target_us)
         if ratio >= 1.0:
             adapt_t = min(
                 1.0, (min(ratio, max_ratio) - 1.0) / (max_ratio - 1.0)
             )
+
+    max_by_name = {
+        "IOComplete": io_max,
+        "Maintenance": maint_max,
+        "Client": client_max,
+    }
+    min_by_name = {
+        "IOComplete": io_min,
+        "Maintenance": maint_min,
+        "Client": client_min,
+    }
 
     def effective(lane_idx, base):
         if base is None:
@@ -941,14 +980,14 @@ def _adaptive_slice_state(engine, queue):
         if base <= 0:
             return base  # drain-until-empty: no adapt
         name = LANE_NAMES[lane_idx]
-        if name not in ("Client", "Maintenance") or adapt_t <= 0.0:
+        if name == "Control" or adapt_t <= 0.0:
             return base
-        if name == "Client":
-            max_ms = int(client_max) if client_max is not None else base
+        if lane_idx == dominant_idx:
+            max_ms = int(max_by_name.get(name) or base)
             if max_ms < base:
                 max_ms = base
             return base + int((max_ms - base) * adapt_t)
-        min_ms = int(maint_min) if maint_min is not None else 0
+        min_ms = int(min_by_name.get(name) if min_by_name.get(name) is not None else 0)
         if min_ms < 0:
             min_ms = 0
         if min_ms > base:
@@ -956,51 +995,69 @@ def _adaptive_slice_state(engine, queue):
         return base - int((base - min_ms) * adapt_t)
 
     eff = [effective(i, bases[i]) for i in range(len(LANE_NAMES))]
+    cidx = LANE_NAMES.index("Client")
     return {
         "target_us": target_us,
         "client_max_ms": client_max,
+        "client_min_ms": client_min,
+        "io_max_ms": io_max,
+        "io_min_ms": io_min,
+        "maint_max_ms": maint_max,
         "maint_min_ms": maint_min,
         "exec_window_n": win_n,
         "bases": bases,
         "depths": depths,
-        "client_avg_us": avg_us,
-        "client_samples": filled,
-        "client_window_n": win_filled_n,
-        "client_backlog_us": backlog_us,
+        "avgs": avgs,
+        "samples": samples,
+        "win_ns": win_ns,
+        "backlogs": backlogs,
+        "client_avg_us": avgs[cidx],
+        "client_samples": samples[cidx],
+        "client_window_n": win_ns[cidx],
+        "client_backlog_us": backlogs[cidx],
+        "dominant": LANE_NAMES[dominant_idx],
+        "dominant_backlog_us": max_bl,
         "adapt_t": adapt_t,
         "effective": eff,
     }
 
 
 def _print_adaptive_slices(state):
-    """Compact block for adaptive Client/Maintenance slices."""
+    """Compact block for backlog-dominant adaptive slices."""
     print(
         "  adaptive slices: target=%s  exec_window_n=%s  "
-        "client_max=%sms  maint_min=%sms"
+        "dominant=%s  adapt_t=%.3f"
         % (
             _fmt_us(state["target_us"]),
             state["exec_window_n"]
             if state["exec_window_n"] is not None
             else "?",
-            state["client_max_ms"]
-            if state["client_max_ms"] is not None
-            else "?",
-            state["maint_min_ms"]
-            if state["maint_min_ms"] is not None
-            else "?",
+            state["dominant"],
+            state["adapt_t"],
+        )
+    )
+    print(
+        "    bounds: io=%s/%sms  maint=%s/%sms  client=%s/%sms"
+        % (
+            state["io_min_ms"] if state["io_min_ms"] is not None else "?",
+            state["io_max_ms"] if state["io_max_ms"] is not None else "?",
+            state["maint_min_ms"] if state["maint_min_ms"] is not None else "?",
+            state["maint_max_ms"] if state["maint_max_ms"] is not None else "?",
+            state["client_min_ms"] if state["client_min_ms"] is not None else "?",
+            state["client_max_ms"] if state["client_max_ms"] is not None else "?",
         )
     )
     cidx = LANE_NAMES.index("Client")
     print(
         "    Client: depth=%s  avg_exec=%s (%d/%s samples)  "
-        "backlog=%s  adapt_t=%.3f"
+        "backlog=%s  (dominant_backlog=%s)"
         % (
             state["depths"][cidx] if state["depths"][cidx] is not None else "?",
             _fmt_us(state["client_avg_us"]),
             state["client_samples"],
             state["client_window_n"],
             _fmt_us(state["client_backlog_us"]),
-            state["adapt_t"],
+            _fmt_us(state["dominant_backlog_us"]),
         )
     )
     parts = []

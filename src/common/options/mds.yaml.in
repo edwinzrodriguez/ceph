@@ -223,49 +223,116 @@ options:
 - name: mds_reactor_slice_backlog_target
   type: millisecs
   level: advanced
-  desc: Soft Client backlog that starts adapting reactor lane slices
-  long_desc: When estimated Client backlog (lane depth times rolling average
-    execute time) reaches this target, the scheduler begins boosting the
-    Client lane slice toward ``mds_reactor_lane_slice_client_max`` and cutting
-    Maintenance toward ``mds_reactor_lane_slice_maintenance_min``. Full
-    adaptation is reached at four times this target. ``0`` disables adaptation.
+  desc: Soft per-lane backlog that starts adapting reactor lane slices
+  long_desc: When the highest estimated backlog among IOComplete, Maintenance,
+    and Client (lane depth times rolling average execute time) reaches this
+    target, the scheduler boosts that dominant lane's slice toward its
+    ``*_max`` and cuts the other adaptable lanes toward their ``*_min``.
+    Control keeps its base slice. Full adaptation is reached at four times
+    this target. ``0`` disables adaptation.
   default: 500
   services:
   - mds
   see_also:
   - mds_reactor_slice_exec_window
-  - mds_reactor_lane_slice_client
   - mds_reactor_lane_slice_client_max
+  - mds_reactor_lane_slice_client_min
+  - mds_reactor_lane_slice_io_max
+  - mds_reactor_lane_slice_io_min
+  - mds_reactor_lane_slice_maintenance_max
   - mds_reactor_lane_slice_maintenance_min
   flags:
   - runtime
 - name: mds_reactor_lane_slice_client_max
   type: millisecs
   level: advanced
-  desc: Maximum Client lane slice under backlog adaptation
-  long_desc: Upper bound for the Client lane wall-clock budget when estimated
-    Client backlog is high. The configured ``mds_reactor_lane_slice_client``
-    remains the idle/base budget.
+  desc: Maximum Client lane slice when Client has the dominant backlog
+  long_desc: Upper bound for the Client lane wall-clock budget when Client is
+    the adaptable lane with the highest estimated backlog. The configured
+    ``mds_reactor_lane_slice_client`` remains the idle/base budget.
   default: 20
   services:
   - mds
   see_also:
   - mds_reactor_lane_slice_client
+  - mds_reactor_lane_slice_client_min
+  - mds_reactor_slice_backlog_target
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_client_min
+  type: millisecs
+  level: advanced
+  desc: Minimum Client lane slice when another lane has the dominant backlog
+  long_desc: Floor for the Client lane wall-clock budget when IOComplete or
+    Maintenance dominates. Keeps Client from being starved entirely.
+  default: 1
+  services:
+  - mds
+  see_also:
+  - mds_reactor_lane_slice_client
+  - mds_reactor_lane_slice_client_max
+  - mds_reactor_slice_backlog_target
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_io_max
+  type: millisecs
+  level: advanced
+  desc: Maximum IOComplete lane slice when IO has the dominant backlog
+  long_desc: Upper bound for the IOComplete lane wall-clock budget when
+    IOComplete has the highest estimated backlog among adaptable lanes.
+  default: 20
+  services:
+  - mds
+  see_also:
+  - mds_reactor_lane_slice_io
+  - mds_reactor_lane_slice_io_min
+  - mds_reactor_slice_backlog_target
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_io_min
+  type: millisecs
+  level: advanced
+  desc: Minimum IOComplete lane slice when another lane has the dominant backlog
+  long_desc: Floor for the IOComplete lane wall-clock budget when Client or
+    Maintenance dominates. Prevents journal/OSD completion starvation under
+    Client CAPS floods.
+  default: 2
+  services:
+  - mds
+  see_also:
+  - mds_reactor_lane_slice_io
+  - mds_reactor_lane_slice_io_max
+  - mds_reactor_slice_backlog_target
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_maintenance_max
+  type: millisecs
+  level: advanced
+  desc: Maximum Maintenance lane slice when Maintenance has the dominant backlog
+  long_desc: Upper bound for Maintenance when it is the adaptable lane with
+    the highest estimated backlog (uncommon; mostly trim pressure).
+  default: 5
+  services:
+  - mds
+  see_also:
+  - mds_reactor_lane_slice_maintenance
+  - mds_reactor_lane_slice_maintenance_min
   - mds_reactor_slice_backlog_target
   flags:
   - runtime
 - name: mds_reactor_lane_slice_maintenance_min
   type: millisecs
   level: advanced
-  desc: Minimum Maintenance lane slice under Client backlog pressure
-  long_desc: Floor for the Maintenance lane wall-clock budget when estimated
-    Client backlog is high. The configured
+  desc: Minimum Maintenance lane slice when another lane has the dominant backlog
+  long_desc: Floor for the Maintenance lane wall-clock budget when Client or
+    IOComplete dominates. The configured
     ``mds_reactor_lane_slice_maintenance`` remains the idle/base budget.
   default: 1
   services:
   - mds
   see_also:
   - mds_reactor_lane_slice_maintenance
+  - mds_reactor_lane_slice_maintenance_max
   - mds_reactor_slice_backlog_target
   flags:
   - runtime
