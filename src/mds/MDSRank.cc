@@ -3989,13 +3989,53 @@ void MDSRank::create_logger()
           "Reactor Client lane queue depth", "rdqc",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_u64(
+          l_mds_reactor_dispatch_queue_len_io, "dispatch_queue_len_io",
+          "Reactor IOComplete lane queue depth", "rdqi",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_dispatch_queue_len_maintenance,
+          "dispatch_queue_len_maintenance",
+          "Reactor Maintenance lane queue depth", "rdqn",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
           l_mds_reactor_client_avg_exec_us, "dispatch_client_avg_exec_us",
           "Rolling average Client lane execute time (microseconds)", "dcae",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_u64(
+          l_mds_reactor_io_avg_exec_us, "dispatch_io_avg_exec_us",
+          "Rolling average IOComplete lane execute time (microseconds)", "diae",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_maintenance_avg_exec_us,
+          "dispatch_maintenance_avg_exec_us",
+          "Rolling average Maintenance lane execute time (microseconds)",
+          "dmae", PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
           l_mds_reactor_client_backlog_us, "dispatch_client_backlog_us",
           "Estimated Client lane backlog (depth * avg exec, microseconds)",
           "dcbl", PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_io_backlog_us, "dispatch_io_backlog_us",
+          "Estimated IOComplete lane backlog (depth * avg exec, microseconds)",
+          "dibl", PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_maintenance_backlog_us,
+          "dispatch_maintenance_backlog_us",
+          "Estimated Maintenance lane backlog (depth * avg exec, microseconds)",
+          "dmbl", PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_dominant_backlog_us, "dispatch_dominant_backlog_us",
+          "Estimated backlog of the dominant adaptable lane (microseconds)",
+          "ddbl", PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_adapt_t_milli, "dispatch_adapt_t_milli",
+          "Backlog adaptation factor t * 1000 (0=none, 1000=full)", "datm",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_reactor_dominant_lane, "dispatch_dominant_lane",
+          "Dominant adaptable DispatchLane (1=IOComplete, 2=Maintenance, "
+          "3=Client)",
+          "ddln", PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_u64(
           l_mds_reactor_slice_client_effective_ms,
           "dispatch_slice_client_effective_ms",

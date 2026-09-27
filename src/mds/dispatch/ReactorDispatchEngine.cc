@@ -395,10 +395,36 @@ ReactorDispatchEngine::maybe_abort_on_queue_depth(size_t depth)
     return;
   }
 
+  static constexpr const char* lane_names[] = {
+      "Control", "IOComplete", "Maintenance", "Client"};
+  const auto [dominant, dom_backlog] = dominant_adaptable_backlog();
+  const double adapt_t = backlog_adapt_t(dom_backlog);
+  const size_t nlanes = static_cast<size_t>(DispatchLane::Count);
+
   derr << "mds_reactor_queue_len_abort: dispatch queue depth " << depth
        << " >= limit " << limit
        << " (queue_len_max=" << queue_len_max.load(std::memory_order_relaxed)
        << ")" << dendl;
+  for (size_t i = 0; i < nlanes; ++i) {
+    const auto lane = static_cast<DispatchLane>(i);
+    derr << "  lane " << lane_names[i]
+         << ": depth=" << queue.count(lane)
+         << " avg_exec_us=" << avg_exec_us(lane)
+         << " backlog_us=" << estimated_backlog_us(lane)
+         << " slice_ms=" << lane_slice_ms(lane)
+         << " (base="
+         << lane_slice_ms_cached[i].load(std::memory_order_relaxed)
+         << " min=" << lane_slice_min_ms(lane)
+         << " max=" << lane_slice_max_ms(lane) << ")" << dendl;
+  }
+  derr << "  adaptive: target_us="
+       << slice_backlog_target_us.load(std::memory_order_relaxed)
+       << " dominant=" << lane_names[static_cast<size_t>(dominant)]
+       << " dominant_backlog_us=" << dom_backlog
+       << " adapt_t=" << adapt_t
+       << " client_enqueue_throttle_waiters="
+       << client_enqueue_throttle_waiters.load(std::memory_order_relaxed)
+       << dendl;
   publish_queue_depth_metrics();
   if (g_ceph_context && g_ceph_context->_log) {
     g_ceph_context->_log->dump_recent();
@@ -499,6 +525,10 @@ ReactorDispatchEngine::publish_queue_depth_metrics()
   flush_logger_metrics();
 
   PerfCounters* logger = ctx.rank->logger;
+  const auto [dominant, dom_backlog] = dominant_adaptable_backlog();
+  const double adapt_t = backlog_adapt_t(dom_backlog);
+  const uint64_t adapt_t_milli = static_cast<uint64_t>(adapt_t * 1000.0 + 0.5);
+
   logger->set(l_mds_reactor_dispatch_queue_len, queue.count());
   logger->set(
       l_mds_dispatch_queue_len_max,
@@ -507,8 +537,28 @@ ReactorDispatchEngine::publish_queue_depth_metrics()
       l_mds_reactor_dispatch_queue_len_client,
       queue.count(DispatchLane::Client));
   logger->set(
+      l_mds_reactor_dispatch_queue_len_io,
+      queue.count(DispatchLane::IOComplete));
+  logger->set(
+      l_mds_reactor_dispatch_queue_len_maintenance,
+      queue.count(DispatchLane::Maintenance));
+  logger->set(
       l_mds_reactor_client_avg_exec_us, avg_exec_us(DispatchLane::Client));
+  logger->set(
+      l_mds_reactor_io_avg_exec_us, avg_exec_us(DispatchLane::IOComplete));
+  logger->set(
+      l_mds_reactor_maintenance_avg_exec_us,
+      avg_exec_us(DispatchLane::Maintenance));
   logger->set(l_mds_reactor_client_backlog_us, client_backlog_us());
+  logger->set(
+      l_mds_reactor_io_backlog_us,
+      estimated_backlog_us(DispatchLane::IOComplete));
+  logger->set(
+      l_mds_reactor_maintenance_backlog_us,
+      estimated_backlog_us(DispatchLane::Maintenance));
+  logger->set(l_mds_reactor_dominant_backlog_us, dom_backlog);
+  logger->set(l_mds_reactor_adapt_t_milli, adapt_t_milli);
+  logger->set(l_mds_reactor_dominant_lane, static_cast<uint64_t>(dominant));
   logger->set(
       l_mds_reactor_slice_client_effective_ms,
       lane_slice_ms(DispatchLane::Client));
