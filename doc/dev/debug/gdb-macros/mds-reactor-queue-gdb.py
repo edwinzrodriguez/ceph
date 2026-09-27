@@ -15,6 +15,8 @@
 # Also prints adaptive lane-slice state when engine symbols exist:
 #   dominant backlog lane, adapt_t, effective IO/Maint/Client slice ms
 #   (mirrors ReactorDispatchEngine::lane_slice_ms).
+# And Client/IOComplete enqueue throttle watermarks + waiter counts when
+# those engine fields exist.
 #
 # Auto-discovery (no arg): prefers `this` in a ReactorDispatchEngine frame
 # (e.g. abort stack); falls back to mds-rank-op / MDSDaemon.
@@ -1080,6 +1082,112 @@ def _print_adaptive_slices(state):
     print("    effective: %s" % ("  ".join(parts) if parts else "(n/a)"))
 
 
+def _enqueue_throttle_lane(engine, queue, lane_name, high_field, low_field, waiters_field):
+    """
+    Read one lane's enqueue hysteresis state. Returns a dict or None if the
+    high watermark field is missing (older binary without that throttle).
+    """
+    try:
+        high = _atomic_load_opt(engine[high_field], default=None)
+    except (gdb.error, KeyError, TypeError, ValueError):
+        return None
+    if high is None:
+        return None
+    try:
+        low = _atomic_load_opt(engine[low_field], default=0)
+        waiters = _atomic_load_opt(engine[waiters_field], default=0)
+    except (gdb.error, KeyError, TypeError, ValueError):
+        low = 0
+        waiters = 0
+
+    # Mirror ReactorDispatchEngine::*_enqueue_low_watermark.
+    eff_low = low
+    if high and (not low or low >= high):
+        eff_low = high // 2
+
+    lane_idx = LANE_NAMES.index(lane_name)
+    depth = _lane_depth_atomic(queue["lanes"][lane_idx])
+    engaged = bool(high and depth is not None and depth >= high)
+    below_low = bool(high and depth is not None and depth <= eff_low)
+
+    return {
+        "name": lane_name,
+        "high": high,
+        "low": low,
+        "eff_low": eff_low,
+        "waiters": waiters if waiters is not None else 0,
+        "depth": depth,
+        "engaged": engaged,
+        "below_low": below_low,
+    }
+
+
+def _enqueue_throttle_state(engine, queue):
+    """Client + IOComplete enqueue throttle snapshot (None if neither exists)."""
+    client = _enqueue_throttle_lane(
+        engine,
+        queue,
+        "Client",
+        "client_enqueue_high",
+        "client_enqueue_low",
+        "client_enqueue_throttle_waiters",
+    )
+    io = _enqueue_throttle_lane(
+        engine,
+        queue,
+        "IOComplete",
+        "io_enqueue_high",
+        "io_enqueue_low",
+        "io_enqueue_throttle_waiters",
+    )
+    if client is None and io is None:
+        return None
+    return {"client": client, "io": io}
+
+
+def _print_enqueue_throttle(state):
+    """Compact block for Client/IOComplete enqueue backpressure."""
+    print("  enqueue throttle:")
+    for key in ("io", "client"):
+        lane = state.get(key)
+        if lane is None:
+            print("    %s: (n/a — binary lacks fields)" % key)
+            continue
+        high = lane["high"]
+        if not high:
+            print(
+                "    %s: disabled  depth=%s  waiters=%s"
+                % (
+                    lane["name"],
+                    lane["depth"] if lane["depth"] is not None else "?",
+                    lane["waiters"],
+                )
+            )
+            continue
+        if lane["engaged"]:
+            status = "engaged"
+        elif lane["waiters"]:
+            status = "draining"
+        elif lane["below_low"]:
+            status = "idle"
+        else:
+            status = "armed"
+        low_s = lane["low"]
+        if low_s != lane["eff_low"]:
+            low_s = "%s(->%s)" % (lane["low"], lane["eff_low"])
+        print(
+            "    %s: %s  depth=%s  high=%s  low=%s  waiters=%s"
+            % (
+                lane["name"],
+                status,
+                lane["depth"] if lane["depth"] is not None else "?",
+                high,
+                low_s,
+                lane["waiters"],
+            )
+        )
+
+
 def _print_age_stats(label, ages, now_ns):
     if not ages:
         print("    %s: (no enqueued_at samples)" % label)
@@ -1122,7 +1230,9 @@ class MdsReactorQueue(gdb.Command):
 
     When ReactorDispatchEngine adaptive-slice fields exist, also prints
     Client avg_exec / backlog and effective Client/Maintenance slice ms
-    (no list walk — O(1) atomics + ExecWindow).
+    (no list walk — O(1) atomics + ExecWindow). When enqueue-throttle
+    fields exist, prints Client/IOComplete high/low watermarks, depth,
+    waiters, and engaged/draining/idle status.
 
     Empty lanes with log_trim_queued/trim_quantum_queued set usually means
     that single-flight item is already dequeued and running on mds-rank-op
@@ -1178,6 +1288,12 @@ class MdsReactorQueue(gdb.Command):
                     _print_adaptive_slices(adapt)
             except (gdb.error, KeyError, TypeError, ValueError) as e:
                 print("  adaptive slices unavailable: %s" % e)
+            try:
+                throttle = _enqueue_throttle_state(engine, queue)
+                if throttle is not None:
+                    _print_enqueue_throttle(throttle)
+            except (gdb.error, KeyError, TypeError, ValueError) as e:
+                print("  enqueue throttle unavailable: %s" % e)
 
         print(
             "  depth(atomic)=%s  stopping=%s"
