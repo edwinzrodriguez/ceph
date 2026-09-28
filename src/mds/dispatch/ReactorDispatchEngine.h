@@ -33,7 +33,11 @@
  * thread drains to the low watermark. While any producer is waiting for that
  * drain, new producers join the wait (they must not refill the mid band
  * between low and high). Control is never stalled. Disabled when high is 0;
- * Client throttle is skipped during boot exclusivity.
+ * Client throttle is skipped during boot exclusivity. IO completions that
+ * arise on the op thread during execute_item (e.g. Journaler::_finish_flush
+ * → finish_contexts under Journaler::lock) are deferred and drained after
+ * the current item returns — not executed inline (lock re-entry) and not
+ * re-enqueued (throttle bypass / queue-depth abort).
  *
  * Rank exclusivity: after boot, execute_item does not take mds_lock; the
  * registered op thread owns exclusivity (MDS_ASSERT_RANK_EXCLUSIVE /
@@ -58,6 +62,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "common/ceph_mutex.h"
 
@@ -115,6 +120,7 @@ private:
   void enqueue_item(OpWorkItem* item, DispatchLane lane);
   void execute_item(OpWorkItem* item);
   void execute_io_completion(MDSIOContextBase* ioctx, int r);
+  void drain_deferred_io_completions();
   void record_wait_metrics(const OpWorkItem& item);
   void record_execute_metrics(
       const OpWorkItem& item,
@@ -194,4 +200,8 @@ private:
   std::array<ExecWindow, static_cast<size_t>(DispatchLane::Count)> exec_windows{};
   /// Op-thread local PerfCounters staging (flushed in publish_queue_depth_metrics).
   mds::dispatch_perf::LocalDispatchMetrics local_metrics{};
+  /// Nesting depth of execute_item on the op thread (0 outside).
+  unsigned execute_depth{0};
+  /// IO completions deferred from submit_io_completion while execute_depth > 0.
+  std::vector<std::pair<MDSIOContextBase*, int>> deferred_io_completions;
 };
