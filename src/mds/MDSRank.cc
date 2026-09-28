@@ -782,6 +782,8 @@ void MDSRankDispatcher::tick()
   if (is_clientreplay() || is_active() || is_stopping()) {
     server->clear_laggy_clients();
     server->find_idle_sessions();
+    // Abort before eviction so sticky-revoke dumps still see live clients.
+    server->maybe_abort_on_cap_revoke_timeout();
     server->evict_cap_revoke_non_responders();
     locker->tick();
   }
@@ -4550,6 +4552,7 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
        "mds_cache_trim_max_duration",
        "mds_cache_trim_threshold",
        "mds_cap_acquisition_throttle_retry_request_time",
+       "mds_cap_revoke_abort_timeout",
        "mds_cap_revoke_eviction_timeout",
        "mds_debug_subtrees",
        "mds_dir_max_entries",

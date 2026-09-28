@@ -302,6 +302,8 @@ Server::Server(MDSRank *m, MetricsHandler *metrics_handler) :
   replay_unsafe_with_closed_session = g_conf().get_val<bool>("mds_replay_unsafe_with_closed_session");
   allow_batched_ops = g_conf().get_val<bool>("mds_allow_batched_ops");
   cap_revoke_eviction_timeout = g_conf().get_val<double>("mds_cap_revoke_eviction_timeout");
+  cap_revoke_abort_timeout =
+      g_conf().get_val<double>("mds_cap_revoke_abort_timeout");
   max_snaps_per_dir = g_conf().get_val<uint64_t>("mds_max_snaps_per_dir");
   delegate_inos_pct = g_conf().get_val<uint64_t>("mds_client_delegate_inos_pct");
   max_caps_per_client = g_conf().get_val<uint64_t>("mds_max_caps_per_client");
@@ -1390,6 +1392,32 @@ void Server::find_idle_sessions()
   clear_laggy_clients();
 }
 
+void
+Server::maybe_abort_on_cap_revoke_timeout()
+{
+  if (cap_revoke_abort_timeout <= 0) {
+    return;
+  }
+
+  auto&& late = mds->locker->get_late_revoking_clients(cap_revoke_abort_timeout);
+  if (late.empty()) {
+    return;
+  }
+
+  derr << "mds_cap_revoke_abort_timeout: " << late.size()
+       << " client(s) have not responded to cap revoke for over "
+       << cap_revoke_abort_timeout << " seconds" << dendl;
+  for (auto const& client : late) {
+    derr << "  late client." << client << dendl;
+  }
+  mds->locker->dump_late_revoking(cap_revoke_abort_timeout);
+  if (g_ceph_context && g_ceph_context->_log) {
+    g_ceph_context->_log->dump_recent();
+  }
+  ceph_abort_msg(
+      "mds_cap_revoke_abort_timeout: client(s) not responding to cap revoke");
+}
+
 void Server::evict_cap_revoke_non_responders() {
   if (!cap_revoke_eviction_timeout) {
     return;
@@ -1442,6 +1470,12 @@ void Server::handle_conf_change(const std::set<std::string>& changed) {
     cap_revoke_eviction_timeout = g_conf().get_val<double>("mds_cap_revoke_eviction_timeout");
     dout(20) << __func__ << " cap revoke eviction timeout changed to "
             << cap_revoke_eviction_timeout << dendl;
+  }
+  if (changed.count("mds_cap_revoke_abort_timeout")) {
+    cap_revoke_abort_timeout =
+        g_conf().get_val<double>("mds_cap_revoke_abort_timeout");
+    dout(20) << __func__ << " cap revoke abort timeout changed to "
+             << cap_revoke_abort_timeout << dendl;
   }
   if (changed.count("mds_recall_max_decay_rate")) {
     recall_throttle = DecayCounter(g_conf().get_val<double>("mds_recall_max_decay_rate"));

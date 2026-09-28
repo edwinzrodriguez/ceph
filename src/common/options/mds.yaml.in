@@ -1915,6 +1915,29 @@ options:
   default: 0
   services:
   - mds
+  see_also:
+  - mds_cap_revoke_abort_timeout
+- name: mds_cap_revoke_abort_timeout
+  type: float
+  level: dev
+  desc: Abort the MDS when a client has not responded to a cap revoke for this many
+    seconds
+  long_desc: Debugging aid for sticky cap-revoke stalls (client holds issued caps
+    that the MDS has already revoked). When non-zero, if any client has a pending
+    revoke older than this timeout, the MDS dumps the recent in-memory log (see
+    ``log_max_recent`` / ``debug_mds`` gather level) with details of the late
+    revokes and aborts. Prefer this over ``mds_cap_revoke_eviction_timeout`` when
+    capturing client debugfs or gdb at the moment of the wedge — eviction recovers
+    the MDS but leaves clients dead before a stall dump can run. ``0`` disables
+    (default). Independent of eviction; set both to the same value to abort on the
+    first late revoke instead of silently recovering via eviction.
+  default: 0
+  services:
+  - mds
+  see_also:
+  - mds_cap_revoke_eviction_timeout
+  flags:
+  - runtime
 - name: mds_dump_cache_threshold_formatter
   type: size
   level: dev

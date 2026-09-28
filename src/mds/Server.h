@@ -391,6 +391,7 @@ public:
 			       CDentry *destdn, CDentry *staydn, std::map<client_t,ref_t<MClientSnap>> splits[2],
 			       bool finish_mdr);
 
+  void maybe_abort_on_cap_revoke_timeout();
   void evict_cap_revoke_non_responders();
   void handle_conf_change(const std::set<std::string>& changed);
 
@@ -624,6 +625,7 @@ private:
   bool forward_all_requests_to_auth = false;
   bool replay_unsafe_with_closed_session = false;
   double cap_revoke_eviction_timeout = 0;
+  double cap_revoke_abort_timeout = 0;
   uint64_t max_snaps_per_dir = 100;
   // long snapshot names have the following format: "_<SNAPSHOT-NAME>_<INODE-NUMBER>"
   uint64_t snapshot_name_max = NAME_MAX - 1 - 1 - 13;

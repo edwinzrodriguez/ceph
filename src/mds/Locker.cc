@@ -4488,6 +4488,31 @@ std::set<client_t> Locker::get_late_revoking_clients(double timeout)
 // inspection tools for getting at detailed cap state (#7316)
 #define MAX_WARN_CAPS 100
 
+void
+Locker::dump_late_revoking(double timeout)
+{
+  utime_t now = ceph_clock_now();
+  int n = 0;
+  for (auto p = revoking_caps.begin(); !p.end(); ++p) {
+    Capability* cap = *p;
+    utime_t age = now - cap->get_last_revoke_stamp();
+    if (age <= timeout) {
+      break;
+    }
+    ++n;
+    if (n > MAX_WARN_CAPS) {
+      derr << "  ... and more late revoking caps (capped at " << MAX_WARN_CAPS
+           << ")" << dendl;
+      break;
+    }
+    derr << "  client." << cap->get_client() << " ino "
+         << cap->get_inode()->ino() << " pending "
+         << ccap_string(cap->pending()) << " issued "
+         << ccap_string(cap->issued()) << " sent " << age << " seconds ago"
+         << dendl;
+  }
+}
+
 void Locker::caps_tick()
 {
   utime_t now = ceph_clock_now();
