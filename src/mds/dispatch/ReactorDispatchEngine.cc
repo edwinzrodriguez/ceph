@@ -829,8 +829,30 @@ ReactorDispatchEngine::submit_inbound(const ref_t<Message>& m)
 void
 ReactorDispatchEngine::submit_io_completion(MDSIOContextBase* ioctx, int r)
 {
+  // Nested on the op thread (e.g. Journaler::_finish_flush holds Journaler::lock
+  // then finish_contexts → MDSLogContextBase::complete). Must not execute
+  // inline (re-enters Journaler) and must not re-enqueue onto IOComplete (op
+  // thread skips throttle → queue-depth abort). Defer until execute_item
+  // finishes and outer locks are dropped.
+  if (mds::reactor_is_op_thread() && execute_depth > 0) {
+    deferred_io_completions.emplace_back(ioctx, r);
+    return;
+  }
   OpWorkItem* item = OpWorkItem::create_io(ioctx, r);
   enqueue_item(item, DispatchLane::IOComplete);
+}
+
+void
+ReactorDispatchEngine::drain_deferred_io_completions()
+{
+  // execute_depth stays > 0 so further nested completes keep deferring.
+  while (!deferred_io_completions.empty()) {
+    auto batch = std::move(deferred_io_completions);
+    deferred_io_completions.clear();
+    for (auto& [ioctx, r] : batch) {
+      execute_io_completion(ioctx, r);
+    }
+  }
 }
 
 void
@@ -983,6 +1005,7 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
     owner_token.emplace(*ctx.mds_lock, token);
   }
 
+  ++execute_depth;
   switch (item->kind) {
   case WorkKind::InboundMessage:
     ++local_metrics.inbound;
@@ -1029,6 +1052,10 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
     }
     break;
   }
+
+  // After the item returns, outer locks (e.g. Journaler::lock) are dropped.
+  drain_deferred_io_completions();
+  --execute_depth;
 
   record_execute_metrics(*item, exec_start);
   item->destroy();
