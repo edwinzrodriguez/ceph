@@ -1042,7 +1042,7 @@ void Objecter::ms_fast_dispatch2(const MessageRef& m)
   case CEPH_MSG_OSD_OPREPLY: {
     auto priv = m->get_connection()->get_priv();
     auto s = static_cast<OSDSession*>(priv.get());
-    if (s) {
+    if (s && cct->_conf->objecter_dispatch_to_session_strand) {
       s->track_enqueue(m, [this, priv, s, m]() {
         s->track_dequeue(m);
         handle_osd_op_reply(cref_cast<MOSDOpReply>(m));
@@ -1056,7 +1056,7 @@ void Objecter::ms_fast_dispatch2(const MessageRef& m)
   case CEPH_MSG_WATCH_NOTIFY: {
     auto priv = m->get_connection()->get_priv();
     auto s = static_cast<OSDSession*>(priv.get());
-    if (s) {
+    if (s && cct->_conf->objecter_dispatch_to_session_strand) {
       s->track_enqueue(m, [this, priv, s, m]() {
         s->track_dequeue(m);
         handle_watch_notify(cref_cast<MWatchNotify>(m));
@@ -1079,7 +1079,7 @@ Dispatcher::dispatch_result_t Objecter::ms_dispatch2(const MessageRef& m)
   case CEPH_MSG_OSD_BACKOFF: {
     auto priv = m->get_connection()->get_priv();
     auto s = static_cast<OSDSession*>(priv.get());
-    if (s) {
+    if (s && cct->_conf->objecter_dispatch_to_session_strand) {
       s->track_enqueue(m, [this, priv, s, m]() {
         s->track_dequeue(m);
         handle_osd_backoff(cref_cast<MOSDBackoff>(m));
@@ -1096,7 +1096,7 @@ Dispatcher::dispatch_result_t Objecter::ms_dispatch2(const MessageRef& m)
     if (m->get_source().type() == CEPH_ENTITY_TYPE_OSD) {
       auto priv = m->get_connection()->get_priv();
       auto s = static_cast<OSDSession*>(priv.get());
-      if (s) {
+      if (s && cct->_conf->objecter_dispatch_to_session_strand) {
         s->track_enqueue(m, [this, priv, s, m]() {
           s->track_dequeue(m);
           handle_command_reply(cref_cast<MCommandReply>(m));
