@@ -15,6 +15,7 @@
 #   ./mds-stall-debug.py --daemon mds.myfs-0.abc --grafana-url http://localhost:3000
 #   ./mds-stall-debug.py --daemon mds.myfs-0.abc --client-debugfs \
 #       --client-host client-000 --client-host client-001
+#   (also copies /var/log/ceph/ceph-fuse-<host>.log when present)
 #
 # Log extract uses stall dir timestamp (…-YYYYMMDD-HHMMSS), blocked/historic op event
 # times, and report events — not report.txt collection time for idle (0 blocked op) stalls.
@@ -33,6 +34,8 @@ import base64
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -946,6 +949,9 @@ PROMETHEUS_TIMESERIES_ARTIFACT = "prometheus_timeseries.json"
 CLIENT_DEBUGFS_DIR = "client_debugfs"
 CLIENT_DEBUGFS_SUMMARY = "client_debugfs_summary.json"
 CLIENT_DEBUGFS_DEFAULT_FILES = ("mdsc", "mds_sessions", "osdc", "caps")
+CLIENT_FUSE_LOG_DIR = "client_logs"
+CLIENT_FUSE_LOG_SUMMARY = "client_fuse_logs.json"
+CLIENT_FUSE_LOG_DEFAULT_DIR = "/var/log/ceph"
 CLIENT_DEBUGFS_DIR_RE = re.compile(
     r"^(?P<fsid>[0-9a-fA-F-]{36})\.client(?P<client_id>\d+)$"
 )
@@ -2480,6 +2486,202 @@ def append_client_debugfs_report_section(
         handle.write("\n")
 
 
+def client_fuse_log_name(host: str) -> str:
+    label = sanitize_host_label(host.split(".")[0] if host else "host")
+    return f"ceph-fuse-{label}.log"
+
+
+def copy_client_fuse_log_local(
+    *,
+    dest: Path,
+    remote_path: Path,
+    timeout: int,
+) -> Dict[str, Any]:
+    if not remote_path.is_file():
+        return {"status": "missing", "source": str(remote_path)}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(remote_path, dest)
+    except PermissionError:
+        text = read_text_file_local(remote_path, timeout)
+        dest.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return {"status": "error", "source": str(remote_path), "error": str(exc)}
+    return {
+        "status": "copied",
+        "source": str(remote_path),
+        "path": str(dest),
+        "bytes": dest.stat().st_size,
+    }
+
+
+def copy_client_fuse_log_remote(
+    *,
+    dest: Path,
+    host: str,
+    remote_path: str,
+    timeout: int,
+    ssh_user: Optional[str] = None,
+) -> Dict[str, Any]:
+    quoted = remote_path.replace("'", "'\"'\"'")
+    try:
+        exists = ssh_run(
+            host,
+            f"if [ -f '{quoted}' ]; then echo yes; fi",
+            timeout=min(timeout, 20),
+            ssh_user=ssh_user,
+        ).strip()
+    except RuntimeError as exc:
+        return {"status": "error", "source": remote_path, "error": str(exc)}
+    if exists != "yes":
+        return {"status": "missing", "source": remote_path}
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    target = f"{ssh_user}@{host}" if ssh_user else host
+    cmd = [
+        "scp",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ConnectTimeout=10",
+        f"{target}:{remote_path}",
+        str(dest),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, check=False, capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"status": "error", "source": remote_path, "error": str(exc)}
+    if proc.returncode != 0:
+        # scp may be blocked; fall back to ssh cat.
+        try:
+            text = read_text_file_remote(
+                host, remote_path, timeout=timeout, ssh_user=ssh_user,
+            )
+        except RuntimeError as exc:
+            err = proc.stderr.strip() or proc.stdout.strip() or str(exc)
+            return {"status": "error", "source": remote_path, "error": err}
+        dest.write_text(text, encoding="utf-8")
+    return {
+        "status": "copied",
+        "source": remote_path,
+        "path": str(dest),
+        "bytes": dest.stat().st_size if dest.exists() else 0,
+    }
+
+
+def collect_client_fuse_logs(
+    *,
+    output_dir: Path,
+    hosts: Optional[List[str]] = None,
+    log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
+    ssh_user: Optional[str] = None,
+    timeout: int = 60,
+    include_local: bool = True,
+) -> Dict[str, Any]:
+    """
+    Copy ceph-fuse-<host>.log from each client when the file exists.
+    Missing logs are skipped (recorded as status=missing).
+    """
+    out_dir = output_dir / CLIENT_FUSE_LOG_DIR
+    host_list: List[str] = []
+    if include_local and not hosts:
+        host_list = ["localhost"]
+    for host in hosts or []:
+        host_list.append(host)
+
+    results: List[Dict[str, Any]] = []
+    for host in host_list:
+        name = client_fuse_log_name(host)
+        remote_path = f"{log_dir.rstrip('/')}/{name}"
+        dest = out_dir / name
+        entry: Dict[str, Any] = {"host": host, "filename": name}
+        if host in ("localhost", "127.0.0.1", "::1"):
+            # Also try the real short hostname used in ceph-fuse-<host>.log.
+            candidates = [Path(remote_path)]
+            try:
+                short = socket.gethostname().split(".")[0]
+                alt = Path(log_dir) / client_fuse_log_name(short)
+                if alt not in candidates:
+                    candidates.append(alt)
+            except OSError:
+                pass
+            copied: Optional[Dict[str, Any]] = None
+            for cand in candidates:
+                copied = copy_client_fuse_log_local(
+                    dest=out_dir / cand.name, remote_path=cand, timeout=timeout,
+                )
+                entry["filename"] = cand.name
+                if copied.get("status") == "copied":
+                    break
+            entry.update(copied or {"status": "missing", "source": remote_path})
+        else:
+            entry.update(
+                copy_client_fuse_log_remote(
+                    dest=dest,
+                    host=host,
+                    remote_path=remote_path,
+                    timeout=timeout,
+                    ssh_user=ssh_user,
+                )
+            )
+        results.append(entry)
+
+    copied_n = sum(1 for r in results if r.get("status") == "copied")
+    summary = {
+        "log_dir": log_dir,
+        "host_count": len(results),
+        "copied": copied_n,
+        "missing": sum(1 for r in results if r.get("status") == "missing"),
+        "errors": sum(1 for r in results if r.get("status") == "error"),
+        "hosts": results,
+        "collected_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    write_json_artifact(output_dir / CLIENT_FUSE_LOG_SUMMARY, summary)
+    return summary
+
+
+def format_client_fuse_log_report(summary: Dict[str, Any]) -> List[str]:
+    lines = ["== Client ceph-fuse logs =="]
+    lines.append(
+        "Hosts={hosts}, copied={copied}, missing={missing}, errors={errors} "
+        "(looked in {log_dir}/ceph-fuse-<host>.log)".format(
+            hosts=summary.get("host_count", 0),
+            copied=summary.get("copied", 0),
+            missing=summary.get("missing", 0),
+            errors=summary.get("errors", 0),
+            log_dir=summary.get("log_dir", CLIENT_FUSE_LOG_DEFAULT_DIR),
+        )
+    )
+    for host in summary.get("hosts") or []:
+        status = host.get("status") or "?"
+        extra = ""
+        if status == "copied":
+            extra = f" -> {host.get('path')} ({host.get('bytes', 0)} bytes)"
+        elif host.get("error"):
+            extra = f": {host.get('error')}"
+        elif host.get("source"):
+            extra = f" ({host.get('source')})"
+        lines.append(f"- {host.get('host')}: {status}{extra}")
+    return lines
+
+
+def append_client_fuse_log_report_section(
+    report_path: Path,
+    summary: Dict[str, Any],
+) -> None:
+    if not report_path.exists():
+        return
+    section = format_client_fuse_log_report(summary)
+    with report_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+        handle.write("\n".join(section))
+        handle.write("\n")
+
+
 def build_log_tail_fallback_window(
     window: LogExtractWindow,
     *,
@@ -2911,6 +3113,7 @@ def collect_from_dir(
     client_hosts: Optional[List[str]] = None,
     client_debugfs_files: Optional[List[str]] = None,
     client_ssh_user: Optional[str] = None,
+    client_fuse_log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
 ) -> None:
     blocked_path = input_dir / "blocked_ops.json"
     locks_path = input_dir / "ops_locks.json"
@@ -3056,6 +3259,18 @@ def collect_from_dir(
         append_client_debugfs_report_section(
             output_dir / "report.txt", debugfs_summary,
         )
+    if client_debugfs or client_hosts:
+        fuse_summary = collect_client_fuse_logs(
+            output_dir=output_dir,
+            hosts=client_hosts,
+            log_dir=client_fuse_log_dir,
+            ssh_user=client_ssh_user,
+            timeout=metrics_timeout,
+            include_local=not client_hosts,
+        )
+        append_client_fuse_log_report_section(
+            output_dir / "report.txt", fuse_summary,
+        )
 
 
 def collect(
@@ -3082,10 +3297,13 @@ def collect(
     client_hosts: Optional[List[str]] = None,
     client_debugfs_files: Optional[List[str]] = None,
     client_ssh_user: Optional[str] = None,
+    client_fuse_log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     collection_errors: Dict[str, str] = {}
-    allow_partial = bool(client_debugfs or grafana_url or prometheus_url)
+    allow_partial = bool(
+        client_debugfs or client_hosts or grafana_url or prometheus_url
+    )
 
     blocked, err = invoke_optional(invoke, ["dump_blocked_ops"])
     if err:
@@ -3272,6 +3490,18 @@ def collect(
         )
         append_client_debugfs_report_section(
             output_dir / "report.txt", debugfs_summary,
+        )
+    if client_debugfs or client_hosts:
+        fuse_summary = collect_client_fuse_logs(
+            output_dir=output_dir,
+            hosts=client_hosts,
+            log_dir=client_fuse_log_dir,
+            ssh_user=client_ssh_user,
+            timeout=metrics_timeout,
+            include_local=not client_hosts,
+        )
+        append_client_fuse_log_report_section(
+            output_dir / "report.txt", fuse_summary,
         )
 
     if collection_errors:
@@ -3464,8 +3694,8 @@ def main() -> int:
         default=[],
         dest="client_hosts",
         help=(
-            "SSH host to scrape client debugfs from (repeatable). "
-            "If omitted with --client-debugfs, scrapes localhost"
+            "SSH host to scrape client debugfs and ceph-fuse-<host>.log from "
+            "(repeatable). If omitted with --client-debugfs, scrapes localhost"
         ),
     )
     parser.add_argument(
@@ -3478,6 +3708,14 @@ def main() -> int:
         help=(
             "Comma-separated debugfs filenames to collect "
             f"(default: {','.join(CLIENT_DEBUGFS_DEFAULT_FILES)})"
+        ),
+    )
+    parser.add_argument(
+        "--client-fuse-log-dir",
+        default=CLIENT_FUSE_LOG_DEFAULT_DIR,
+        help=(
+            "Directory on each client for ceph-fuse-<host>.log "
+            f"(default: {CLIENT_FUSE_LOG_DEFAULT_DIR}). Copied when present."
         ),
     )
     args = parser.parse_args()
@@ -3545,6 +3783,7 @@ def main() -> int:
             "client_hosts": args.client_hosts or None,
             "client_debugfs_files": files or list(CLIENT_DEBUGFS_DEFAULT_FILES),
             "client_ssh_user": args.client_ssh_user,
+            "client_fuse_log_dir": args.client_fuse_log_dir,
         }
 
     if args.from_dir and not (args.mds or args.daemon):
@@ -3571,6 +3810,8 @@ def main() -> int:
         print(f"  revokes:{args.output / 'cap_revokes.json'}")
         if (args.output / CLIENT_DEBUGFS_SUMMARY).exists():
             print(f"  debugfs:{args.output / CLIENT_DEBUGFS_SUMMARY}")
+        if (args.output / CLIENT_FUSE_LOG_SUMMARY).exists():
+            print(f"  fuse logs:{args.output / CLIENT_FUSE_LOG_SUMMARY}")
         maybe_extract_log(args.stall_dir or args.from_dir or args.output)
         return 0
 
@@ -3618,6 +3859,8 @@ def main() -> int:
         print(f"  metrics:{args.output / PROMETHEUS_TIMESERIES_ARTIFACT}")
     if (args.output / CLIENT_DEBUGFS_SUMMARY).exists():
         print(f"  debugfs:{args.output / CLIENT_DEBUGFS_SUMMARY}")
+    if (args.output / CLIENT_FUSE_LOG_SUMMARY).exists():
+        print(f"  fuse logs:{args.output / CLIENT_FUSE_LOG_SUMMARY}")
     maybe_extract_log(args.stall_dir or args.output)
     return 0
 
