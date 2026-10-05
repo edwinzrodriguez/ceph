@@ -2,14 +2,21 @@
 # -*- mode:python; tab-width:4; indent-tabs-mode:nil -*-
 # vim: ts=4 sw=4 expandtab
 #
-# Watch an MDS admin socket and, when the daemon disappears (crash/abort),
-# collect stall diagnostics, a gdb backtrace + reactor queue dump from the
-# newest core, and copies of the MDS log / settings into the stall directory.
+# Distributed crash monitor for MDS + ceph-fuse.
+#
+# Watches the MDS admin socket (local) and ceph-fuse asoks on --client-host
+# peers (via SSH). At watch start, records each process's log path with
+# `config get log_file`. When ANY monitored process dies:
+#   1. `log dump` surviving processes
+#   2. copy all known logs into one stall directory
+#   3. run mds-stall-debug.py for MDS/client diagnostics
+#   4. if the MDS died: gdb the newest core + copy settings
 #
 # Example:
 #   ./mds-crash-monitor.py \
 #       --asok /var/run/ceph/ceph-mds.mds_reactor.mon-000.0.asok \
 #       --output-dir /cephfs_perf/results/my-run \
+#       --client-host client-000 --client-host client-001 \
 #       --crash-dir /crash \
 #       --ceph-mds /home/root/usr/local/wip-mds-hotpath-phase3/bin/ceph-mds
 #
@@ -17,14 +24,16 @@
 from __future__ import annotations
 
 import argparse
-import os
+import importlib.util
+import json
 import shutil
 import subprocess
 import sys
 import time
+import types
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 DEFAULT_CLIENT_HOSTS = [
@@ -42,95 +51,124 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
-def asok_alive(asok: Path, timeout: float) -> bool:
-    """True if the admin socket exists and answers a cheap command."""
-    if not asok.is_socket() and not asok.exists():
-        return False
-    try:
-        proc = subprocess.run(
-            ["ceph", "--admin-daemon", str(asok), "status"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
-    # Any successful JSON/status reply means the daemon is up. Connection /
-    # missing-socket failures return non-zero.
-    return proc.returncode == 0
+def load_stall_debug(stall_debug: Path) -> types.ModuleType:
+    """Import mds-stall-debug.py helpers (hyphenated filename)."""
+    name = "mds_stall_debug_helpers"
+    spec = importlib.util.spec_from_file_location(name, stall_debug)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import {stall_debug}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def wait_until_alive(
-    asok: Path,
+def wait_inventory_alive(
+    sd: types.ModuleType,
+    inventory: List[Dict[str, Any]],
+    *,
     interval: float,
     probe_timeout: float,
+    ssh_user: Optional[str],
 ) -> None:
-    log(f"waiting for MDS asok to become healthy: {asok}")
+    log(f"waiting for {len(inventory)} monitored asok(s) to become healthy")
     while True:
-        if asok_alive(asok, probe_timeout):
-            log("MDS asok is healthy")
+        pending = [
+            p for p in inventory
+            if not sd.probe_monitored_process(p, probe_timeout, ssh_user=ssh_user)
+        ]
+        if not pending:
+            log("all monitored asoks are healthy")
             return
+        names = ", ".join(
+            f"{p.get('role')}:{p.get('host')}" for p in pending[:6]
+        )
+        if len(pending) > 6:
+            names += f", +{len(pending) - 6} more"
+        log(f"still waiting ({len(pending)}): {names}")
         time.sleep(interval)
 
 
-def watch_until_dead(
-    asok: Path,
+def watch_inventory_until_any_dead(
+    sd: types.ModuleType,
+    inventory: List[Dict[str, Any]],
+    *,
     interval: float,
     probe_timeout: float,
     fail_threshold: int,
-) -> float:
+    ssh_user: Optional[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     """
-    Poll until the asok fails ``fail_threshold`` times in a row after having
-    been alive. Returns monotonic time of the first consecutive failure.
+    Poll every monitored process. Return (crashed_proc, meta) when any one
+    fails ``fail_threshold`` consecutive probes.
     """
-    log(f"watching {asok} (interval={interval}s, fail_threshold={fail_threshold})")
-    consecutive_fails = 0
-    first_fail_at: Optional[float] = None
-    while True:
-        if asok_alive(asok, probe_timeout):
-            if consecutive_fails:
-                log("MDS asok recovered; resetting failure streak")
-            consecutive_fails = 0
-            first_fail_at = None
-        else:
-            consecutive_fails += 1
-            if first_fail_at is None:
-                first_fail_at = time.monotonic()
-            log(
-                f"MDS asok probe failed ({consecutive_fails}/{fail_threshold})"
+    threshold = max(1, fail_threshold)
+    log(
+        f"watching {len(inventory)} process(es) "
+        f"(interval={interval}s, fail_threshold={threshold})"
+    )
+    for proc in inventory:
+        log(
+            "  {role} {host} asok={asok} log_file={log} ({src})".format(
+                role=proc.get("role"),
+                host=proc.get("host"),
+                asok=proc.get("asok"),
+                log=proc.get("log_file"),
+                src=proc.get("log_file_source"),
             )
-            if consecutive_fails >= fail_threshold:
-                assert first_fail_at is not None
-                return first_fail_at
+        )
+
+    fails: Dict[str, int] = {p["id"]: 0 for p in inventory}
+    first_fail_at: Dict[str, float] = {}
+
+    while True:
+        for proc in inventory:
+            pid = proc["id"]
+            alive = sd.probe_monitored_process(
+                proc, probe_timeout, ssh_user=ssh_user,
+            )
+            if alive:
+                if fails[pid]:
+                    log(f"{pid} recovered; resetting failure streak")
+                fails[pid] = 0
+                first_fail_at.pop(pid, None)
+                continue
+
+            fails[pid] += 1
+            if pid not in first_fail_at:
+                first_fail_at[pid] = time.monotonic()
+            log(f"{pid} probe failed ({fails[pid]}/{threshold})")
+            if fails[pid] >= threshold:
+                meta = {
+                    "first_fail_monotonic": first_fail_at[pid],
+                    "detected_at": datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                    "crashed_id": pid,
+                }
+                return proc, meta
         time.sleep(interval)
-
-
-def derive_mds_log(asok: Path, log_dir: Path) -> Path:
-    # ceph-mds.mds_reactor.mon-000.0.asok -> ceph-mds.mds_reactor.mon-000.0.log
-    return log_dir / f"{asok.name.removesuffix('.asok')}.log"
 
 
 def run_stall_debug(
     *,
-    cwd: Path,
+    stall_dir: Path,
     stall_debug: Path,
-    asok: Path,
+    mds_asok: Path,
     client_hosts: Sequence[str],
     grafana_url: str,
     metrics_step: str,
     extra_args: Sequence[str],
-) -> Path:
-    """
-    Run mds-stall-debug.py with cwd=output-dir so it creates
-    mds-stall-<name>-<ts> underneath. Returns that directory.
-    """
-    before = {p.resolve() for p in cwd.glob("mds-stall-*") if p.is_dir()}
+    ssh_user: Optional[str] = None,
+) -> None:
+    """Run mds-stall-debug.py into an existing stall directory."""
     cmd: List[str] = [
         sys.executable,
         str(stall_debug),
         "--daemon",
-        str(asok),
+        str(mds_asok),
+        "--output",
+        str(stall_dir),
         "--client-debugfs",
         "--grafana-url",
         grafana_url,
@@ -139,28 +177,16 @@ def run_stall_debug(
     ]
     for host in client_hosts:
         cmd.extend(["--client-host", host])
+    if ssh_user:
+        cmd.extend(["--client-ssh-user", ssh_user])
     cmd.extend(extra_args)
 
-    log(f"running stall debug in {cwd}: {' '.join(cmd)}")
+    log(f"running stall debug: {' '.join(cmd)}")
     # Stall-debug may fail parts of live asok collection after a crash; still
-    # keep going so we can attach gdb / copy logs into whatever dir it made.
-    proc = subprocess.run(cmd, cwd=str(cwd), check=False)
+    # keep going so we can attach gdb / keep log captures already written.
+    proc = subprocess.run(cmd, check=False)
     if proc.returncode != 0:
         log(f"warning: mds-stall-debug.py exited {proc.returncode}")
-
-    after = [p for p in cwd.glob("mds-stall-*") if p.is_dir()]
-    created = [p for p in after if p.resolve() not in before]
-    candidates = created if created else after
-    if not candidates:
-        # Fallback: create a capture dir ourselves so gdb/log still land somewhere.
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        fallback = cwd / f"mds-stall-{asok.name}-{ts}"
-        fallback.mkdir(parents=True, exist_ok=True)
-        log(f"no stall dir created; using fallback {fallback}")
-        return fallback
-    newest = max(candidates, key=lambda p: p.stat().st_mtime)
-    log(f"stall directory: {newest}")
-    return newest
 
 
 def looks_like_core(path: Path) -> bool:
@@ -171,12 +197,10 @@ def looks_like_core(path: Path) -> bool:
         return False
     if name in {"README", "README.txt"}:
         return False
-    # Common layouts: bare "core", core.<pid>, core-ceph-mds-*, abrt dumps, etc.
     if name == "core" or name.startswith("core.") or name.startswith("core-"):
         return True
     if "coredump" in name.lower() or name.endswith(".core"):
         return True
-    # ELF note: cheap magic check
     try:
         with path.open("rb") as f:
             magic = f.read(4)
@@ -192,21 +216,15 @@ def find_newest_core(
     wait_s: float,
     poll_s: float,
 ) -> Optional[Path]:
-    """
-    Return the newest core under crash_dir. If ``not_before`` (epoch seconds)
-    is set, prefer cores with mtime >= that; wait up to ``wait_s`` for one.
-    """
     if not crash_dir.is_dir():
         log(f"warning: crash dir does not exist: {crash_dir}")
         return None
 
     deadline = time.monotonic() + wait_s
-    best: Optional[Path] = None
     while True:
         cores = [p for p in crash_dir.rglob("*") if looks_like_core(p)]
         if not_before is not None:
-            fresh = [p for p in cores if p.stat().st_mtime >= not_before]
-            pool = fresh if fresh else []
+            pool = [p for p in cores if p.stat().st_mtime >= not_before]
         else:
             pool = cores
         if pool:
@@ -217,7 +235,6 @@ def find_newest_core(
             break
         time.sleep(poll_s)
 
-    # Fall back to absolute newest core even if older than crash detection.
     cores = [p for p in crash_dir.rglob("*") if looks_like_core(p)]
     if not cores:
         log(f"no core files found under {crash_dir}")
@@ -263,46 +280,36 @@ def run_gdb_capture(
     return out
 
 
-def copy_artifacts(
-    stall_dir: Path,
-    *,
-    mds_log: Optional[Path],
-    settings: Optional[Path],
-) -> None:
-    if mds_log is not None:
-        if mds_log.is_file():
-            dest = stall_dir / mds_log.name
-            log(f"copying {mds_log} -> {dest}")
-            shutil.copy2(mds_log, dest)
-        else:
-            log(f"warning: MDS log not found: {mds_log}")
-    if settings is not None:
-        if settings.is_file():
-            dest = stall_dir / settings.name
-            log(f"copying {settings} -> {dest}")
-            shutil.copy2(settings, dest)
-        else:
-            log(f"warning: settings file not found: {settings}")
+def copy_settings(stall_dir: Path, settings: Optional[Path]) -> None:
+    if settings is None:
+        return
+    if settings.is_file():
+        dest = stall_dir / settings.name
+        log(f"copying {settings} -> {dest}")
+        shutil.copy2(settings, dest)
+    else:
+        log(f"warning: settings file not found: {settings}")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Monitor an MDS admin socket and collect stall-debug + gdb "
-            "artifacts when the daemon crashes/aborts."
+            "Distributed monitor for MDS + ceph-fuse asoks. When any monitored "
+            "process crashes, dump survivor logs, collect them, and run "
+            "mds-stall-debug.py (plus gdb if the MDS died)."
         ),
     )
     p.add_argument(
         "--asok",
         type=Path,
         required=True,
-        help="MDS admin socket path to watch",
+        help="MDS admin socket path to watch (local)",
     )
     p.add_argument(
         "--output-dir",
         type=Path,
         required=True,
-        help="Directory in which mds-stall-debug.py creates its stall folder",
+        help="Directory in which the stall capture folder is created",
     )
     p.add_argument(
         "--crash-dir",
@@ -337,14 +344,22 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--mds-log",
         type=Path,
         default=None,
-        help="MDS log to copy into the stall dir "
-        "(default: /var/log/ceph/<asok-basename>.log)",
+        help="Optional MDS log path override "
+        "(default: asok `config get log_file`, else "
+        "/var/log/ceph/<asok-basename>.log)",
     )
     p.add_argument(
         "--log-dir",
         type=Path,
         default=Path("/var/log/ceph"),
-        help="Directory used when deriving --mds-log from the asok name",
+        help="Fallback directory when deriving MDS/fuse log names",
+    )
+    p.add_argument(
+        "--fuse-asok-dir",
+        type=Path,
+        default=Path("/var/run/ceph"),
+        help="Directory for ceph-fuse-<host>.asok on clients "
+        "(default: /var/run/ceph)",
     )
     p.add_argument(
         "--mds-settings",
@@ -356,8 +371,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--client-host",
         action="append",
         default=None,
-        help="Client host for --client-debugfs (repeatable; "
+        help="Client host whose ceph-fuse asok is monitored (repeatable; "
         f"default: {', '.join(DEFAULT_CLIENT_HOSTS)})",
+    )
+    p.add_argument(
+        "--client-ssh-user",
+        help="SSH username for probing/copying from --client-host",
+    )
+    p.add_argument(
+        "--no-fuse-watch",
+        action="store_true",
+        help="Only watch the MDS asok (legacy single-process mode)",
     )
     p.add_argument(
         "--grafana-url",
@@ -385,18 +409,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--fail-threshold",
         type=int,
         default=2,
-        help="Consecutive failed probes before treating MDS as crashed (default: 2)",
+        help="Consecutive failed probes before treating a process as crashed "
+        "(default: 2)",
     )
     p.add_argument(
         "--core-wait",
         type=float,
         default=30.0,
-        help="Seconds to wait for a fresh core after crash detection (default: 30)",
+        help="Seconds to wait for a fresh core after MDS crash (default: 30)",
     )
     p.add_argument(
         "--no-wait-alive",
         action="store_true",
-        help="Do not wait for the asok to be healthy before watching",
+        help="Do not wait for monitored asoks to be healthy before watching",
+    )
+    p.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        help="Timeout for log dump / log copy operations (default: 120)",
     )
     p.add_argument(
         "--stall-debug-arg",
@@ -415,13 +446,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     stall_debug: Path = args.stall_debug.expanduser()
     gdb_macro: Path = args.gdb_macro.expanduser()
     ceph_mds: Path = args.ceph_mds.expanduser()
-    mds_log = (
-        args.mds_log.expanduser()
-        if args.mds_log is not None
-        else derive_mds_log(asok, args.log_dir.expanduser())
+    mds_log_override = (
+        str(args.mds_log.expanduser()) if args.mds_log is not None else None
     )
     settings = args.mds_settings.expanduser() if args.mds_settings else None
     client_hosts = args.client_host if args.client_host else list(DEFAULT_CLIENT_HOSTS)
+    ssh_user = args.client_ssh_user
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -434,53 +464,111 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not gdb_macro.is_file():
         log(f"warning: gdb macro not found (gdb source may fail): {gdb_macro}")
 
-    if not args.no_wait_alive:
-        wait_until_alive(asok, args.interval, args.probe_timeout)
+    try:
+        sd = load_stall_debug(stall_debug)
+    except Exception as exc:  # noqa: BLE001 - surface import errors clearly
+        log(f"error: failed to import helpers from {stall_debug}: {exc}")
+        return 2
 
-    # Record wall time just before watch so we can prefer cores written after.
-    watch_started_wall = time.time()
-    watch_until_dead(
-        asok,
-        args.interval,
-        args.probe_timeout,
-        max(1, args.fail_threshold),
+    inventory = sd.build_cluster_watch_inventory(
+        mds_asok=str(asok),
+        mds_host=None,  # local MDS
+        mds_log=mds_log_override,
+        client_hosts=None if args.no_fuse_watch else client_hosts,
+        asok_dir=str(args.fuse_asok_dir.expanduser()),
+        client_fuse_log_dir=str(args.log_dir.expanduser()),
+        ssh_user=ssh_user,
+        timeout=min(args.timeout, 30),
+        include_local_fuse=False,
     )
-    log("MDS appears down; collecting crash artifacts")
+    if not inventory:
+        log("error: empty watch inventory")
+        return 2
 
-    # Prefer cores written around/after we started watching (minus a small
-    # skew), not ancient dumps left in the crash dir.
-    not_before = watch_started_wall - 5.0
+    inv_path = output_dir / "cluster_watch_inventory.json"
+    inv_path.write_text(json.dumps(inventory, indent=2) + "\n", encoding="utf-8")
+    log(f"wrote inventory: {inv_path}")
 
-    stall_dir = run_stall_debug(
-        cwd=output_dir,
+    if not args.no_wait_alive:
+        wait_inventory_alive(
+            sd,
+            inventory,
+            interval=args.interval,
+            probe_timeout=args.probe_timeout,
+            ssh_user=ssh_user,
+        )
+
+    watch_started_wall = time.time()
+    crashed, meta = watch_inventory_until_any_dead(
+        sd,
+        inventory,
+        interval=args.interval,
+        probe_timeout=args.probe_timeout,
+        fail_threshold=args.fail_threshold,
+        ssh_user=ssh_user,
+    )
+    crashed_role = str(crashed.get("role") or "unknown")
+    crashed_asok = str(crashed.get("asok") or "")
+    log(
+        f"{crashed_role} appears down ({crashed.get('id')}); "
+        "dumping survivors and collecting artifacts"
+    )
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stall_dir = output_dir / f"mds-stall-{crashed_role}-{ts}"
+    stall_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Dump survivors + copy all logs (fast path before stall-debug).
+    sd.collect_on_monitored_abort(
+        output_dir=stall_dir,
+        crashed_asok=crashed_asok,
+        crashed_role=crashed_role,
+        inventory=inventory,
+        ssh_user=ssh_user,
+        timeout=args.timeout,
+        watch_meta=meta,
+        event=f"{crashed_role}-abort",
+    )
+
+    # 2) Stall diagnostics (MDS asok may be dead; best-effort).
+    run_stall_debug(
+        stall_dir=stall_dir,
         stall_debug=stall_debug,
-        asok=asok,
+        mds_asok=asok,
         client_hosts=client_hosts,
         grafana_url=args.grafana_url,
         metrics_step=args.metrics_step,
         extra_args=args.stall_debug_arg,
+        ssh_user=ssh_user,
     )
 
-    core = find_newest_core(
-        crash_dir,
-        not_before=not_before,
-        wait_s=args.core_wait,
-        poll_s=1.0,
-    )
-    if core is not None:
-        run_gdb_capture(
-            stall_dir=stall_dir,
-            ceph_mds=ceph_mds,
-            core=core,
-            gdb_macro=gdb_macro,
-            gdb_bin=args.gdb,
+    # 3) MDS-only: gdb core + settings.
+    if crashed_role == "mds":
+        not_before = watch_started_wall - 5.0
+        core = find_newest_core(
+            crash_dir,
+            not_before=not_before,
+            wait_s=args.core_wait,
+            poll_s=1.0,
         )
-        # Also record which core we used.
-        (stall_dir / "core_path.txt").write_text(str(core.resolve()) + "\n", encoding="utf-8")
+        if core is not None:
+            run_gdb_capture(
+                stall_dir=stall_dir,
+                ceph_mds=ceph_mds,
+                core=core,
+                gdb_macro=gdb_macro,
+                gdb_bin=args.gdb,
+            )
+            (stall_dir / "core_path.txt").write_text(
+                str(core.resolve()) + "\n", encoding="utf-8",
+            )
+        else:
+            log("skipping gdb capture (no core)")
+        copy_settings(stall_dir, settings)
     else:
-        log("skipping gdb capture (no core)")
+        log(f"skipping gdb (crash was {crashed_role}, not mds)")
+        copy_settings(stall_dir, settings)
 
-    copy_artifacts(stall_dir, mds_log=mds_log, settings=settings)
     log(f"done: artifacts in {stall_dir}")
     return 0
 
