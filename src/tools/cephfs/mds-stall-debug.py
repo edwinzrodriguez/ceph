@@ -952,6 +952,7 @@ CLIENT_DEBUGFS_DEFAULT_FILES = ("mdsc", "mds_sessions", "osdc", "caps")
 CLIENT_FUSE_LOG_DIR = "client_logs"
 CLIENT_FUSE_LOG_SUMMARY = "client_fuse_logs.json"
 CLIENT_FUSE_LOG_DEFAULT_DIR = "/var/log/ceph"
+CLIENT_FUSE_ASOK_DEFAULT_DIR = "/var/run/ceph"
 CLIENT_DEBUGFS_DIR_RE = re.compile(
     r"^(?P<fsid>[0-9a-fA-F-]{36})\.client(?P<client_id>\d+)$"
 )
@@ -2486,9 +2487,94 @@ def append_client_debugfs_report_section(
         handle.write("\n")
 
 
+def client_fuse_host_label(host: str) -> str:
+    return sanitize_host_label(host.split(".")[0] if host else "host")
+
+
 def client_fuse_log_name(host: str) -> str:
-    label = sanitize_host_label(host.split(".")[0] if host else "host")
-    return f"ceph-fuse-{label}.log"
+    return f"ceph-fuse-{client_fuse_host_label(host)}.log"
+
+
+def client_fuse_asok_name(host: str) -> str:
+    return f"ceph-fuse-{client_fuse_host_label(host)}.asok"
+
+
+def client_fuse_asok_path(
+    host: str,
+    asok_dir: str = CLIENT_FUSE_ASOK_DEFAULT_DIR,
+) -> str:
+    return f"{asok_dir.rstrip('/')}/{client_fuse_asok_name(host)}"
+
+
+def dump_client_fuse_log_local(
+    *,
+    asok_path: Path,
+    timeout: int,
+) -> Dict[str, Any]:
+    """
+    Best-effort: dump in-memory ceph-fuse log buffer via asok before copy.
+    """
+    info: Dict[str, Any] = {"asok": str(asok_path)}
+    try:
+        if not asok_path.exists():
+            info["status"] = "missing"
+            return info
+    except OSError as exc:
+        info["status"] = "error"
+        info["error"] = str(exc)
+        return info
+
+    cmd = ["ceph", "--admin-daemon", str(asok_path), "log", "dump"]
+    try:
+        proc = subprocess.run(
+            cmd, check=False, capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        info["status"] = "error"
+        info["error"] = str(exc)
+        return info
+    if proc.returncode != 0:
+        err = proc.stderr.strip() or proc.stdout.strip() or "log dump failed"
+        info["status"] = "error"
+        info["error"] = err
+        return info
+    info["status"] = "dumped"
+    return info
+
+
+def dump_client_fuse_log_remote(
+    *,
+    host: str,
+    asok_path: str,
+    timeout: int,
+    ssh_user: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Best-effort: dump in-memory ceph-fuse log buffer via asok before copy.
+    """
+    info: Dict[str, Any] = {"asok": asok_path}
+    quoted = asok_path.replace("'", "'\"'\"'")
+    script = (
+        f"if [ -S '{quoted}' ] || [ -e '{quoted}' ]; then "
+        f"ceph --admin-daemon '{quoted}' log dump; "
+        f"else echo '__ASOK_MISSING__'; exit 0; fi"
+    )
+    try:
+        out = ssh_run(
+            host,
+            script,
+            timeout=min(timeout, 30),
+            ssh_user=ssh_user,
+        )
+    except RuntimeError as exc:
+        info["status"] = "error"
+        info["error"] = str(exc)
+        return info
+    if "__ASOK_MISSING__" in out:
+        info["status"] = "missing"
+        return info
+    info["status"] = "dumped"
+    return info
 
 
 def copy_client_fuse_log_local(
@@ -2578,13 +2664,17 @@ def collect_client_fuse_logs(
     output_dir: Path,
     hosts: Optional[List[str]] = None,
     log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
+    asok_dir: str = CLIENT_FUSE_ASOK_DEFAULT_DIR,
     ssh_user: Optional[str] = None,
     timeout: int = 60,
     include_local: bool = True,
 ) -> Dict[str, Any]:
     """
     Copy ceph-fuse-<host>.log from each client when the file exists.
-    Missing logs are skipped (recorded as status=missing).
+
+    Before copying, if /var/run/ceph/ceph-fuse-<host>.asok exists, run
+    `ceph --admin-daemon <asok> log dump` so recent in-memory log entries
+    are flushed into the log file first. Missing logs/asoks are skipped.
     """
     out_dir = output_dir / CLIENT_FUSE_LOG_DIR
     host_list: List[str] = []
@@ -2601,16 +2691,31 @@ def collect_client_fuse_logs(
         entry: Dict[str, Any] = {"host": host, "filename": name}
         if host in ("localhost", "127.0.0.1", "::1"):
             # Also try the real short hostname used in ceph-fuse-<host>.log.
-            candidates = [Path(remote_path)]
+            log_candidates = [Path(remote_path)]
+            asok_labels = [client_fuse_host_label(host)]
             try:
                 short = socket.gethostname().split(".")[0]
                 alt = Path(log_dir) / client_fuse_log_name(short)
-                if alt not in candidates:
-                    candidates.append(alt)
+                if alt not in log_candidates:
+                    log_candidates.append(alt)
+                short_label = client_fuse_host_label(short)
+                if short_label not in asok_labels:
+                    asok_labels.append(short_label)
             except OSError:
                 pass
+
+            dump_info: Optional[Dict[str, Any]] = None
+            for label in asok_labels:
+                dump_info = dump_client_fuse_log_local(
+                    asok_path=Path(asok_dir) / f"ceph-fuse-{label}.asok",
+                    timeout=min(timeout, 30),
+                )
+                if dump_info.get("status") == "dumped":
+                    break
+            entry["log_dump"] = dump_info or {"status": "missing"}
+
             copied: Optional[Dict[str, Any]] = None
-            for cand in candidates:
+            for cand in log_candidates:
                 copied = copy_client_fuse_log_local(
                     dest=out_dir / cand.name, remote_path=cand, timeout=timeout,
                 )
@@ -2619,6 +2724,12 @@ def collect_client_fuse_logs(
                     break
             entry.update(copied or {"status": "missing", "source": remote_path})
         else:
+            entry["log_dump"] = dump_client_fuse_log_remote(
+                host=host,
+                asok_path=client_fuse_asok_path(host, asok_dir),
+                timeout=timeout,
+                ssh_user=ssh_user,
+            )
             entry.update(
                 copy_client_fuse_log_remote(
                     dest=dest,
@@ -2631,10 +2742,16 @@ def collect_client_fuse_logs(
         results.append(entry)
 
     copied_n = sum(1 for r in results if r.get("status") == "copied")
+    dumped_n = sum(
+        1 for r in results
+        if (r.get("log_dump") or {}).get("status") == "dumped"
+    )
     summary = {
         "log_dir": log_dir,
+        "asok_dir": asok_dir,
         "host_count": len(results),
         "copied": copied_n,
+        "log_dumped": dumped_n,
         "missing": sum(1 for r in results if r.get("status") == "missing"),
         "errors": sum(1 for r in results if r.get("status") == "error"),
         "hosts": results,
@@ -2647,13 +2764,17 @@ def collect_client_fuse_logs(
 def format_client_fuse_log_report(summary: Dict[str, Any]) -> List[str]:
     lines = ["== Client ceph-fuse logs =="]
     lines.append(
-        "Hosts={hosts}, copied={copied}, missing={missing}, errors={errors} "
-        "(looked in {log_dir}/ceph-fuse-<host>.log)".format(
+        "Hosts={hosts}, copied={copied}, log_dumped={dumped}, "
+        "missing={missing}, errors={errors} "
+        "(looked in {log_dir}/ceph-fuse-<host>.log; "
+        "asok log dump via {asok_dir}/ceph-fuse-<host>.asok)".format(
             hosts=summary.get("host_count", 0),
             copied=summary.get("copied", 0),
+            dumped=summary.get("log_dumped", 0),
             missing=summary.get("missing", 0),
             errors=summary.get("errors", 0),
             log_dir=summary.get("log_dir", CLIENT_FUSE_LOG_DEFAULT_DIR),
+            asok_dir=summary.get("asok_dir", CLIENT_FUSE_ASOK_DEFAULT_DIR),
         )
     )
     for host in summary.get("hosts") or []:
@@ -2665,6 +2786,13 @@ def format_client_fuse_log_report(summary: Dict[str, Any]) -> List[str]:
             extra = f": {host.get('error')}"
         elif host.get("source"):
             extra = f" ({host.get('source')})"
+        dump = host.get("log_dump") or {}
+        dump_status = dump.get("status")
+        if dump_status and dump_status != "missing":
+            dump_extra = f", log_dump={dump_status}"
+            if dump_status == "error" and dump.get("error"):
+                dump_extra += f" ({dump.get('error')})"
+            extra += dump_extra
         lines.append(f"- {host.get('host')}: {status}{extra}")
     return lines
 
