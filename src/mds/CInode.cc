@@ -4259,8 +4259,8 @@ CInode::encode_inodestat(
       }
       issue = cap->pending();
       dout(10) << "encode_inodestat issuing " << ccap_string(issue)
-               << " cap_id " << cap->get_cap_id()
-               << " seq " << cap->get_last_seq() << dendl;
+               << " cap_id " << cap->get_cap_id() << " seq "
+               << cap->get_last_seq() << dendl;
     } else if (cap && cap->is_new() && !dir_realm) {
       // alway issue new caps to client, otherwise the caps get lost
       ceph_assert(cap->is_stale());
@@ -4269,8 +4269,8 @@ CInode::encode_inodestat(
       cap->issue_norevoke(issue, true);
       cap_mutated = true;
       dout(10) << "encode_inodestat issuing " << ccap_string(issue)
-               << " cap_id " << cap->get_cap_id()
-               << " seq " << cap->get_last_seq() << "(stale&new caps)" << dendl;
+               << " cap_id " << cap->get_cap_id() << " seq "
+               << cap->get_last_seq() << "(stale&new caps)" << dendl;
     }
 
     if (issue) {
@@ -4296,10 +4296,9 @@ CInode::encode_inodestat(
     }
   }
   ecap.flags = is_auth() ? CEPH_CAP_FLAG_AUTH : 0;
-  dout(10) << "encode_inodestat caps " << ccap_string(ecap.caps)
-	   << " cap_id " << ecap.cap_id
-	   << " seq " << ecap.seq << " mseq " << ecap.mseq
-	   << " xattrv " << xattr_version << dendl;
+  dout(10) << "encode_inodestat caps " << ccap_string(ecap.caps) << " cap_id "
+           << ecap.cap_id << " seq " << ecap.seq << " mseq " << ecap.mseq
+           << " xattrv " << xattr_version << dendl;
 
   if (!readdir_partial_fast && inline_data.length() && cap) {
     if ((cap->pending() | getattr_caps) & CEPH_CAP_FILE_SHARED) {
