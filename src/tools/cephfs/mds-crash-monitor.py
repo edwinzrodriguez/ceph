@@ -7,18 +7,22 @@
 # Always watches the local MDS admin socket. With --watch-fuse, also watches
 # ceph-fuse asoks on --client-host peers (via SSH). Kernel ceph mounts do not
 # need --watch-fuse; pass --client-host so mds-stall-debug.py can still collect
-# client debugfs. At watch start, records each process's log path with
-# `config get log_file`. When ANY monitored process dies:
+# client debugfs. With --collect-kernel-logs, also grabs ceph/libceph/rbd
+# dmesg + journalctl lines (and dynamic_debug control) from each client.
+# At watch start, records each process's log path with `config get log_file`.
+# When ANY monitored process dies:
 #   1. `log dump` surviving processes
 #   2. copy all known logs into one stall directory
-#   3. run mds-stall-debug.py for MDS/client diagnostics
-#   4. if the MDS died: gdb the newest core + copy settings
+#   3. optional: collect kernel ceph/libceph/rbd logs from clients
+#   4. run mds-stall-debug.py for MDS/client diagnostics
+#   5. if the MDS died: gdb the newest core + copy settings
 #
 # Example (kernel clients):
 #   ./mds-crash-monitor.py \
 #       --asok /var/run/ceph/ceph-mds.mds_reactor.mon-000.0.asok \
 #       --output-dir /cephfs_perf/results/my-run \
 #       --client-host client-000 --client-host client-001 \
+#       --collect-kernel-logs \
 #       --crash-dir /crash \
 #       --ceph-mds /home/root/usr/local/wip-mds-hotpath-phase3/bin/ceph-mds
 #
@@ -304,7 +308,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "When any monitored process crashes, dump survivor logs, collect "
             "them, and run mds-stall-debug.py (plus gdb if the MDS died). "
             "Kernel ceph mounts work without --watch-fuse; use --client-host "
-            "so stall-debug can collect client debugfs."
+            "so stall-debug can collect client debugfs, and "
+            "--collect-kernel-logs for ceph/libceph/rbd dmesg lines."
         ),
     )
     p.add_argument(
@@ -398,6 +403,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--no-fuse-watch",
         action="store_true",
         help=argparse.SUPPRESS,  # legacy alias; fuse watch is off by default
+    )
+    p.add_argument(
+        "--collect-kernel-logs",
+        action="store_true",
+        help=(
+            "After a crash, collect kernel ceph / libceph / rbd logs from each "
+            "--client-host (dmesg + journalctl -k filtered lines, and matching "
+            "dynamic_debug/control entries). Intended for kernel mounts with "
+            "kcon_all.sh-style dynamic debug enabled."
+        ),
     )
     p.add_argument(
         "--grafana-url",
@@ -559,6 +574,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         event=f"{crashed_role}-abort",
     )
 
+    # 1b) Kernel client logs ASAP (ring buffer can wrap during stall-debug).
+    klog_summary: Optional[Dict[str, Any]] = None
+    if args.collect_kernel_logs:
+        log(
+            f"collecting kernel ceph/libceph/rbd logs from "
+            f"{len(client_hosts)} client host(s)"
+        )
+        try:
+            klog_summary = sd.collect_client_kernel_logs(
+                output_dir=stall_dir,
+                hosts=list(client_hosts),
+                ssh_user=ssh_user,
+                timeout=args.timeout,
+                include_local=False,
+            )
+            log(
+                "kernel logs: copied={copied} empty={empty} errors={errors}".format(
+                    copied=klog_summary.get("copied", 0),
+                    empty=klog_summary.get("empty", 0),
+                    errors=klog_summary.get("errors", 0),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            log(f"warning: kernel log collection failed: {exc}")
+
     # 2) Stall diagnostics (MDS asok may be dead; best-effort).
     run_stall_debug(
         stall_dir=stall_dir,
@@ -570,6 +610,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         extra_args=args.stall_debug_arg,
         ssh_user=ssh_user,
     )
+
+    if klog_summary is not None:
+        try:
+            sd.append_client_kernel_log_report_section(
+                stall_dir / "report.txt", klog_summary,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            log(f"warning: failed to append kernel log report: {exc}")
 
     # 3) MDS-only: gdb core + settings.
     if crashed_role == "mds":
