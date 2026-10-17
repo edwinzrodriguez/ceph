@@ -145,6 +145,9 @@ public:
   void push_waitfor_caps_waiter(Inode *in, Context *c);
   void remove_context_waiter(std::vector<Context*>& ls, Context *c);
 
+  // Mutex wait_on_context_cond waits on; pass to C_ReentrantCond as wait_mutex.
+  ReentrantLock& get_caps_lock() { return caps_lock; }
+
 private:
   Client *client;
   CephContext *cct;
