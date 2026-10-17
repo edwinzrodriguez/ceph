@@ -5373,7 +5373,8 @@ void Client::wait_sync_caps(Inode *in, ceph_tid_t want)
     std::atomic<bool> done{false};
     std::atomic<bool> wake_complete{false};
     int wr = 0;
-    Context *ctx = new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete);
+    Context *ctx = new ceph::C_ReentrantCond(
+      cond, &done, &wr, &wake_complete, &client_caps->get_caps_lock());
     // Register under caps_lock while inode_lock is held: handle_cap_flush_ack
     // can signal waitfor_caps as soon as the MDS ack arrives.
     client_caps->push_waitfor_caps_waiter(in, ctx);
@@ -5574,7 +5575,8 @@ void Client::wait_on_context_list(std::vector<Context*>& ls)
   int r;
   {
     std::unique_lock<Client> l{*this};
-    ls.push_back(new ceph::C_ReentrantCond(cond, &done, &r, &wake_complete));
+    ls.push_back(new ceph::C_ReentrantCond(
+      cond, &done, &r, &wake_complete, &client_caps->get_caps_lock()));
   }
   // Wait without client_lock so ms_dispatch can take it in handle_client_reply
   // to signal this list (finish_contexts -> C_ReentrantCond::finish).
@@ -15373,7 +15375,8 @@ int Client::_fsync_with_slot_held(Inode *in, bool syncdataonly)
     if (unsafe_req->unsafe_item.is_on_list()) {
       unsafe_req->waitfor_safe.push_back(
 	new ceph::C_ReentrantCond(unsafe_cond, &unsafe_done, &unsafe_wr,
-				  &unsafe_wake_complete));
+				  &unsafe_wake_complete,
+				  &client_caps->get_caps_lock()));
       wait_for_unsafe = true;
     }
   }
@@ -15408,7 +15411,8 @@ int Client::_fsync_with_slot_held(Inode *in, bool syncdataonly)
     std::atomic<bool> done{false};
     std::atomic<bool> wake_complete{false};
     int wr = 0;
-    Context *ctx = new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete);
+    Context *ctx = new ceph::C_ReentrantCond(
+      cond, &done, &wr, &wake_complete, &client_caps->get_caps_lock());
     // One persistent waiter per fsync: per-iteration stack conds were left on
     // waitfor_commit after continue and corrupted the next iteration's done.
     client_caps->push_waitfor_fsync_commit_waiter(in, ctx);

@@ -337,7 +337,9 @@ int ClientCaps::get_caps(Fh *fh, int need, int want, int *phave, loff_t endoff)
       // waiter stuck with done=false even after max_size is granted.
       {
 	std::scoped_lock l{caps_lock};
-	wait_list.push_back(new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete));
+	wait_list.push_back(
+	  new ceph::C_ReentrantCond(cond, &done, &wr, &wake_complete,
+				    &caps_lock));
       }
       if (waitfor_caps) {
 	// We may have already sent a max_size request (requested_max_size ==
@@ -961,7 +963,8 @@ void ClientCaps::wait_on_context_list(std::vector<Context*>& ls)
   int r;
   {
     std::scoped_lock l{caps_lock};
-    ls.push_back(new ceph::C_ReentrantCond(cond, &done, &r, &wake_complete));
+    ls.push_back(new ceph::C_ReentrantCond(cond, &done, &r, &wake_complete,
+					   &caps_lock));
   }
   wait_on_context_cond(cond, done, wake_complete);
 }
