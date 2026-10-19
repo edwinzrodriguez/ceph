@@ -852,6 +852,9 @@ bench_write_worker(
         write_error = true;
         break;
       } else {
+        if (config.measure_latencies) {
+          stats.clat.add_sample(mono_ns_now() - t0);
+        }
         written += rc;
         stats.bytes_transferred += rc;
         stats.ops++;
