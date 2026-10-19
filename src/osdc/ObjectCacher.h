@@ -391,8 +391,12 @@ class ObjectCacher {
 
 
   struct ObjectSet {
-    mutable ceph::mutex oset_lock = ceph::make_mutex("ObjectSet::oset_lock");
-    // mutable ceph::ReentrantLock oset_lock = ceph::make_reentrant("ObjectSet::oset_lock", false); // disable deadlock detection
+    // Reentrant: close_object / ~Object and ObjectCacher helpers (set_is_empty,
+    // for_each_object*) can nest while the same thread already holds oset_lock.
+    // A non-recursive ERRORCHECK mutex aborts with std::system_error (EDEADLK)
+    // on that path (e.g. handle_cap_grant -> get_caps_used -> set_is_empty).
+    mutable ceph::ReentrantLock oset_lock =
+      ceph::make_reentrant("ObjectSet::oset_lock");
 
     void * const parent;
 
