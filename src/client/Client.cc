@@ -4499,7 +4499,19 @@ void Client::_put_inode(Inode *in, int n)
     while (in->get_nref() > 1)
       in->iput(1);
     if (in->get_nref() == 1) {
-      in_lock.unlock();
+      // pthread_mutex_destroy requires an unlocked mutex. Teardown helpers
+      // (caps_issued, snaprealm unlink, get/put_open_ref) may nest inode_lock
+      // so a single unique_lock::unlock() can leave recursion_count > 0 and
+      // ~Inode aborts with EBUSY. Drop every level this thread holds, detach
+      // the guard so it will not touch the freed mutex, and do not restore.
+      {
+        ceph::unique_unlock<Inode> drop(*in, std::defer_lock);
+        if (in->is_locked_by_me())
+          drop.release();
+        in_lock.release();
+        drop._abandon();
+      }
+      ceph_assert(!in->is_locked_by_me());
       in->iput();
     } else if (in->get_nref() == 0) {
       in_lock.unlock();
@@ -6655,7 +6667,9 @@ void Client::_try_to_trim_inode(Inode *in, bool sched_inval)
 {
   if (!in || _inode_is_deleting(in))
     return;
-  if (ceph::client_lock::order::any_inode_lock_held() && !in->is_locked_by_me())
+  // Dentry teardown needs client_lock; never nest that under any inode_lock
+  // (lock_order.h: client_lock and inode_lock must not overlap).
+  if (ceph::client_lock::order::any_inode_lock_held())
     return;
 
   {
@@ -6668,17 +6682,16 @@ void Client::_try_to_trim_inode(Inode *in, bool sched_inval)
   if (pin->get_nref() == 0)
     return;
 
-  // inode_lock work must not run under client_lock (handle_caps, put_request).
-  ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
-  if (is_locked_by_me())
-    cl_drop.release();
-
-  int ref = pin->get_nref();
+  // Inode::print (caps_issued) needs inode_lock; drop client_lock first.
   {
+    ceph::unique_unlock<Client> cl_drop(*this, std::defer_lock);
+    if (is_locked_by_me())
+      cl_drop.release();
     std::unique_lock in_lock(*pin);
     ldout(cct, 5) << __func__ << " in " << *pin << dendl;
   }
 
+  int ref = pin->get_nref();
   std::vector<std::string> to_unlink_names;
   std::vector<Inode*> child_dirs;
   struct alias_dentry_key {
@@ -6687,14 +6700,21 @@ void Client::_try_to_trim_inode(Inode *in, bool sched_inval)
   };
   std::vector<alias_dentry_key> alias_keys;
   bool had_dir = false;
+  // Dir::dentries / Dentry lifetime are protected by client_lock
+  // (unlink_locked, close_dir, link). Scanning under inode_lock alone races
+  // with put_request on ms_dispatch and UAF's the Dir or Dentry.
   {
-    std::unique_lock in_lock(*pin);
+    std::scoped_lock<Client> cl(*this);
+    if (!_inode_map_has(pin.get()))
+      return;
     Dir *dir = pin->dir;
     if (dir && !dir->dentries.empty()) {
       had_dir = true;
       for (const auto& p : dir->dentries) {
 	Dentry *dn = p.second;
-	if (pin->snapid != CEPH_NOSNAP && dn->inode && dn->inode->is_dir())
+        if (!dn)
+          continue;
+        if (pin->snapid != CEPH_NOSNAP && dn->inode && dn->inode->is_dir())
 	  child_dirs.push_back(dn->inode.get());
 	if (dn->lru_is_expireable())
 	  to_unlink_names.push_back(p.first);
@@ -6703,8 +6723,8 @@ void Client::_try_to_trim_inode(Inode *in, bool sched_inval)
     if (ref > 1) {
       for (auto q : pin->dentries) {
 	Dentry *dn = q;
-	if (dn->dir)
-	  alias_keys.push_back({dn->dir->parent_inode->vino(), dn->name});
+        if (dn && dn->dir)
+          alias_keys.push_back({dn->dir->parent_inode->vino(), dn->name});
       }
     }
   }
@@ -12260,6 +12280,7 @@ int Client::_open(const InodeRef& in, int flags, mode_t mode, Fh **fhp,
 	result = mds_check_access(path, perms, mask);
       }
       if (result) {
+        in->put_open_ref(cmode);
         return result;
       }
       // update wanted?
@@ -16260,7 +16281,9 @@ int64_t Client::drop_caches()
 
 int Client::_lazyio(Fh *fh, int enable)
 {
+  // Caller must hold inode_lock (get/put_open_ref take it reentrantly).
   Inode *in = fh->inode.get();
+  ceph_assert(in->is_locked_by_me());
   ldout(cct, 20) << __func__ << " " << *in << " " << !!enable << dendl;
 
   if (!!(fh->mode & CEPH_FILE_MODE_LAZY) == !!enable)
@@ -16284,12 +16307,22 @@ int Client::_lazyio(Fh *fh, int enable)
 
 int Client::lazyio(int fd, int enable)
 {
-  std::scoped_lock l(client_lock);
-  Fh *f = get_filehandle(fd);
-  if (!f)
-    return -EBADF;
-
-  return _lazyio(f, enable);
+  Fh* f;
+  {
+    std::scoped_lock l(client_lock);
+    f = get_filehandle(fd);
+    if (!f)
+      return -EBADF;
+    // Pin across client_lock → inode_lock switch (close may race).
+    f->get();
+  }
+  int r;
+  {
+    std::scoped_lock in_lock(*f->inode);
+    r = _lazyio(f, enable);
+  }
+  _put_fh(f);
+  return r;
 }
 
 int Client::ll_lazyio(Fh *fh, int enable)
