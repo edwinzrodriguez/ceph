@@ -170,17 +170,26 @@ void Inode::make_nosnap_relative_path(filepath& p)
 
 void Inode::get_open_ref(int mode)
 {
-  client->inc_opened_files();
-  if (open_by_mode[mode] == 0) {
-    client->inc_opened_inodes();
+  // open_by_mode is per-inode state: must not RMW without inode_lock.
+  // create_and_open/_open can race many threads on one inode (e.g.
+  // LibCephFS.CreateParallel); lost increments then trip put_open_ref
+  // on unmount.
+  {
+    std::unique_lock in_lock(*this);
+    client->inc_opened_files();
+    if (open_by_mode[mode] == 0) {
+      client->inc_opened_inodes();
+    }
+    open_by_mode[mode]++;
   }
-  open_by_mode[mode]++;
+  // May drop a caller-held inode_lock while waiting for delegations.
   break_deleg(!(mode & CEPH_FILE_MODE_WR));
 }
 
 bool Inode::put_open_ref(int mode)
 {
   //cout << "open_by_mode[" << mode << "] " << open_by_mode[mode] << " -> " << (open_by_mode[mode]-1) << std::endl;
+  std::unique_lock in_lock(*this);
   auto& ref = open_by_mode.at(mode);
   ceph_assert(ref > 0);
   client->dec_opened_files();
