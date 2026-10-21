@@ -808,6 +808,10 @@ void ObjectCacher::close_object(Object *ob)
 void ObjectCacher::bh_read(BufferHead *bh, int op_flags,
                            const ZTracer::Trace &parent_trace)
 {
+  // If the caller already holds cache_lock, unique_unlock would drop their
+  // nesting too and leave them unlocked mid-critical-section (stale BH
+  // pointers → LRU assert).  Only drop when we are the sole holder.
+  const bool nested = cache_lock.is_locked_by_me();
   std::unique_lock cl(cache_lock);
   ldout(cct, 7) << "bh_read on " << *bh << " outstanding reads "
 		<< reads_outstanding << dendl;
@@ -819,20 +823,34 @@ void ObjectCacher::bh_read(BufferHead *bh, int op_flags,
     trace.event("start");
   }
 
+  // Mark RX (pins BH) before any lock drop for Objecter submit.
   mark_rx(bh);
   bh->last_read_tid = ++last_read_tid;
 
-  // finisher
   C_ReadFinish *onfinish = new C_ReadFinish(this, bh->ob, bh->last_read_tid,
 					    bh->start(), bh->length(), trace);
-  // go
-  writeback_handler.read(bh->ob->get_oid(), bh->ob->get_object_number(),
-			 bh->ob->get_oloc(), bh->start(), bh->length(),
-			 bh->ob->get_snap(), &onfinish->bl,
-			 bh->ob->truncate_size, bh->ob->truncate_seq,
-			 op_flags, trace, onfinish);
+
+  object_t oid = bh->ob->get_oid();
+  uint64_t object_no = bh->ob->get_object_number();
+  object_locator_t oloc = bh->ob->get_oloc();
+  loff_t start = bh->start();
+  uint64_t length = bh->length();
+  snapid_t snap = bh->ob->get_snap();
+  uint64_t truncate_size = bh->ob->truncate_size;
+  uint32_t truncate_seq = bh->ob->truncate_seq;
 
   ++reads_outstanding;
+
+  if (nested) {
+    writeback_handler.read(oid, object_no, oloc, start, length, snap,
+			   &onfinish->bl, truncate_size, truncate_seq,
+			   op_flags, trace, onfinish);
+  } else {
+    cl.unlock();
+    writeback_handler.read(oid, object_no, oloc, start, length, snap,
+			   &onfinish->bl, truncate_size, truncate_seq,
+			   op_flags, trace, onfinish);
+  }
 }
 
 // Run Context waiters without cache_lock.  In-thread finish_contexts from
@@ -1168,6 +1186,7 @@ public:
 };
 void ObjectCacher::bh_write_scattered(list<BufferHead*>& blist)
 {
+  const bool nested = cache_lock.is_locked_by_me();
   std::unique_lock cl(cache_lock);
 
   Object *ob = blist.front()->ob;
@@ -1199,68 +1218,107 @@ void ObjectCacher::bh_write_scattered(list<BufferHead*>& blist)
       snapc = bh->snapc;
     if (bh->last_write > last_write)
       last_write = bh->last_write;
-  }
 
-  C_WriteCommit *oncommit = new C_WriteCommit(this, ob->oloc.pool, ob->get_soid(), ranges);
-
-  ceph_tid_t tid = writeback_handler.write(ob->get_oid(), ob->get_oloc(),
-					   io_vec, snapc, last_write,
-					   ob->truncate_size, ob->truncate_seq,
-					   oncommit);
-  cl.unlock();
-  oncommit->arm(tid);
-  cl.lock();
-  ob->last_write_tid = tid;
-  for (list<BufferHead*>::iterator p = blist.begin(); p != blist.end(); ++p) {
-    BufferHead *bh = *p;
-    bh->last_write_tid = tid;
+    // TX before any lock drop so concurrent flush cannot resubmit these BHs.
     mark_tx(bh);
   }
 
+  C_WriteCommit *oncommit = new C_WriteCommit(this, ob->oloc.pool, ob->get_soid(),
+					      ranges);
+
+  object_t oid = ob->get_oid();
+  object_locator_t oloc = ob->get_oloc();
+  uint64_t truncate_size = ob->truncate_size;
+  uint32_t truncate_seq = ob->truncate_seq;
+
+  ceph_tid_t tid;
+  if (nested) {
+    tid = writeback_handler.write(oid, oloc, io_vec, snapc, last_write,
+				  truncate_size, truncate_seq, oncommit);
+  } else {
+    cl.unlock();
+    tid = writeback_handler.write(oid, oloc, io_vec, snapc, last_write,
+				  truncate_size, truncate_seq, oncommit);
+    cl.lock();
+  }
+
+  for (BufferHead *bh : blist) {
+    ceph_assert(bh->is_tx() || bh->is_dirty());
+    bh->last_write_tid = tid;
+  }
+  ob->last_write_tid = tid;
+
   if (perfcounter)
     perfcounter->inc(l_objectcacher_data_flushed, total_len);
+
+  // Arm after tid is stored.  Drop only our unique_lock level so a nested
+  // caller's cache_lock remains held.
+  cl.unlock();
+  oncommit->arm(tid);
+  if (nested)
+    cl.lock();
 }
 
 void ObjectCacher::bh_write(BufferHead *bh, const ZTracer::Trace &parent_trace)
 {
+  const bool nested = cache_lock.is_locked_by_me();
   std::unique_lock cl(cache_lock);
   ldout(cct, 7) << "bh_write " << *bh << dendl;
 
-  bh->ob->get();
+  Object *ob = bh->ob;
+  ob->get();
 
   ZTracer::Trace trace;
   if (parent_trace.valid()) {
     trace.init("", &trace_endpoint, &parent_trace);
-    trace.copy_name("bh_write " + bh->ob->get_oid().name);
+    trace.copy_name("bh_write " + ob->get_oid().name);
     trace.event("start");
   }
 
-  // finishers
-  C_WriteCommit *oncommit = new C_WriteCommit(this, bh->ob->oloc.pool,
-					      bh->ob->get_soid(), bh->start(),
-					      bh->length(), trace);
-  // go
-  ceph_tid_t tid = writeback_handler.write(bh->ob->get_oid(),
-					   bh->ob->get_oloc(),
-					   bh->start(), bh->length(),
-					   bh->snapc, bh->bl, bh->last_write,
-					   bh->ob->truncate_size,
-					   bh->ob->truncate_seq,
-					   bh->journal_tid, trace, oncommit);
-  ldout(cct, 20) << " tid " << tid << " on " << bh->ob->get_oid() << dendl;
+  // TX before any lock drop so concurrent flush cannot resubmit this dirty BH.
+  mark_tx(bh);
 
-  // set bh last_write_tid
-  cl.unlock();
-  oncommit->arm(tid);
-  cl.lock();
-  bh->ob->last_write_tid = tid;
+  C_WriteCommit *oncommit = new C_WriteCommit(this, ob->oloc.pool,
+					      ob->get_soid(), bh->start(),
+					      bh->length(), trace);
+
+  object_t oid = ob->get_oid();
+  object_locator_t oloc = ob->get_oloc();
+  loff_t start = bh->start();
+  uint64_t length = bh->length();
+  SnapContext snapc = bh->snapc;
+  bufferlist bl = bh->bl;
+  ceph::real_time last_write = bh->last_write;
+  uint64_t truncate_size = ob->truncate_size;
+  uint32_t truncate_seq = ob->truncate_seq;
+  ceph_tid_t journal_tid = bh->journal_tid;
+
+  ceph_tid_t tid;
+  if (nested) {
+    tid = writeback_handler.write(oid, oloc, start, length, snapc, bl,
+				  last_write, truncate_size, truncate_seq,
+				  journal_tid, trace, oncommit);
+  } else {
+    cl.unlock();
+    tid = writeback_handler.write(oid, oloc, start, length, snapc, bl,
+				  last_write, truncate_size, truncate_seq,
+				  journal_tid, trace, oncommit);
+    cl.lock();
+  }
+  ldout(cct, 20) << " tid " << tid << " on " << oid << dendl;
+
+  ceph_assert(bh->is_tx() || bh->is_dirty());
+  ob->last_write_tid = tid;
   bh->last_write_tid = tid;
 
   if (perfcounter) {
-    perfcounter->inc(l_objectcacher_data_flushed, bh->length());
+    perfcounter->inc(l_objectcacher_data_flushed, length);
   }
 
-  mark_tx(bh);
+  cl.unlock();
+  oncommit->arm(tid);
+  if (nested)
+    cl.lock();
 }
 
 void ObjectCacher::bh_write_commit(int64_t poolid, sobject_t oid,
@@ -1537,6 +1595,23 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
   bool dontneed = rd->fadvise_flags & LIBRADOS_OP_FLAG_FADVISE_DONTNEED;
   bool nocache = rd->fadvise_flags & LIBRADOS_OP_FLAG_FADVISE_NOCACHE;
 
+  // Collect Objecter reads under lock; submit once after the extent loop.
+  // Unlocking mid-loop to submit let completions run C_RetryRead, which
+  // can delete rd while we still iterate rd->extents (corrupt oid / UAF).
+  struct PendingRead {
+    C_ReadFinish *onfinish;
+    object_t oid;
+    uint64_t object_no;
+    object_locator_t oloc;
+    loff_t start;
+    uint64_t length;
+    snapid_t snap;
+    uint64_t truncate_size;
+    uint32_t truncate_seq;
+    ZTracer::Trace trace;
+  };
+  vector<PendingRead> pending_reads;
+
   /*
    * WARNING: we can only meaningfully return ENOENT if the read request
    * passed in a single ObjectExtent.  Any caller who wants ENOENT instead of
@@ -1630,6 +1705,9 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
     }
 
     if (!missing.empty() || !rx.empty()) {
+      // Prepare RX under lock; Objecter submit is deferred until after the
+      // extent loop (see pending_reads above).
+
       // read missing
       map<loff_t, BufferHead*>::iterator last = missing.end();
       for (map<loff_t, BufferHead*>::iterator bh_it = missing.begin();
@@ -1653,8 +1731,33 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 	  bh_remove(o, bh_it->second);
 	  delete bh_it->second;
 	} else {
-	  bh_it->second->set_nocache(nocache);
-	  bh_read(bh_it->second, rd->fadvise_flags, *trace);
+	  BufferHead *bh = bh_it->second;
+	  bh->set_nocache(nocache);
+	  mark_rx(bh);
+	  bh->last_read_tid = ++last_read_tid;
+
+	  ZTracer::Trace read_trace;
+	  if (trace->valid()) {
+	    read_trace.init("", &trace_endpoint, trace);
+	    read_trace.copy_name("bh_read " + bh->ob->get_oid().name);
+	    read_trace.event("start");
+	  }
+	  C_ReadFinish *onfinish_read = new C_ReadFinish(
+	    this, bh->ob, bh->last_read_tid, bh->start(), bh->length(),
+	    read_trace);
+	  pending_reads.push_back(PendingRead{
+	    onfinish_read,
+	    bh->ob->get_oid(),
+	    bh->ob->get_object_number(),
+	    bh->ob->get_oloc(),
+	    bh->start(),
+	    static_cast<uint64_t>(bh->length()),
+	    bh->ob->get_snap(),
+	    bh->ob->truncate_size,
+	    static_cast<uint32_t>(bh->ob->truncate_seq),
+	    read_trace});
+	  ++reads_outstanding;
+
 	  if ((success && onfinish) || last != missing.end())
 	    last = bh_it;
 	}
@@ -1717,7 +1820,10 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 	}
       }
 
-      if (!error) {
+      // Skip stripe_map assembly if an earlier extent already missed —
+      // the map would be discarded, and later off-lock submit of
+      // pending_reads can let C_RetryRead free rd.
+      if (!error && success) {
 	// create reverse map of buffer offset -> object for the
 	// eventual result.  this is over a single ObjectExtent, so we
 	// know that
@@ -1777,6 +1883,34 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
       if (dontneed && o->include_all_cached_data(ex_it->offset, ex_it->length))
 	  bottouch_ob(o);
     }
+  }
+
+  if (!pending_reads.empty()) {
+    const int op_flags = rd->fadvise_flags;
+    // When onfinish is set we registered C_RetryRead on rd; after unlock
+    // that retry may complete and delete rd.  Do not touch rd afterward.
+    const bool retry_owns_rd = onfinish != nullptr;
+    {
+      ceph::unique_unlock<ceph::ReentrantLock> drop(cache_lock);
+      for (auto& p : pending_reads) {
+	writeback_handler.read(p.oid, p.object_no, p.oloc, p.start, p.length,
+			       p.snap, &p.onfinish->bl, p.truncate_size,
+			       p.truncate_seq, op_flags, p.trace, p.onfinish);
+      }
+    }
+    if (perfcounter && external_call) {
+      perfcounter->inc(l_objectcacher_data_read, total_bytes_read);
+      perfcounter->inc(l_objectcacher_cache_bytes_miss, bytes_not_in_cache);
+      perfcounter->inc(l_objectcacher_cache_ops_miss);
+    }
+    if (!retry_owns_rd) {
+      ldout(cct, 20) << "readx drop " << rd << " (no complete, but no waiter)"
+		     << dendl;
+      delete rd;
+    } else {
+      ldout(cct, 20) << "readx defer after miss submit" << dendl;
+    }
+    return 0;  // wait!
   }
 
   if (!success) {
@@ -2258,9 +2392,10 @@ bool ObjectCacher::_flush_set_finish(std::unique_lock<ceph::ReentrantLock>& cl,
   return true;
 }
 
-// bh_write() drops cache_lock to arm write commits.  A commit for an object
-// already in the flush gather set can therefore complete before we register
-// waitfor_commit subs at the end of flush_set/flush_all.  Treat those as done.
+// bh_write() drops cache_lock around Objecter submit and arm().  A commit for
+// an object already in the flush gather set can therefore complete before we
+// register waitfor_commit subs at the end of flush_set/flush_all.  Treat
+// those as done.
 static bool object_write_already_committed(ObjectCacher::Object *ob)
 {
   return ob->last_write_tid != 0 &&
