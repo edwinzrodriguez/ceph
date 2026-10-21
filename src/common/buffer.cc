@@ -13,6 +13,7 @@
  *
  */
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <errno.h>
@@ -23,6 +24,7 @@
 #include <iomanip> // for std::setw()
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 #include "include/ceph_assert.h"
 #include "include/types.h"
@@ -1145,18 +1147,54 @@ static ceph::spinlock debug_lock;
 
   uint64_t buffer::list::get_wasted_space() const
   {
+    if (_num == 0)
+      return 0;
     if (_num == 1)
       return _buffers.back().wasted();
 
-    std::vector<const raw*> raw_vec;
-    raw_vec.reserve(_num);
+    // Hot path after ObjectCacher split/merge: usually a couple of ptrs.
+    if (_num == 2) {
+      auto it = _buffers.begin();
+      const raw *a = it->_raw;
+      const raw *b = (++it)->_raw;
+      uint64_t total = a->get_len();
+      if (b != a)
+	total += b->get_len();
+      if (total <= length())
+	return 0;
+      return total - length();
+    }
+
+    // Overestimate without dedupe (shared raws counted multiple times).
+    // If that is already <= length(), unique-raw waste is zero — skip sort.
+    uint64_t over_total = 0;
     for (const auto& p : _buffers)
-      raw_vec.push_back(p._raw);
-    std::sort(raw_vec.begin(), raw_vec.end());
+      over_total += p._raw->get_len();
+    if (over_total <= length())
+      return 0;
+
+    // Unique-raw sum: stack for small N (avoid malloc under cache_lock),
+    // heap only for large lists.
+    constexpr unsigned stack_max = 16;
+    const raw *stack_raws[stack_max];
+    std::vector<const raw*> heap_raws;
+    const raw **raws;
+    if (_num <= stack_max) {
+      raws = stack_raws;
+    } else {
+      heap_raws.resize(_num);
+      raws = heap_raws.data();
+    }
+    unsigned i = 0;
+    for (const auto& p : _buffers)
+      raws[i++] = p._raw;
+    ceph_assert(i == _num);
+    std::sort(raws, raws + _num);
 
     uint64_t total = 0;
     const raw *last = nullptr;
-    for (const auto r : raw_vec) {
+    for (unsigned j = 0; j < _num; ++j) {
+      const raw *r = raws[j];
       if (r == last)
 	continue;
       last = r;
