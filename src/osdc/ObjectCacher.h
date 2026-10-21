@@ -707,8 +707,7 @@ class ObjectCacher {
   class C_WriteCommit;
   class C_WaitForWrite;
   class C_FlushSetCallback;
-  class C_BHWriteCommitWaiters;
-  class C_BHReadFinishWaiters;
+  class C_FinishContexts;
 
   void perf_start();
   void perf_stop();
@@ -772,7 +771,12 @@ private:
                       ZTracer::Trace *trace, Context *onfreespace,
                       bool block_writes_upfront);
   void _maybe_wait_for_writeback(uint64_t len, ZTracer::Trace *trace);
-  bool _flush_set_finish(C_GatherBuilder *gather, Context *onfinish);
+  // @p cl must own cache_lock.  Returns true only after @p onfinish has
+  // completed (lock dropped for that call).  Returns false if @p onfinish
+  // was attached to a gather and will complete asynchronously.
+  bool _flush_set_finish(std::unique_lock<ceph::ReentrantLock>& cl,
+			 C_GatherBuilder *gather, Context *onfinish);
+  void _queue_finish_contexts(std::list<Context*>&& waiters, int r = 0);
 
   void _discard(ObjectSet *oset, const std::vector<ObjectExtent>& exls,
                 C_GatherBuilder* gather);

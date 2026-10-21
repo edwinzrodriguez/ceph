@@ -600,7 +600,7 @@ void ObjectCacher::Object::truncate(loff_t s)
   if (!waiting_for_read.empty()) {
     ldout(oc->cct, 10) <<  "restarting reads post-truncate" << dendl;
   }
-  finish_contexts(oc->cct, waiting_for_read, 0);
+  oc->_queue_finish_contexts(std::move(waiting_for_read));
 }
 
 void ObjectCacher::Object::discard(loff_t off, loff_t len,
@@ -669,7 +669,7 @@ void ObjectCacher::Object::discard(loff_t off, loff_t len,
   if (!waiting_for_read.empty()) {
     ldout(oc->cct, 10) <<  "restarting reads post-discard" << dendl;
   }
-  finish_contexts(oc->cct, waiting_for_read, 0); /* restart reads */
+  oc->_queue_finish_contexts(std::move(waiting_for_read)); /* restart reads */
 }
 
 
@@ -835,21 +835,29 @@ void ObjectCacher::bh_read(BufferHead *bh, int op_flags,
   ++reads_outstanding;
 }
 
-// Run read finish waiters without cache_lock.  In-thread finish_contexts from
-// bh_read_finish caused cache_lock -> inode_lock inversions when
-// C_Read_Async_Finisher::do_readahead calls Inode::effective_size() while a
-// reader thread holds the inode lock and waits on cache_lock in _readx.
-class ObjectCacher::C_BHReadFinishWaiters : public Context {
+// Run Context waiters without cache_lock.  In-thread finish_contexts from
+// bh_read_finish / writex / truncate / discard / flush_set / retry_waiting_reads
+// caused cache_lock -> inode_lock inversions (e.g. C_Read_Async_Finisher::
+// do_readahead -> Inode::effective_size while a reader holds inode_lock and
+// waits on cache_lock in _readx; C_Client_FlushComplete::check_caps similarly).
+class ObjectCacher::C_FinishContexts : public Context {
   CephContext *cct;
   std::list<Context*> waiters;
   int r;
 public:
-  C_BHReadFinishWaiters(CephContext *c, std::list<Context*>&& ls, int _r)
+  C_FinishContexts(CephContext *c, std::list<Context*>&& ls, int _r)
     : cct(c), waiters(std::move(ls)), r(_r) {}
   void finish(int) override {
     finish_contexts(cct, waiters, r);
   }
 };
+
+void ObjectCacher::_queue_finish_contexts(std::list<Context*>&& waiters, int r)
+{
+  if (!waiters.empty()) {
+    finisher.queue(new C_FinishContexts(cct, std::move(waiters), r));
+  }
+}
 
 void ObjectCacher::bh_read_finish(int64_t poolid, sobject_t oid,
 				  ceph_tid_t tid, loff_t start,
@@ -1024,13 +1032,7 @@ void ObjectCacher::bh_read_finish(int64_t poolid, sobject_t oid,
   // called with lock held.
   ldout(cct, 20) << "finishing waiters " << ls << dendl;
 
-  std::list<Context*> waiters;
-  waiters.swap(ls);
-  cl.unlock();
-  if (!waiters.empty()) {
-    finisher.queue(new C_BHReadFinishWaiters(cct, std::move(waiters), err));
-  }
-  cl.lock();
+  _queue_finish_contexts(std::move(ls), err);
 
   retry_waiting_reads();
 
@@ -1118,22 +1120,6 @@ void ObjectCacher::_schedule_flush_set_callback(ObjectSet *oset)
   oset->flush_callback_pending = true;
   finisher.queue(new C_FlushSetCallback(this, oset));
 }
-
-// Run commit waiters without cache_lock (and without the writeback path's
-// client_lock from C_ReentrantLock).  In-thread finish_contexts from
-// bh_write_commit caused cache_lock -> inode_lock inversions with
-// C_Client_FlushComplete::check_caps.
-class ObjectCacher::C_BHWriteCommitWaiters : public Context {
-  CephContext *cct;
-  std::list<Context*> waiters;
-  int r;
-public:
-  C_BHWriteCommitWaiters(CephContext *c, std::list<Context*>&& ls, int _r)
-    : cct(c), waiters(std::move(ls)), r(_r) {}
-  void finish(int) override {
-    finish_contexts(cct, waiters, r);
-  }
-};
 
 class ObjectCacher::C_WriteCommit : public Context {
   ObjectCacher *oc;
@@ -1398,13 +1384,8 @@ void ObjectCacher::bh_write_commit(int64_t poolid, sobject_t oid,
     _schedule_flush_set_callback(oset);
   }
 
-  std::list<Context*> waiters;
-  waiters.swap(ls);
   cl.unlock();
-
-  if (!waiters.empty()) {
-    finisher.queue(new C_BHWriteCommitWaiters(cct, std::move(waiters), r));
-  }
+  _queue_finish_contexts(std::move(ls), r);
 }
 
 void ObjectCacher::flush(ZTracer::Trace *trace, loff_t amount, int max_bhs)
@@ -1859,13 +1840,7 @@ void ObjectCacher::retry_waiting_reads()
 {
   list<Context *> ls;
   ls.swap(waitfor_read);
-
-  while (!ls.empty() && waitfor_read.empty()) {
-    Context *ctx = ls.front();
-    ls.pop_front();
-    ctx->complete(0);
-  }
-  waitfor_read.splice(waitfor_read.end(), ls);
+  _queue_finish_contexts(std::move(ls));
 }
 
 int ObjectCacher::writex(OSDWrite *wr, ObjectSet *oset, Context *onfreespace,
@@ -1965,7 +1940,7 @@ int ObjectCacher::writex(OSDWrite *wr, ObjectSet *oset, Context *onfreespace,
                           block_writes_upfront);
   delete wr;
 
-  finish_contexts(cct, wait_for_reads, 0);
+  _queue_finish_contexts(std::move(wait_for_reads));
 
   //verify_stats();
   trim();
@@ -2261,10 +2236,11 @@ bool ObjectCacher::flush(Object *ob, loff_t offset, loff_t length,
   return clean;
 }
 
-bool ObjectCacher::_flush_set_finish(C_GatherBuilder *gather,
+bool ObjectCacher::_flush_set_finish(std::unique_lock<ceph::ReentrantLock>& cl,
+				     C_GatherBuilder *gather,
 				     Context *onfinish)
 {
-  std::unique_lock cl(cache_lock);
+  ceph_assert(cl.owns_lock());
 
   if (gather->has_subs()) {
     gather->set_finisher(onfinish);
@@ -2273,6 +2249,11 @@ bool ObjectCacher::_flush_set_finish(C_GatherBuilder *gather,
   }
 
   ldout(cct, 10) << "flush_set has no dirty|tx bhs" << dendl;
+  // return true means onfinish has already run.  Callers such as
+  // Client::_fsync_wait_objectcacher skip wait() on true and destroy a
+  // stack C_SaferCond — queuing to finisher here UAF'd that cond.
+  // Drop cache_lock so Client work in onfinish does not run under it.
+  cl.unlock();
   onfinish->complete(0);
   return true;
 }
@@ -2295,6 +2276,7 @@ bool ObjectCacher::flush_set(ObjectSet *oset, Context *onfinish)
   ceph_assert(onfinish != NULL);
   if (oset->empty()) {
     ldout(cct, 10) << "flush_set on " << oset << " dne" << dendl;
+    cl.unlock();
     onfinish->complete(0);
     return true;
   }
@@ -2394,7 +2376,7 @@ bool ObjectCacher::flush_set(ObjectSet *oset, Context *onfinish)
     ob->waitfor_commit[ob->last_write_tid].push_back(gather.new_sub());
   }
 
-  return _flush_set_finish(&gather, onfinish);
+  return _flush_set_finish(cl, &gather, onfinish);
 }
 
 // flush.  non-blocking, takes callback.
@@ -2408,6 +2390,7 @@ bool ObjectCacher::flush_set(ObjectSet *oset, vector<ObjectExtent>& exv,
   ceph_assert(onfinish != NULL);
   if (oset->empty()) {
     ldout(cct, 10) << "flush_set on " << oset << " dne" << dendl;
+    cl.unlock();
     onfinish->complete(0);
     return true;
   }
@@ -2444,7 +2427,7 @@ bool ObjectCacher::flush_set(ObjectSet *oset, vector<ObjectExtent>& exv,
     }
   }
 
-  return _flush_set_finish(&gather, onfinish);
+  return _flush_set_finish(cl, &gather, onfinish);
 }
 
 // flush all dirty data.  non-blocking, takes callback.
@@ -2508,7 +2491,7 @@ bool ObjectCacher::flush_all(Context *onfinish)
     ob->waitfor_commit[ob->last_write_tid].push_back(gather.new_sub());
   }
 
-  return _flush_set_finish(&gather, onfinish);
+  return _flush_set_finish(cl, &gather, onfinish);
 }
 
 void ObjectCacher::purge_set(ObjectSet *oset)
@@ -2707,10 +2690,14 @@ void ObjectCacher::discard_writeback(ObjectSet *oset,
     bool flushed = was_dirty && oset->dirty_or_tx == 0;
     gather.set_finisher(new LambdaContext(
       [this, oset, flushed, on_finish](int) {
-	std::unique_lock cl(cache_lock);
+	// Completes via write-commit Finisher waiters; drop cache_lock
+	// before invoking the client on_finish.
+	{
+	  std::unique_lock cl(cache_lock);
 
-	if (flushed && flush_set_callback) {
-	  _schedule_flush_set_callback(oset);
+	  if (flushed && flush_set_callback) {
+	    _schedule_flush_set_callback(oset);
+	  }
 	}
 	if (on_finish)
 	  on_finish->complete(0);
@@ -2746,17 +2733,18 @@ void ObjectCacher::_discard(ObjectSet *oset, const vector<ObjectExtent>& exls,
 void ObjectCacher::_discard_finish(ObjectSet *oset, bool was_dirty,
                                    Context* on_finish)
 {
-  std::unique_lock cl(cache_lock);
-
+  // Caller (discard_set / discard_writeback) already holds cache_lock.
+  ceph_assert(cache_lock.is_locked_by_me());
 
   // did we truncate off dirty data?
   if (flush_set_callback && was_dirty && oset->dirty_or_tx == 0) {
     _schedule_flush_set_callback(oset);
   }
 
-  // notify that in-flight writeback has completed
+  // Async: discard_writeback does not use a return-true / stack-Context
+  // contract the way flush_set does.
   if (on_finish != nullptr) {
-    on_finish->complete(0);
+    finisher.queue(on_finish);
   }
 }
 

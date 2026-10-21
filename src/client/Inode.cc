@@ -315,10 +315,15 @@ bool Inode::cap_is_valid(const Cap &cap) const
   // cap_lease_valid takes session_lock.  When inode_lock is already held,
   // drop it briefly so we do not invert lock order (inode_lock -> session_lock).
   // Snapshot cap.gen under inode_lock first; it is updated by add_update_cap.
+  // Pin across the unlock: ObjectCacher Finisher / put_inode can destroy this
+  // inode while inode_lock is dropped (EINVAL on unique_unlock reacquire).
   MetaSession *session = cap.session;
   if (!session)
     return false;
   __u32 gen = cap.gen;
+  InodeRef pin;
+  if (get_nref() > 0)
+    pin = const_cast<Inode*>(this);
   ceph::unique_unlock<Inode> in_unlock(const_cast<Inode&>(*this), std::defer_lock);
   if (is_locked_by_me()) {
     in_unlock.release();
@@ -338,6 +343,12 @@ int Inode::caps_issued(int *implemented) const
     auth_issued = auth_cap->issued;
     auth_impl = auth_cap->implemented;
   }
+
+  // Pin across unique_unlock: without a ref, Finisher put_inode can free this
+  // inode while we hold only session_lock, and reacquire throws system_error.
+  InodeRef pin;
+  if (get_nref() > 0)
+    pin = const_cast<Inode*>(this);
 
   ceph::unique_unlock<Inode> in_unlock(const_cast<Inode&>(*this), std::defer_lock);
   if (is_locked_by_me())
@@ -396,6 +407,11 @@ bool Inode::caps_issued_mask(unsigned mask, bool allow_impl)
     ceph::unique_unlock<Client> drop(*client);
     return caps_issued_mask(mask, allow_impl);
   }
+  // Pin across the unique_unlock below (session_lock); lock alone does not
+  // keep the Inode object alive if put_inode runs on another thread.
+  InodeRef pin;
+  if (get_nref() > 0)
+    pin = this;
   std::unique_lock<Inode> in_lock(*this);
 
   int c = snap_caps;

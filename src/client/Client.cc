@@ -6339,6 +6339,11 @@ void Client::handle_caps(const MConstRef<MClientCaps>& m)
       case CEPH_CAP_OP_IMPORT:
       case CEPH_CAP_OP_REVOKE:
       case CEPH_CAP_OP_GRANT: {
+        // Pin before dropping client_lock: handle_cap_grant -> caps_issued
+        // briefly releases inode_lock for session_lock; without a ref,
+        // concurrent Finisher put_inode can free the inode (EINVAL on
+        // unique_unlock reacquire).
+        InodeRef pin(in);
         cl.unlock();
         if (_inode_is_deleting(in))
           return;
@@ -15299,10 +15304,9 @@ int Client::_fsync_wait_objectcacher(Inode *in)
     C_SaferCond flush_cond("Client::_fsync_wait_objectcacher");
     const bool flushed_sync = _flush(in, &flush_cond);
 
-    // When _flush returns false, ObjectCacher::flush_set may still hold
-    // &flush_cond in a C_Gather onfinish.  Never skip the wait just because
-    // oset looks clean — the gather can outlive this stack frame and
-    // onfinish->complete() on a destroyed C_SaferCond (SIGSEGV).
+    // flush_set returns true only after onfinish has completed (possibly
+    // with cache_lock dropped).  false means &flush_cond is still held by
+    // a gather / Finisher — must wait or the stack C_SaferCond is UAF'd.
     if (!flushed_sync) {
       ldout(cct, 15) << "waiting on data to flush" << dendl;
       r = flush_cond.wait();
