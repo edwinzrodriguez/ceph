@@ -1796,7 +1796,19 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
     } else {
       ceph_assert(!hits.empty());
 
-      // make a plain list
+      // Under lock: touch BHs and snapshot bufferlists (shallow) so
+      // substr_of / append_zero can run off-lock without racing writers.
+      // Only planned when success (no earlier miss) — see guard below.
+      struct HitFrag {
+	bool is_zero;
+	loff_t bh_off;
+	loff_t opos;
+	uint64_t len;
+	uint64_t stripe_off;
+	bufferlist bl;  // shallow copy of bh->bl when !is_zero
+      };
+      vector<HitFrag> hit_frags;
+
       for (map<loff_t, BufferHead*>::iterator bh_it = hits.begin();
 	   bh_it != hits.end();
 	   ++bh_it) {
@@ -1820,11 +1832,10 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 	}
       }
 
-      // Skip stripe_map assembly if an earlier extent already missed —
-      // the map would be discarded, and later off-lock submit of
-      // pending_reads can let C_RetryRead free rd.
+      // Skip HitFrag plan if an earlier extent already missed — assembly
+      // would be discarded, and unlocking here races C_RetryRead on rd.
       if (!error && success) {
-	// create reverse map of buffer offset -> object for the
+	// create reverse map plan of buffer offset -> object for the
 	// eventual result.  this is over a single ObjectExtent, so we
 	// know that
 	//  - the bh's are contiguous
@@ -1846,20 +1857,15 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 			 << f_it->second << " +" << foff << "~" << len
 			 << dendl;
 
-	  bufferlist bit;
-	  // put substr here first, since substr_of clobbers, and we
-	  // may get multiple bh's at this stripe_map position
-	  if (bh->is_zero()) {
-	    stripe_map[f_it->first].append_zero(len);
-            if (holes) {
-              holes->push_back(std::make_pair(opos, len));
-            }
-	  } else {
-	    bit.substr_of(bh->bl,
-		opos - bh->start(),
-		len);
-	    stripe_map[f_it->first].claim_append(bit);
-	  }
+	  HitFrag frag;
+	  frag.is_zero = bh->is_zero();
+	  frag.bh_off = static_cast<loff_t>(bhoff);
+	  frag.opos = opos;
+	  frag.len = len;
+	  frag.stripe_off = f_it->first;
+	  if (!frag.is_zero)
+	    frag.bl = bh->bl;  // shallow: holds bufferptr refs across unlock
+	  hit_frags.push_back(std::move(frag));
 
 	  opos += len;
 	  bhoff += len;
@@ -1882,6 +1888,25 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
 
       if (dontneed && o->include_all_cached_data(ex_it->offset, ex_it->length))
 	  bottouch_ob(o);
+
+      if (!hit_frags.empty()) {
+	ceph::unique_unlock<ceph::ReentrantLock> drop(cache_lock);
+	for (auto& f : hit_frags) {
+	  if (f.is_zero) {
+	    stripe_map[f.stripe_off].append_zero(f.len);
+	    if (holes) {
+	      holes->push_back(std::make_pair(
+		static_cast<uint64_t>(f.opos), f.len));
+	    }
+	  } else {
+	    bufferlist bit;
+	    // put substr here first, since substr_of clobbers, and we
+	    // may get multiple bh's at this stripe_map position
+	    bit.substr_of(f.bl, f.bh_off, f.len);
+	    stripe_map[f.stripe_off].claim_append(bit);
+	  }
+	}
+      }
     }
   }
 
@@ -1937,25 +1962,29 @@ int ObjectCacher::_readx(OSDRead *rd, ObjectSet *oset, Context *onfinish,
   // no misses... success!  do the read.
   ldout(cct, 10) << "readx has all buffers" << dendl;
 
-  // ok, assemble into result buffer.
+  // Assemble into the caller buffer off-lock; stripe_map is local and BH
+  // data was already copied into it under pin above.
   uint64_t pos = 0;
-  if (rd->bl && !error) {
-    rd->bl->clear();
-    for (map<uint64_t,bufferlist>::iterator i = stripe_map.begin();
-	 i != stripe_map.end();
-	 ++i) {
-      ceph_assert(pos == i->first);
-      ldout(cct, 10) << "readx  adding buffer len " << i->second.length()
-		     << " at " << pos << dendl;
-      pos += i->second.length();
-      rd->bl->claim_append(i->second);
-      ceph_assert(rd->bl->length() == pos);
+  {
+    ceph::unique_unlock<ceph::ReentrantLock> drop(cache_lock);
+    if (rd->bl && !error) {
+      rd->bl->clear();
+      for (map<uint64_t,bufferlist>::iterator i = stripe_map.begin();
+	   i != stripe_map.end();
+	   ++i) {
+	ceph_assert(pos == i->first);
+	ldout(cct, 10) << "readx  adding buffer len " << i->second.length()
+		       << " at " << pos << dendl;
+	pos += i->second.length();
+	rd->bl->claim_append(i->second);
+	ceph_assert(rd->bl->length() == pos);
+      }
+      ldout(cct, 10) << "readx  result is " << rd->bl->length() << dendl;
+    } else if (!error) {
+      ldout(cct, 10) << "readx  no bufferlist ptr (readahead?), done." << dendl;
+      map<uint64_t,bufferlist>::reverse_iterator i = stripe_map.rbegin();
+      pos = i->first + i->second.length();
     }
-    ldout(cct, 10) << "readx  result is " << rd->bl->length() << dendl;
-  } else if (!error) {
-    ldout(cct, 10) << "readx  no bufferlist ptr (readahead?), done." << dendl;
-    map<uint64_t,bufferlist>::reverse_iterator i = stripe_map.rbegin();
-    pos = i->first + i->second.length();
   }
 
   // done with read.
@@ -1981,7 +2010,6 @@ int ObjectCacher::writex(OSDWrite *wr, ObjectSet *oset, Context *onfreespace,
 			 ZTracer::Trace *parent_trace,
 			 bool block_writes_upfront)
 {
-  std::unique_lock cl(cache_lock);
   ceph::real_time now = ceph::real_clock::now();
   uint64_t bytes_written = 0;
   uint64_t bytes_written_in_flush = 0;
@@ -1994,17 +2022,30 @@ int ObjectCacher::writex(OSDWrite *wr, ObjectSet *oset, Context *onfreespace,
     trace.event("start");
   }
 
+  // Prepare frags from the caller bufferlist off-lock; under lock we only
+  // map_write and attach into BHs.
+  vector<vector<bufferlist>> extent_frags(wr->extents.size());
+  for (size_t ei = 0; ei < wr->extents.size(); ++ei) {
+    auto& ex = wr->extents[ei];
+    extent_frags[ei].reserve(ex.buffer_extents.size());
+    for (auto& be : ex.buffer_extents) {
+      bufferlist frag;
+      frag.substr_of(wr->bl, be.first, be.second);
+      extent_frags[ei].push_back(std::move(frag));
+    }
+  }
+
+  std::unique_lock cl(cache_lock);
   list<Context*> wait_for_reads;
-  for (vector<ObjectExtent>::iterator ex_it = wr->extents.begin();
-       ex_it != wr->extents.end();
-       ++ex_it) {
+  for (size_t ei = 0; ei < wr->extents.size(); ++ei) {
+    ObjectExtent& ex = wr->extents[ei];
     // get object cache
-    sobject_t soid(ex_it->oid, CEPH_NOSNAP);
-    Object *o = get_object(soid, ex_it->objectno, oset, ex_it->oloc,
-			   ex_it->truncate_size, oset->truncate_seq);
+    sobject_t soid(ex.oid, CEPH_NOSNAP);
+    Object *o = get_object(soid, ex.objectno, oset, ex.oloc,
+			   ex.truncate_size, oset->truncate_seq);
 
     // map it all into a single bufferhead.
-    BufferHead *bh = o->map_write(*ex_it, wr->journal_tid);
+    BufferHead *bh = o->map_write(ex, wr->journal_tid);
     bool missing = bh->is_missing();
     bh->snapc = wr->snapc;
 
@@ -2014,9 +2055,9 @@ int ObjectCacher::writex(OSDWrite *wr, ObjectSet *oset, Context *onfreespace,
     }
     bh->waitfor_read.clear();
 
-    bytes_written += ex_it->length;
+    bytes_written += ex.length;
     if (bh->is_tx()) {
-      bytes_written_in_flush += ex_it->length;
+      bytes_written_in_flush += ex.length;
     }
 
     // adjust buffer pointers (ie "copy" data into my cache)
@@ -2024,20 +2065,18 @@ int ObjectCacher::writex(OSDWrite *wr, ObjectSet *oset, Context *onfreespace,
     //  - there is one contiguous bh
     //  - the buffer frags need not be (and almost certainly aren't)
     // note: i assume striping is monotonic... no jumps backwards, ever!
-    loff_t opos = ex_it->offset;
-    for (vector<pair<uint64_t, uint64_t> >::iterator f_it
-	   = ex_it->buffer_extents.begin();
-	 f_it != ex_it->buffer_extents.end();
-	 ++f_it) {
-      ldout(cct, 10) << "writex writing " << f_it->first << "~"
-		     << f_it->second << " into " << *bh << " at " << opos
+    loff_t opos = ex.offset;
+    auto& frags = extent_frags[ei];
+    ceph_assert(frags.size() == ex.buffer_extents.size());
+    for (size_t fi = 0; fi < ex.buffer_extents.size(); ++fi) {
+      auto& be = ex.buffer_extents[fi];
+      ldout(cct, 10) << "writex writing " << be.first << "~"
+		     << be.second << " into " << *bh << " at " << opos
 		     << dendl;
       uint64_t bhoff = opos - bh->start();
-      ceph_assert(f_it->second <= bh->length() - bhoff);
+      ceph_assert(be.second <= bh->length() - bhoff);
 
-      // get the frag we're mapping in
-      bufferlist frag;
-      frag.substr_of(wr->bl, f_it->first, f_it->second);
+      bufferlist& frag = frags[fi];
 
       // keep anything left of bhoff
       if (!bhoff)
@@ -2045,7 +2084,7 @@ int ObjectCacher::writex(OSDWrite *wr, ObjectSet *oset, Context *onfreespace,
       else
         bh->bl.claim_append(frag);
 
-      opos += f_it->second;
+      opos += be.second;
     }
 
     // ok, now bh is dirty.
