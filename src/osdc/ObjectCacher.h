@@ -391,10 +391,8 @@ class ObjectCacher {
 
 
   struct ObjectSet {
-    // Reentrant: close_object / ~Object and ObjectCacher helpers (set_is_empty,
-    // for_each_object*) can nest while the same thread already holds oset_lock.
-    // A non-recursive ERRORCHECK mutex aborts with std::system_error (EDEADLK)
-    // on that path (e.g. handle_cap_grant -> get_caps_used -> set_is_empty).
+    // Reentrant: close_object / ~Object and for_each_object* can nest while
+    // the same thread already holds oset_lock.
     mutable ceph::ReentrantLock oset_lock =
       ceph::make_reentrant("ObjectSet::oset_lock");
 
@@ -408,6 +406,9 @@ class ObjectCacher {
     std::atomic<uint64_t> truncate_size;
 
     std::atomic<int> dirty_or_tx;
+    // Bytes of BH data in this set (all states).  Updated in bh_stat_add/sub
+    // under cache_lock; readable without cache_lock for set_is_empty().
+    std::atomic<int64_t> cached_bytes{0};
     bool flush_callback_pending = false;
     bool invalidated = false;
 
@@ -462,17 +463,11 @@ class ObjectCacher {
       }
     }
 
-    bool set_is_empty()
+    // Lock-free: cached_bytes / dirty_or_tx are maintained under cache_lock
+    // in bh_stat_*; cap paths must not take cache_lock for these queries.
+    bool set_is_empty() const
     {
-      std::unique_lock cl(oset_lock);
-      if (objects.empty())
-        return true;
-
-      for (xlist<Object*>::iterator p = objects.begin(); !p.end(); ++p)
-        if (!(*p)->is_empty())
-          return false;
-
-      return true;
+      return cached_bytes.load(std::memory_order_acquire) == 0;
     }
 
     bool set_is_cached()
@@ -493,27 +488,12 @@ class ObjectCacher {
 
       return false;
     }
-     bool set_is_dirty_or_committing()
+
+    bool set_is_dirty_or_committing() const
     {
-      std::unique_lock cl(oset_lock);
-
-      if (objects.empty())
-        return false;
-
-      for (auto i = objects.begin(); !i.end(); ++i) {
-        Object *ob = *i;
-
-        for (auto p = ob->data.begin();
-             p != ob->data.end();
-             ++p) {
-          BufferHead *bh = p->second;
-          if (bh->is_dirty() || bh->is_tx())
-            return true;
-        }
-      }
-
-      return false;
+      return dirty_or_tx.load(std::memory_order_acquire) > 0;
     }
+
     ObjectSet(void *p, int64_t _poolid, inodeno_t i)
       : parent(p), ino(i), poolid(_poolid),
 	return_enoent(false), truncate_seq(0),

@@ -2301,7 +2301,6 @@ void ObjectCacher::flusher_entry()
 
 bool ObjectCacher::set_is_empty(ObjectSet *oset)
 {
-  std::unique_lock cl(cache_lock);
   return oset->set_is_empty();
 }
 
@@ -2313,7 +2312,6 @@ bool ObjectCacher::set_is_cached(ObjectSet *oset)
 
 bool ObjectCacher::set_is_dirty_or_committing(ObjectSet *oset)
 {
-  std::unique_lock cl(cache_lock);
   return oset->set_is_dirty_or_committing();
 }
 
@@ -2943,31 +2941,34 @@ void ObjectCacher::bh_stat_add(BufferHead *bh)
 {
   std::unique_lock cl(cache_lock);
 
+  const loff_t len = bh->length();
+  bh->ob->oset->cached_bytes.fetch_add(len, std::memory_order_release);
+
   switch (bh->get_state()) {
   case BufferHead::STATE_MISSING:
-    stat_missing += bh->length();
+    stat_missing += len;
     break;
   case BufferHead::STATE_CLEAN:
-    stat_clean += bh->length();
+    stat_clean += len;
     break;
   case BufferHead::STATE_ZERO:
-    stat_zero += bh->length();
+    stat_zero += len;
     break;
   case BufferHead::STATE_DIRTY:
-    stat_dirty += bh->length();
-    bh->ob->dirty_or_tx += bh->length();
-    bh->ob->oset->dirty_or_tx += bh->length();
+    stat_dirty += len;
+    bh->ob->dirty_or_tx += len;
+    bh->ob->oset->dirty_or_tx += len;
     break;
   case BufferHead::STATE_TX:
-    stat_tx += bh->length();
-    bh->ob->dirty_or_tx += bh->length();
-    bh->ob->oset->dirty_or_tx += bh->length();
+    stat_tx += len;
+    bh->ob->dirty_or_tx += len;
+    bh->ob->oset->dirty_or_tx += len;
     break;
   case BufferHead::STATE_RX:
-    stat_rx += bh->length();
+    stat_rx += len;
     break;
   case BufferHead::STATE_ERROR:
-    stat_error += bh->length();
+    stat_error += len;
     break;
   default:
     ceph_abort_msg("bh_stat_add: invalid bufferhead state");
@@ -2980,31 +2981,34 @@ void ObjectCacher::bh_stat_sub(BufferHead *bh)
 {
   std::unique_lock cl(cache_lock);
 
+  const loff_t len = bh->length();
+  bh->ob->oset->cached_bytes.fetch_sub(len, std::memory_order_release);
+
   switch (bh->get_state()) {
   case BufferHead::STATE_MISSING:
-    stat_missing -= bh->length();
+    stat_missing -= len;
     break;
   case BufferHead::STATE_CLEAN:
-    stat_clean -= bh->length();
+    stat_clean -= len;
     break;
   case BufferHead::STATE_ZERO:
-    stat_zero -= bh->length();
+    stat_zero -= len;
     break;
   case BufferHead::STATE_DIRTY:
-    stat_dirty -= bh->length();
-    bh->ob->dirty_or_tx -= bh->length();
-    bh->ob->oset->dirty_or_tx -= bh->length();
+    stat_dirty -= len;
+    bh->ob->dirty_or_tx -= len;
+    bh->ob->oset->dirty_or_tx -= len;
     break;
   case BufferHead::STATE_TX:
-    stat_tx -= bh->length();
-    bh->ob->dirty_or_tx -= bh->length();
-    bh->ob->oset->dirty_or_tx -= bh->length();
+    stat_tx -= len;
+    bh->ob->dirty_or_tx -= len;
+    bh->ob->oset->dirty_or_tx -= len;
     break;
   case BufferHead::STATE_RX:
-    stat_rx -= bh->length();
+    stat_rx -= len;
     break;
   case BufferHead::STATE_ERROR:
-    stat_error -= bh->length();
+    stat_error -= len;
     break;
   default:
     ceph_abort_msg("bh_stat_sub: invalid bufferhead state");
