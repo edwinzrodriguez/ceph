@@ -647,7 +647,10 @@ class ObjectCacher {
 			    int64_t *amount, int *max_count);
 
   void trim();
-  void flush(ZTracer::Trace *trace, loff_t amount=0, int max_bhs=0);
+  // Caller must hold @p l (typically flusher_entry).  Unlocks briefly every
+  // MAX_FLUSH_UNDER_LOCK BHs so amount-based flush cannot starve other users.
+  void flush(std::unique_lock<ceph::ReentrantLock>& l, ZTracer::Trace *trace,
+	     loff_t amount=0, int max_bhs=0);
 
   /**
    * flush a range of buffers
@@ -663,7 +666,9 @@ class ObjectCacher {
   bool flush(Object *o, loff_t off, loff_t len,
              ZTracer::Trace *trace);
   loff_t release(Object *o);
+  loff_t release_locked(Object *o);
   void purge(Object *o);
+  void purge_locked(Object *o);
 
   int64_t reads_outstanding;
   ceph::reentrant_condition_variable read_cond;
@@ -773,9 +778,12 @@ public:
   bool flush_all(Context *onfinish = 0);
 
   void purge_set(ObjectSet *oset);
+  // Caller already holds cache_lock (e.g. via acquire_cache_lock()).
+  void purge_set_locked(ObjectSet *oset);
 
   // returns # of bytes not released (ie non-clean)
   loff_t release_set(ObjectSet *oset);
+  loff_t release_set_locked(ObjectSet *oset);
   uint64_t release_all();
 
   // Hold cache_lock across inode teardown so no ObjectCacher I/O uses oset_lock

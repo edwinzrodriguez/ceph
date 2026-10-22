@@ -1446,10 +1446,11 @@ void ObjectCacher::bh_write_commit(int64_t poolid, sobject_t oid,
   _queue_finish_contexts(std::move(ls), r);
 }
 
-void ObjectCacher::flush(ZTracer::Trace *trace, loff_t amount, int max_bhs)
+void ObjectCacher::flush(std::unique_lock<ceph::ReentrantLock>& l,
+			 ZTracer::Trace *trace, loff_t amount, int max_bhs)
 {
   ceph_assert(trace != nullptr);
-  std::unique_lock cl(cache_lock);
+  ceph_assert(l.owns_lock());
   ceph::real_time cutoff = ceph::real_clock::now();
 
   ldout(cct, 10) << "flush " << amount
@@ -1460,9 +1461,14 @@ void ObjectCacher::flush(ZTracer::Trace *trace, loff_t amount, int max_bhs)
    * looking at the tail item.  Then we call bh_write, which moves it
    * to the other LRU, so that we can call
    * lru_dirty.lru_get_next_expire() again.
+   *
+   * Drop the lock every MAX_FLUSH_UNDER_LOCK starts so amount-based
+   * flush cannot monopolize cache_lock the way the aged path already
+   * avoids with the same limit.
    */
   int64_t left = amount;
   int left_bhs = max_bhs;
+  int under_lock = MAX_FLUSH_UNDER_LOCK;
   while ((amount == 0 && max_bhs == 0) || left > 0 || left_bhs > 0) {
     BufferHead *bh = static_cast<BufferHead*>(
       bh_lru_dirty.lru_get_next_expire());
@@ -1470,12 +1476,31 @@ void ObjectCacher::flush(ZTracer::Trace *trace, loff_t amount, int max_bhs)
     if (bh->last_write > cutoff) break;
 
     if (scattered_write) {
+      int count_limit = under_lock;
+      if (max_bhs > 0 && left_bhs < count_limit)
+	count_limit = left_bhs;
+      int before = count_limit;
       bh_write_adjacencies(bh, cutoff, amount > 0 ? &left : NULL,
-                           max_bhs > 0 ? &left_bhs : NULL);
+			   &count_limit);
+      int flushed = before - count_limit;
+      under_lock -= flushed;
+      if (max_bhs > 0)
+	left_bhs -= flushed;
     } else {
       left -= bh->length();
       left_bhs--;
       bh_write(bh, *trace);
+      --under_lock;
+    }
+
+    if (under_lock <= 0) {
+      // back off the lock to avoid starving other threads
+      trace->event("backoff");
+      l.unlock();
+      l.lock();
+      under_lock = MAX_FLUSH_UNDER_LOCK;
+      if (flusher_stop)
+	break;
     }
   }
 }
@@ -2276,13 +2301,13 @@ void ObjectCacher::flusher_entry()
       ldout(cct, 10) << "flusher " << get_stat_dirty() << " dirty + "
 		     << get_stat_dirty_waiting() << " dirty_waiting > target "
 		     << target_dirty << ", flushing some dirty bhs" << dendl;
-      flush(&trace, actual - target_dirty);
+      flush(l, &trace, actual - target_dirty);
     } else if (actual_bhs > target_dirty_bh) {
       ldout(cct, 10) << "flusher " << dirty_or_tx_bh.size() << " dirty/tx bh + "
                      << get_stat_nr_dirty_waiters() << " dirty_waiters > "
                      << "target dirty bh " << target_dirty_bh
                      << ", flushing some dirty bhs" << dendl;
-      flush(&trace, 0, actual_bhs - target_dirty_bh);
+      flush(l, &trace, 0, actual_bhs - target_dirty_bh);
     } else {
       // check tail of lru for old dirty items
       ceph::real_time cutoff = ceph::real_clock::now();
@@ -2359,9 +2384,13 @@ bool ObjectCacher::set_is_dirty_or_committing(ObjectSet *oset)
 void ObjectCacher::purge(Object *ob)
 {
   std::unique_lock cl(cache_lock);
+  purge_locked(ob);
+}
 
+void ObjectCacher::purge_locked(Object *ob)
+{
+  ceph_assert(cache_lock.is_locked_by_me());
   ldout(cct, 10) << "purge " << *ob << dendl;
-
   ob->truncate(0);
 }
 
@@ -2669,6 +2698,12 @@ bool ObjectCacher::flush_all(Context *onfinish)
 void ObjectCacher::purge_set(ObjectSet *oset)
 {
   std::unique_lock cl(cache_lock);
+  purge_set_locked(oset);
+}
+
+void ObjectCacher::purge_set_locked(ObjectSet *oset)
+{
+  ceph_assert(cache_lock.is_locked_by_me());
 
   if (oset->empty()) {
     ldout(cct, 10) << "purge_set on " << oset << " dne" << dendl;
@@ -2679,7 +2714,7 @@ void ObjectCacher::purge_set(ObjectSet *oset)
   const bool were_dirty = oset->dirty_or_tx > 0;
 
   oset->for_each_object([this](Object *ob) {
-    purge(ob);
+    purge_locked(ob);
     return true;  // continue iteration
   });
 
@@ -2695,6 +2730,12 @@ void ObjectCacher::purge_set(ObjectSet *oset)
 loff_t ObjectCacher::release(Object *ob)
 {
   std::unique_lock cl(cache_lock);
+  return release_locked(ob);
+}
+
+loff_t ObjectCacher::release_locked(Object *ob)
+{
+  ceph_assert(cache_lock.is_locked_by_me());
 
   list<BufferHead*> clean;
   loff_t o_unclean = 0;
@@ -2738,6 +2779,12 @@ loff_t ObjectCacher::release(Object *ob)
 loff_t ObjectCacher::release_set(ObjectSet *oset)
 {
   std::unique_lock cl(cache_lock);
+  return release_set_locked(oset);
+}
+
+loff_t ObjectCacher::release_set_locked(ObjectSet *oset)
+{
+  ceph_assert(cache_lock.is_locked_by_me());
 
   // return # bytes not clean (and thus not released).
   loff_t unclean = 0;
@@ -2752,7 +2799,7 @@ loff_t ObjectCacher::release_set(ObjectSet *oset)
   oset->invalidated = true;
 
   oset->for_each_object_safe([this, &unclean, oset](Object *ob) {
-    loff_t o_unclean = release(ob);
+    loff_t o_unclean = release_locked(ob);
     unclean += o_unclean;
 
     if (o_unclean)
@@ -2787,7 +2834,7 @@ uint64_t ObjectCacher::release_all()
 
       Object *ob = p->second;
 
-      loff_t o_unclean = release(ob);
+      loff_t o_unclean = release_locked(ob);
       unclean += o_unclean;
 
       if (o_unclean)

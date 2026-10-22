@@ -295,7 +295,7 @@ void Client::objectcacher_purge_set(Inode *in)
     cl_drop.release();
   objectcacher->wait_for_flush_callbacks();
   auto oc_lock = objectcacher->acquire_cache_lock();
-  objectcacher->purge_set(oset);
+  objectcacher->purge_set_locked(oset);
 }
 
 void Client::objectcacher_release_set(Inode *in)
@@ -315,7 +315,7 @@ void Client::objectcacher_release_set(Inode *in)
     cl_drop.release();
   objectcacher->wait_for_flush_callbacks();
   auto oc_lock = objectcacher->acquire_cache_lock();
-  objectcacher->release_set(oset);
+  objectcacher->release_set_locked(oset);
 }
 
 int64_t Client::objectcacher_release_all()
