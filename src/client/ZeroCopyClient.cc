@@ -28,6 +28,7 @@
 #include "osdc/Objecter.h"
 
 #include <errno.h>
+#include <mutex>
 
 namespace ceph {
 
@@ -65,6 +66,7 @@ public:
   snapid_t snapid;
   uint64_t truncate_size;
   uint32_t truncate_seq;
+  bool fini = false; // like C_Read_Sync_NonBlocking: survive short-read retries
 
   C_ZC_Read(Client *clnt, Fh *fh, InodeRef in, uint64_t off, uint64_t len,
 	    bufferlist *bl, IoCallback cb, Filer *filer,
@@ -80,7 +82,11 @@ public:
 
   ~C_ZC_Read() override {
     delete bl;
-    fh->put();
+    // finish() unlocks before the user callback, then complete() deletes us
+    // without client_lock. fh->put() alone never deletes; need _put_fh under
+    // lock or the Fh (and InodeRef) leaks and unmount hangs on inode_map.
+    std::lock_guard lock(clnt->client_lock);
+    clnt->_put_fh(fh);
   }
 
   void start() {
@@ -90,6 +96,15 @@ public:
   void retry() {
     filer->read_trunc(in->ino, &layout, snapid, pos, left, &tbl, 0,
 		      truncate_size, truncate_seq, this);
+  }
+
+  // Default Context::complete always deletes this; short-read retries re-submit
+  // the same object to Filer, so only destroy when finish sets fini.
+  void complete(int r) override {
+    finish(r);
+    if (fini) {
+      delete this;
+    }
   }
 
   void finish(int r) override {
@@ -110,6 +125,9 @@ public:
     }
 
     if (r >= 0 && static_cast<uint64_t>(r) < wanted) {
+      // Short OSD read: zero up to known EOF like C_Read_Sync_NonBlocking,
+      // then re-check size. Retry the remainder only if the file grew / we
+      // have not reached EOF yet.
       auto effective_size = in->effective_size();
       if (pos < effective_size) {
 	int64_t some = effective_size - pos;
@@ -136,7 +154,8 @@ public:
 	}
       }
 
-      if (pos >= in->effective_size()) {
+      effective_size = in->effective_size();
+      if (pos >= effective_size || left == 0) {
 	r = read_bytes;
 	goto done;
       }
@@ -144,8 +163,7 @@ public:
       wanted = left;
       truncate_size = in->truncate_size;
       truncate_seq = in->truncate_seq;
-      // Drop lock across Filer submit (same pattern as C_Read_Sync_NonBlocking).
-      lock.unlock();
+      // Keep client_lock across submit; fini stays false until final completion.
       retry();
       return;
     }
@@ -155,6 +173,7 @@ public:
     }
 
 done:
+    fini = true;
     clnt->put_cap_ref(in.get(), CEPH_CAP_FILE_RD);
     IoCallback user_cb = std::move(cb);
     bufferlist out;
@@ -218,7 +237,10 @@ public:
 
   ~C_ZC_Write() override {
     delete held_bl;
-    fh->put();
+    // Destroyed under client_lock (C_Lock_Client_Finisher → complete). Do not
+    // re-lock — match C_Readahead. fh->put() alone never deletes.
+    ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
+    clnt->_put_fh(fh);
   }
 
   void finish(int r) override {
