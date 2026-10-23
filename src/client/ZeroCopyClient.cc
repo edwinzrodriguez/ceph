@@ -31,10 +31,11 @@
 
 namespace ceph {
 
-void ZeroCopyClient::queue_user_cb(IoCallback cb, int64_t result,
+void ZeroCopyClient::queue_user_cb(Client *clnt, IoCallback cb, int64_t result,
 				   bufferlist data)
 {
-  client->objecter_finisher.queue(make_lambda_context(
+  ceph_assert(clnt);
+  clnt->objecter_finisher.queue(make_lambda_context(
     [cb = std::move(cb), result, data = std::move(data)](int) mutable {
       cb(IoResult{result, std::move(data)});
     }));
@@ -65,11 +66,11 @@ public:
   uint64_t truncate_size;
   uint32_t truncate_seq;
 
-  C_ZC_Read(ZeroCopyClient *zc, Fh *fh, InodeRef in, uint64_t off, uint64_t len,
+  C_ZC_Read(Client *clnt, Fh *fh, InodeRef in, uint64_t off, uint64_t len,
 	    bufferlist *bl, IoCallback cb, Filer *filer,
 	    file_layout_t layout, snapid_t snapid,
 	    uint64_t truncate_size, uint32_t truncate_seq)
-    : clnt(zc->client), fh(fh), in(std::move(in)), off(off), len(len),
+    : clnt(clnt), fh(fh), in(std::move(in)), off(off), len(len),
       bl(bl), cb(std::move(cb)), pos(off), left(len), wanted(len), filer(filer),
       layout(std::move(layout)), snapid(snapid),
       truncate_size(truncate_size), truncate_seq(truncate_seq)
@@ -168,31 +169,30 @@ done:
 /** Optional post-write fsync; runs under client_lock. */
 class C_ZC_Fsync : public Context {
 public:
-  ZeroCopyClient *zc;
   Client *clnt;
   InodeRef in;
   IoCallback cb;
   int64_t io_result;
 
-  C_ZC_Fsync(ZeroCopyClient *zc, InodeRef in, IoCallback cb, int64_t io_result)
-    : zc(zc), clnt(zc->client), in(std::move(in)), cb(std::move(cb)),
-      io_result(io_result)
+  C_ZC_Fsync(Client *clnt, InodeRef in, IoCallback cb, int64_t io_result)
+    : clnt(clnt), in(std::move(in)), cb(std::move(cb)), io_result(io_result)
   {}
 
   void finish(int r) override {
     ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
     clnt->put_cap_ref(in.get(), CEPH_CAP_FILE_WR);
-    zc->queue_user_cb(std::move(cb), r < 0 ? r : io_result, {});
+    ZeroCopyClient::queue_user_cb(clnt, std::move(cb),
+				  r < 0 ? r : io_result, {});
   }
 };
 
 /**
  * Filer write completion under client_lock (via C_Lock_Client_Finisher).
  * Updates size, drops BUFFER/WR (WR after optional fsync), then user cb.
+ * Holds Client* only — never ZeroCopyClient* (stack wrappers must not be pinned).
  */
 class C_ZC_Write : public Context {
 public:
-  ZeroCopyClient *zc;
   Client *clnt;
   Fh *fh;
   InodeRef in;
@@ -205,11 +205,11 @@ public:
   IoCallback cb;
   bufferlist *held_bl; // keeps payload alive for Objecter
 
-  C_ZC_Write(ZeroCopyClient *zc, Fh *fh, InodeRef in, utime_t start,
+  C_ZC_Write(Client *clnt, Fh *fh, InodeRef in, utime_t start,
 	     uint64_t offset, uint64_t size, uint64_t fpos,
 	     bool do_fsync, bool syncdataonly, IoCallback cb,
 	     bufferlist *held_bl)
-    : zc(zc), clnt(zc->client), fh(fh), in(std::move(in)), start(start),
+    : clnt(clnt), fh(fh), in(std::move(in)), start(start),
       offset(offset), size(size), fpos(fpos), do_fsync(do_fsync),
       syncdataonly(syncdataonly), cb(std::move(cb)), held_bl(held_bl)
   {
@@ -233,19 +233,18 @@ public:
     }
 
     if (r >= 0 && do_fsync) {
-      // Copy cb into fsync ctx so we can still deliver on submit failure.
-      auto *fsync_ctx = new C_ZC_Fsync(zc, in, cb, result);
-      int fr = clnt->nonblocking_fsync(in.get(), syncdataonly, fsync_ctx);
-      if (fr < 0) {
-	delete fsync_ctx;
-	clnt->put_cap_ref(in.get(), CEPH_CAP_FILE_WR);
-	zc->queue_user_cb(std::move(cb), fr, {});
-      }
+      // Match C_Write_Finisher: kick C_nonblocking_fsync_state under the
+      // client_lock we already hold. Do not call nonblocking_fsync() — that
+      // entry point takes client_lock again and would assert.
+      auto *fsync_ctx = new C_ZC_Fsync(clnt, in, cb, result);
+      auto *state = new Client::C_nonblocking_fsync_state(
+	clnt, in.get(), syncdataonly, fsync_ctx);
+      state->advance();
       return;
     }
 
     clnt->put_cap_ref(in.get(), CEPH_CAP_FILE_WR);
-    zc->queue_user_cb(std::move(cb), result, {});
+    ZeroCopyClient::queue_user_cb(clnt, std::move(cb), result, {});
   }
 };
 
@@ -321,7 +320,7 @@ int ZeroCopyClient::async_read(Fh *fh, uint64_t off, uint64_t len, IoCallback cb
 
   Client::RWRef_t mref_reader(client->mount_state, Client::CLIENT_MOUNTING);
   if (!mref_reader.is_state_satisfied()) {
-    queue_user_cb(std::move(cb), -ENOTCONN, {});
+    queue_user_cb(client, std::move(cb), -ENOTCONN, {});
     return 0;
   }
 
@@ -329,17 +328,17 @@ int ZeroCopyClient::async_read(Fh *fh, uint64_t off, uint64_t len, IoCallback cb
 
   if (fh == nullptr || !client->_ll_fh_exists(fh)) {
     lock.unlock();
-    queue_user_cb(std::move(cb), -EBADF, {});
+    queue_user_cb(client, std::move(cb), -EBADF, {});
     return 0;
   }
   if ((fh->mode & CEPH_FILE_MODE_RD) == 0) {
     lock.unlock();
-    queue_user_cb(std::move(cb), -EBADF, {});
+    queue_user_cb(client, std::move(cb), -EBADF, {});
     return 0;
   }
   if (len == 0) {
     lock.unlock();
-    queue_user_cb(std::move(cb), 0, {});
+    queue_user_cb(client, std::move(cb), 0, {});
     return 0;
   }
 
@@ -349,7 +348,7 @@ int ZeroCopyClient::async_read(Fh *fh, uint64_t off, uint64_t len, IoCallback cb
   int r = client->get_caps(fh, CEPH_CAP_FILE_RD, CEPH_CAP_FILE_CACHE, &have, -1);
   if (r < 0) {
     lock.unlock();
-    queue_user_cb(std::move(cb), r, {});
+    queue_user_cb(client, std::move(cb), r, {});
     return 0;
   }
 
@@ -357,7 +356,7 @@ int ZeroCopyClient::async_read(Fh *fh, uint64_t off, uint64_t len, IoCallback cb
   if (off >= effective_size) {
     client->put_cap_ref(in, CEPH_CAP_FILE_RD);
     lock.unlock();
-    queue_user_cb(std::move(cb), 0, {});
+    queue_user_cb(client, std::move(cb), 0, {});
     return 0;
   }
   if (off + len > effective_size) {
@@ -366,7 +365,7 @@ int ZeroCopyClient::async_read(Fh *fh, uint64_t off, uint64_t len, IoCallback cb
 
   auto *bl = new bufferlist();
   auto *read_ctx = new C_ZC_Read(
-    this, fh, InodeRef(in), off, len, bl, std::move(cb),
+    client, fh, InodeRef(in), off, len, bl, std::move(cb),
     client->filer.get(), in->layout, in->snapid,
     in->truncate_size, in->truncate_seq);
 
@@ -389,7 +388,7 @@ int ZeroCopyClient::async_write(Fh *fh, uint64_t off, bufferlist data,
 
   Client::RWRef_t mref_reader(client->mount_state, Client::CLIENT_MOUNTING);
   if (!mref_reader.is_state_satisfied()) {
-    queue_user_cb(std::move(cb), -ENOTCONN, {});
+    queue_user_cb(client, std::move(cb), -ENOTCONN, {});
     return 0;
   }
 
@@ -397,19 +396,19 @@ int ZeroCopyClient::async_write(Fh *fh, uint64_t off, bufferlist data,
 
   if (fh == nullptr || !client->_ll_fh_exists(fh)) {
     lock.unlock();
-    queue_user_cb(std::move(cb), -EBADF, {});
+    queue_user_cb(client, std::move(cb), -EBADF, {});
     return 0;
   }
   if ((fh->mode & CEPH_FILE_MODE_WR) == 0) {
     lock.unlock();
-    queue_user_cb(std::move(cb), -EBADF, {});
+    queue_user_cb(client, std::move(cb), -EBADF, {});
     return 0;
   }
 
   Inode *in = fh->inode.get();
   if (in->snapid != CEPH_NOSNAP) {
     lock.unlock();
-    queue_user_cb(std::move(cb), -EROFS, {});
+    queue_user_cb(client, std::move(cb), -EROFS, {});
     return 0;
   }
 
@@ -422,7 +421,7 @@ int ZeroCopyClient::async_write(Fh *fh, uint64_t off, bufferlist data,
       if (lr < 0) {
 	client->unlock_fh_pos(fh);
 	lock.unlock();
-	queue_user_cb(std::move(cb), lr, {});
+	queue_user_cb(client, std::move(cb), lr, {});
 	return 0;
       }
     }
@@ -434,12 +433,12 @@ int ZeroCopyClient::async_write(Fh *fh, uint64_t off, bufferlist data,
   if ((offset + size) > client->mdsmap->get_max_filesize() &&
       (offset + size) > in->size) {
     lock.unlock();
-    queue_user_cb(std::move(cb), -EFBIG, {});
+    queue_user_cb(client, std::move(cb), -EFBIG, {});
     return 0;
   }
   if (client->objecter->osdmap_pool_full(in->layout.pool_id)) {
     lock.unlock();
-    queue_user_cb(std::move(cb), -ENOSPC, {});
+    queue_user_cb(client, std::move(cb), -ENOSPC, {});
     return 0;
   }
 
@@ -447,7 +446,7 @@ int ZeroCopyClient::async_write(Fh *fh, uint64_t off, bufferlist data,
   if (endoff > in->size &&
       client->is_quota_bytes_exceeded(in, endoff - in->size, fh->actor_perms)) {
     lock.unlock();
-    queue_user_cb(std::move(cb), -EDQUOT, {});
+    queue_user_cb(client, std::move(cb), -EDQUOT, {});
     return 0;
   }
 
@@ -458,7 +457,7 @@ int ZeroCopyClient::async_write(Fh *fh, uint64_t off, bufferlist data,
 			   CEPH_CAP_FILE_BUFFER, &have, endoff);
   if (r < 0) {
     lock.unlock();
-    queue_user_cb(std::move(cb), r, {});
+    queue_user_cb(client, std::move(cb), r, {});
     return 0;
   }
   client->put_cap_ref(in, CEPH_CAP_AUTH_SHARED);
@@ -467,14 +466,14 @@ int ZeroCopyClient::async_write(Fh *fh, uint64_t off, bufferlist data,
   if (r < 0) {
     client->put_cap_ref(in, CEPH_CAP_FILE_WR);
     lock.unlock();
-    queue_user_cb(std::move(cb), r, {});
+    queue_user_cb(client, std::move(cb), r, {});
     return 0;
   }
 
   if (!in->snaprealm) {
     client->put_cap_ref(in, CEPH_CAP_FILE_WR);
     lock.unlock();
-    queue_user_cb(std::move(cb), -EINVAL, {});
+    queue_user_cb(client, std::move(cb), -EINVAL, {});
     return 0;
   }
 
@@ -482,7 +481,7 @@ int ZeroCopyClient::async_write(Fh *fh, uint64_t off, bufferlist data,
 
   auto *held_bl = new bufferlist(std::move(data));
   auto *write_ctx = new C_ZC_Write(
-    this, fh, InodeRef(in), start, offset, size, fpos,
+    client, fh, InodeRef(in), start, offset, size, fpos,
     fsync, syncdataonly, std::move(cb), held_bl);
 
   Context *filer_onfinish = new C_OnFinisher(
