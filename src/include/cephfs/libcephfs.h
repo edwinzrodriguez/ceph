@@ -31,6 +31,7 @@
 #include <dirent.h>
 
 #include "ceph_ll_client.h"
+#include "ceph_buffer.h"
 
 #ifdef __cplusplus
 namespace ceph::common {
