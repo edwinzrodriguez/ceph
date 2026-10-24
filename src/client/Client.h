@@ -21,6 +21,14 @@
 #include <atomic>
 #include <dirent.h>
 
+namespace ceph {
+class ZeroCopyClient;
+class C_ZC_Read;
+class C_ZC_Write;
+class C_ZC_Fsync;
+class C_ZC_FsyncSlotWaiter;
+} // namespace ceph
+
 #include "common/admin_socket.h"
 #include "common/CommandTable.h"
 #include "common/Finisher.h"
@@ -399,6 +407,11 @@ public:
   friend class C_Client_CacheRelease; // Asserts on client_lock
   friend class ClientCaps;
   friend class SyntheticClient;
+  friend class ceph::ZeroCopyClient; // Filer-only zero-copy data plane
+  friend class ceph::C_ZC_Read;
+  friend class ceph::C_ZC_Write;
+  friend class ceph::C_ZC_Fsync;
+  friend class ceph::C_ZC_FsyncSlotWaiter;
   friend class Inode;
   friend void intrusive_ptr_release(Inode *in);
   template <typename T> friend struct RWRefState;
