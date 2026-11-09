@@ -62,8 +62,16 @@ public:
     if (!_in || _rl.owns_lock()) {
       return;
     }
+    // _put_inode sets m_dying under the lock, then drops it before ~Inode.
+    // Refusing to lock a dying inode avoids EBUSY in pthread_mutex_destroy
+    // and UAF if a racy locker outlives the delete.
+    ceph_assert(!_in->is_dying());
     ceph::client_lock::order::assert_no_client_lock(_in->get_client_lock());
     _rl.lock();
+    if (_in->is_dying()) {
+      _rl.unlock();
+      ceph_abort_msg("inode_lock on dying inode");
+    }
     ceph::client_lock::order::on_inode_locked();
   }
 
@@ -75,8 +83,15 @@ public:
     if (_rl.owns_lock()) {
       return true;
     }
+    if (_in->is_dying()) {
+      return false;
+    }
     ceph::client_lock::order::assert_no_client_lock(_in->get_client_lock());
     if (!_rl.try_lock()) {
+      return false;
+    }
+    if (_in->is_dying()) {
+      _rl.unlock();
       return false;
     }
     ceph::client_lock::order::on_inode_locked();
@@ -150,15 +165,24 @@ public:
 
   void release()
   {
-    if (_released || !_in || !_in->m_inode_lock.is_locked_by_me()) {
+    if (_released || !_in) {
       return;
     }
-    _saved = _in->m_inode_lock.release_for_wait();
-    for (int i = 0; i < _saved; ++i) {
-      ceph::client_lock::order::on_inode_unlocked();
+    if (_in->m_inode_lock.is_locked_by_me()) {
+      _saved = _in->m_inode_lock.release_for_wait();
+      for (int i = 0; i < _saved; ++i) {
+	ceph::client_lock::order::on_inode_unlocked();
+      }
+      _in->m_inode_lock.native_mutex().unlock();
+      _released = true;
+      return;
     }
-    _in->m_inode_lock.native_mutex().unlock();
-    _released = true;
+    // Desync: native held by us but ReentrantLock recursion/owner already clear.
+    if (ceph_mutex_is_locked_by_me(_in->m_inode_lock.native_mutex())) {
+      _in->m_inode_lock.native_mutex().unlock();
+      _saved = 0;
+      _released = true;
+    }
   }
 
   bool released() const
@@ -183,12 +207,18 @@ public:
 
   void _abandon() noexcept
   {
-    if (!_released && _in && _in->m_inode_lock.is_locked_by_me()) {
-      int saved = _in->m_inode_lock.release_for_wait();
-      for (int i = 0; i < saved; ++i) {
-	ceph::client_lock::order::on_inode_unlocked();
+    if (!_released && _in) {
+      if (_in->m_inode_lock.is_locked_by_me()) {
+	int saved = _in->m_inode_lock.release_for_wait();
+	for (int i = 0; i < saved; ++i) {
+	  ceph::client_lock::order::on_inode_unlocked();
+	}
+	_in->m_inode_lock.native_mutex().unlock();
+      } else if (ceph_mutex_is_locked_by_me(_in->m_inode_lock.native_mutex())) {
+	// release_for_wait() can clear recursion/owner while leaving the
+	// native mutex locked if a matching native unlock was skipped.
+	_in->m_inode_lock.native_mutex().unlock();
       }
-      _in->m_inode_lock.native_mutex().unlock();
     }
     _released = false;
     _saved = 0;

@@ -23,6 +23,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 
 using namespace std::literals::string_view_literals;
@@ -4511,19 +4512,42 @@ void Client::_put_inode(Inode *in, int n)
     while (in->get_nref() > 1)
       in->iput(1);
     if (in->get_nref() == 1) {
+      // Cap::~Cap asserts inode_lock; clear again in case a grant raced in
+      // while we dropped the lock for objectcacher / inode_map teardown.
+      if (!in->caps.empty())
+	      remove_all_caps(in);
+
       // pthread_mutex_destroy requires an unlocked mutex. Teardown helpers
       // (caps_issued, snaprealm unlink, get/put_open_ref) may nest inode_lock
       // so a single unique_lock::unlock() can leave recursion_count > 0 and
-      // ~Inode aborts with EBUSY. Drop every level this thread holds, detach
-      // the guard so it will not touch the freed mutex, and do not restore.
+      // ~Inode aborts with EBUSY. Mark dying while we still hold the lock so
+      // other threads cannot reacquire, drop every recursion level AND the
+      // native mutex (ReentrantLock tracking can desync from nlock), wait
+      // for any concurrent holder to leave, then destroy.
+      in->set_dying();
       {
         ceph::unique_unlock<Inode> drop(*in, std::defer_lock);
-        if (in->is_locked_by_me())
+        if (in->is_locked_by_me() ||
+	    ceph_mutex_is_locked_by_me(in->native_mutex()))
           drop.release();
         in_lock.release();
         drop._abandon();
       }
       ceph_assert(!in->is_locked_by_me());
+      // Drain both ReentrantLock tracking and the native mutex.  Checking
+      // only is_locked() misses the release_for_wait-without-unlock desync
+      // that leaves nlock > 0 with recursion_count == 0.
+      while (in->is_locked() || ceph_mutex_is_locked(in->native_mutex())) {
+	if (in->is_locked_by_me() ||
+	    ceph_mutex_is_locked_by_me(in->native_mutex())) {
+	  ceph::unique_unlock<Inode> drop(*in, std::defer_lock);
+	  drop.release();
+	  drop._abandon();
+	  continue;
+	}
+	std::this_thread::yield();
+      }
+      ceph_assert(!ceph_mutex_is_locked(in->native_mutex()));
       in->iput();
     } else if (in->get_nref() == 0) {
       in_lock.unlock();
@@ -12243,9 +12267,13 @@ int Client::_release_fh(Fh *f, bool drop_ref)
   }
 
   if (drop_ref) {
-    // ~Fh drops the inode InodeRef; release inode_lock first (same as put_inode).
+    // ~Fh drops the inode InodeRef via put_inode().  Fully drop inode_lock and
+    // abandon both guards so neither reacquires after a synchronous delete
+    // (or after delay_put races ahead during unmount).
     ceph::unique_unlock<Inode> u(*in);
+    in_lock.release();
     _put_fh(f);
+    u._abandon();
   }
 
   return err;
@@ -13424,7 +13452,7 @@ int Client::_read_sync(Fh *f, uint64_t off, uint64_t len, bufferlist *bl,
 
   auto effective_size = in->effective_size();
   auto target_len = std::min(len, effective_size - off);
-uint64_t read_start;
+  uint64_t read_start;
   uint64_t read_len;
 
 #if defined(__linux__)
@@ -13452,9 +13480,7 @@ uint64_t read_start;
 
   auto start_time = mono_clock_now();
   // 0 success, 1 continue and < 0 error happen.
-  auto wait_and_copy = [&](C_SaferCond &onfinish, bufferlist &tbl, int wanted) {
-    int r = onfinish.wait();
-
+  auto copy_result = [&](int r, bufferlist &tbl, int wanted) {
     // if we get ENOENT from OSD, assume 0 bytes returned
     if (r == -ENOENT)
       r = 0;
@@ -13501,12 +13527,28 @@ uint64_t read_start;
 
     int wanted = left;
 
+    // Snapshot Filer args under inode_lock; layout must outlive wait().
+    const inodeno_t ino = in->ino;
+    file_layout_t layout = in->layout;
+    const snapid_t snapid = in->snapid;
+    const uint64_t truncate_size = in->truncate_size;
+    const uint32_t truncate_seq = in->truncate_seq;
+
     // TODO: Incorporate holes into the read
-    filer->read_trunc(in->ino, &in->layout, in->snapid,
+    filer->read_trunc(ino, &layout, snapid,
 		      pos, left, &tbl, 0,
-		      in->truncate_size, in->truncate_seq,
+		      truncate_size, truncate_seq,
 		      &onfinish);
-    r = wait_and_copy(onfinish, tbl, wanted);
+
+    // Match _read_async / sync _write: drop inode_lock and ll_io_mutex across
+    // the Filer wait so concurrent ll_* on this file are not serialized for
+    // the whole OSD RTT.
+    {
+      ceph::unique_unlock<Inode> in_unlock(*in);
+      ceph::unique_unlock<ceph::TrackedLock> io_unlock(in->ll_io_mutex);
+      r = onfinish.wait();
+    }
+    r = copy_result(r, tbl, wanted);
     if (!r)
       break;
     if (r < 0)
@@ -15496,10 +15538,13 @@ int Client::_fsync_with_slot_held(Inode *in, bool syncdataonly)
   logger->tinc(l_c_fsync, lat);
 
   // Drop tmp_ref without holding inode_lock.  ~InodeRef -> put_inode() under
-  // inode_lock deadlocks with tick.
+  // inode_lock deadlocks with tick.  Abandon so we do not reacquire if this
+  // was the last ref and delay_put deletes the inode.
   {
     ceph::unique_unlock<Inode> u(*in);
+    in_guard.release();
     tmp_ref = InodeRef();
+    u._abandon();
   }
 
   return r;

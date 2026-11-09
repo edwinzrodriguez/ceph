@@ -4,6 +4,7 @@
 #ifndef CEPH_CLIENT_INODE_H
 #define CEPH_CLIENT_INODE_H
 
+#include <atomic>
 #include <numeric>
 
 #include "include/compat.h"
@@ -146,8 +147,19 @@ struct Inode : RefCountedObject {
   mutable ceph::ReentrantLock m_inode_lock =
     ceph::make_reentrant("Inode::inode_lock", false);
 
+  // Set under inode_lock just before the final iput in _put_inode.  Stops
+  // other threads from re-acquiring after we drop the lock for destroy;
+  // pthread_mutex_destroy requires the mutex to be unlocked (EBUSY otherwise).
+  mutable std::atomic<bool> m_dying{false};
+
   bool is_locked() const;
   bool is_locked_by_me() const;
+  bool is_dying() const {
+    return m_dying.load(std::memory_order_acquire);
+  }
+  void set_dying() {
+    m_dying.store(true, std::memory_order_release);
+  }
 
   int release_for_wait() noexcept;
   void restore_after_wait(int saved) noexcept;
