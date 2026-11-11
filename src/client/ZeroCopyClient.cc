@@ -285,7 +285,9 @@ public:
 
 /**
  * ObjectCacher read completion under client_lock (ObjectCacher uses client_lock).
- * Decrypts when FSCrypt is enabled, kicks readahead, drops FILE_RD, then user cb.
+ * Decrypts when FSCrypt is enabled, drops FILE_RD, then user cb.
+ * No do_readahead here: Filer ZC skips it, and issuing file_read under
+ * client_lock on every completion amplifies lock hold under Ganesha concurrency.
  */
 class C_ZC_Read_OC : public Context {
 public:
@@ -347,10 +349,6 @@ public:
       }
     }
 #endif
-
-    if (r != 0) {
-      clnt->do_readahead(fh, in.get(), off, len);
-    }
 
     clnt->put_cap_ref(in.get(), CEPH_CAP_FILE_RD);
     clnt->logger->inc(l_c_aio_completions);
