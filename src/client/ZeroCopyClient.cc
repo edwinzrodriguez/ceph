@@ -671,7 +671,14 @@ int ZeroCopyClient::async_read(Fh* fh, uint64_t off, uint64_t len, IoCallback cb
     // Match _read_async: drop CACHE once submitted; finisher owns FILE_RD.
     client->put_cap_ref(in, CEPH_CAP_FILE_CACHE);
     if (r != 0) {
-      oc_ctx->complete(r);
+      // Hit / immediate error: do not nest C_ZC_Read_OC under file_read_ex's
+      // client_lock hold (_readx assembly already ran). Miss completions reach
+      // finish via ObjecterWriteback's C_OnFinisher+C_Lock; queue hits the same
+      // way so user-facing finish runs after we drop the lock.
+      lock.unlock();
+      client->objecter_finisher.queue(
+          new Client::C_Lock_Client_Finisher(client, oc_ctx), r);
+      return 0;
     }
     lock.unlock();
     return 0;
