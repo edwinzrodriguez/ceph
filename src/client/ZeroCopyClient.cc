@@ -284,10 +284,11 @@ public:
 };
 
 /**
- * ObjectCacher read completion under client_lock (ObjectCacher uses client_lock).
- * Decrypts when FSCrypt is enabled, drops FILE_RD, then user cb.
- * No do_readahead here: Filer ZC skips it, and issuing file_read under
- * client_lock on every completion amplifies lock hold under Ganesha concurrency.
+ * ObjectCacher read completion. Callers hold client_lock (ObjectCacher / C_Lock).
+ * Under lock: put_cap_ref(FILE_RD) + aio counters. Off lock: decrypt_bl and
+ * user cb (Filer C_ZC_Read discipline). Relock so ~C_ZC_Read_OC can _put_fh.
+ * No do_readahead: Filer ZC skips it; file_read under client_lock amplifies
+ * hold under Ganesha concurrency.
  */
 class C_ZC_Read_OC : public Context {
 public:
@@ -335,33 +336,49 @@ public:
   {
     ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
 
-#if defined(__linux__)
-    if (fscrypt_denc && r > 0) {
-      std::vector<FSCryptFDataDenc::Segment> holes;
-      auto dec_start = mono_clock_now();
-      int dr = fscrypt_denc->decrypt_bl(off, len, read_start, holes, bl);
-      clnt->logger->tinc(l_c_fscrypt_dec_lat, mono_clock_now() - dec_start);
-      if (dr < 0) {
-        r = dr;
-      } else {
-        r = bl->length();
-        clnt->logger->tinc(l_c_fscrypt_rd_lat, mono_clock_now() - start_time);
-      }
-    }
-#endif
-
     clnt->put_cap_ref(in.get(), CEPH_CAP_FILE_RD);
     clnt->logger->inc(l_c_aio_completions);
     clnt->dec_aio_in_flight();
 
     IoCallback user_cb = std::move(cb);
-    bufferlist out;
-    if (r >= 0) {
-      out = std::move(*bl);
-    }
-    // Match Filer ZC read: user cb without client_lock.
+    const uint64_t out_off = off;
+    const uint64_t out_len = len;
+    const uint64_t out_read_start = read_start;
+    const utime_t io_start = start_time;
+#if defined(__linux__)
+    FSCryptFDataDencRef denc = std::move(fscrypt_denc);
+#endif
+    // Own the result buffer off-lock for decrypt / move into user cb.
+    bufferlist* result_bl = bl;
+    bl = nullptr;
+
     clnt->client_lock.unlock();
+
+#if defined(__linux__)
+    if (denc && r > 0 && result_bl) {
+      std::vector<FSCryptFDataDenc::Segment> holes;
+      auto dec_start = mono_clock_now();
+      int dr = denc->decrypt_bl(out_off, out_len, out_read_start, holes,
+                                result_bl);
+      clnt->logger->tinc(l_c_fscrypt_dec_lat, mono_clock_now() - dec_start);
+      if (dr < 0) {
+        r = dr;
+      } else {
+        r = result_bl->length();
+        clnt->logger->tinc(l_c_fscrypt_rd_lat, mono_clock_now() - io_start);
+      }
+    }
+#endif
+
+    bufferlist out;
+    if (r >= 0 && result_bl) {
+      out = std::move(*result_bl);
+    }
+    delete result_bl;
+
     user_cb(IoResult{r, std::move(out)});
+
+    // Context::complete deletes us after finish; ~C_ZC_Read_OC needs the lock.
     clnt->client_lock.lock();
   }
 };
