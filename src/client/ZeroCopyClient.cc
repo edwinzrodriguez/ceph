@@ -660,10 +660,12 @@ int ZeroCopyClient::async_read(Fh* fh, uint64_t off, uint64_t len, IoCallback cb
     uint64_t read_start = off;
     uint64_t read_len = len;
 #if defined(__linux__)
+    // Per-op validator like Filer C_ZC_Read::prepare — do not assign
+    // in->fscrypt_key_validator on the hot path.
+    FSCryptKeyValidatorRef key_validator;
     FSCryptFDataDencRef fscrypt_denc;
-    client->fscrypt->prepare_data_read(in->fscrypt_ctx,
-                                       &in->fscrypt_key_validator, off, len,
-                                       in->size, &read_start, &read_len,
+    client->fscrypt->prepare_data_read(in->fscrypt_ctx, &key_validator, off,
+                                       len, in->size, &read_start, &read_len,
                                        &fscrypt_denc);
 #endif
     auto* bl = new bufferlist();
@@ -830,8 +832,8 @@ int ZeroCopyClient::async_write(Fh* fh, uint64_t off, bufferlist data,
   bool will_encrypt = false;
 #if defined(__linux__)
   {
-    auto denc = client->fscrypt->get_fdata_denc(in->fscrypt_ctx,
-                                                &in->fscrypt_key_validator);
+    FSCryptKeyValidatorRef key_validator;
+    auto denc = client->fscrypt->get_fdata_denc(in->fscrypt_ctx, &key_validator);
     will_encrypt = static_cast<bool>(denc);
   }
 #endif
