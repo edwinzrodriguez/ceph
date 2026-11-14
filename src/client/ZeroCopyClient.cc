@@ -18,6 +18,7 @@
 
 #include <cstdlib>
 #include <mutex>
+#include <vector>
 
 #include "client/Client.h"
 #include "client/ClientSnapRealm.h"
@@ -33,6 +34,10 @@
 #include "osdc/Filer.h"
 #include "osdc/Objecter.h"
 
+#if defined(__linux__)
+#include "client/FSCrypt.h"
+#endif
+
 namespace ceph {
 
 void ZeroCopyClient::queue_user_cb(Client* clnt, IoCallback cb, int64_t result,
@@ -46,17 +51,21 @@ void ZeroCopyClient::queue_user_cb(Client* clnt, IoCallback cb, int64_t result,
 }
 
 /**
- * Filer read completion. Objecter may invoke without client_lock; we take it,
- * finish short-read handling, drop FILE_RD, unlock, then run the user
- * callback. Context::complete() deletes this after finish returns.
+ * Filer read completion. Objecter may invoke without client_lock; we take it for
+ * size/cap/short-read bookkeeping, drop it for buffer assembly / decrypt and
+ * for Filer submit, then run the user callback. Context::complete() deletes
+ * this after finish returns (unless a short-read retry keeps the object alive).
+ *
+ * API payload is always plaintext: ciphertext from Filer is decrypted in place
+ * via decrypt_bl before the user callback (copy into a new bufferlist).
  */
 class C_ZC_Read : public Context {
 public:
   Client* clnt;
   Fh* fh;
   InodeRef in;
-  uint64_t off;
-  uint64_t len;
+  uint64_t off; ///< logical (plaintext) offset
+  uint64_t len; ///< logical (plaintext) length requested
   bufferlist* bl;
   IoCallback cb;
   uint64_t pos;
@@ -70,6 +79,16 @@ public:
   uint64_t truncate_size;
   uint32_t truncate_seq;
   bool fini = false; // like C_Read_Sync_NonBlocking: survive short-read retries
+  utime_t start_time;
+  uint64_t read_start = 0;
+  uint64_t read_len = 0;
+#if defined(__linux__)
+  // Per-op validator: avoid racing shared_ptr assigns on in->fscrypt_key_validator
+  // from concurrent ZC reads (prepare stays under client_lock for inode fields).
+  FSCryptKeyValidatorRef key_validator;
+  FSCryptFDataDencRef fscrypt_denc;
+  bufferlist encbl; ///< accumulates ciphertext when fscrypt_denc is set
+#endif
 
   C_ZC_Read(Client* clnt, Fh* fh, InodeRef in, uint64_t off, uint64_t len,
             bufferlist* bl, IoCallback cb, Filer* filer, file_layout_t layout,
@@ -77,7 +96,7 @@ public:
     clnt(clnt), fh(fh), in(std::move(in)), off(off), len(len), bl(bl),
     cb(std::move(cb)), pos(off), left(len), wanted(len), filer(filer),
     layout(std::move(layout)), snapid(snapid), truncate_size(truncate_size),
-    truncate_seq(truncate_seq)
+    truncate_seq(truncate_seq), start_time(mono_clock_now())
   {
     fh->get();
   }
@@ -92,9 +111,29 @@ public:
     clnt->_put_fh(fh);
   }
 
-  void start() { retry(); }
+  // Requires client_lock: reads inode size/ctx and sets up aligned range + denc.
+  // Does not submit to Filer — call submit() after unlocking.
+  void prepare()
+  {
+#if defined(__linux__)
+    clnt->fscrypt->prepare_data_read(in->fscrypt_ctx, &key_validator, off, len,
+                                     in->size, &read_start, &read_len,
+                                     &fscrypt_denc);
+    pos = read_start;
+    left = read_len;
+    wanted = read_len;
+#else
+    read_start = off;
+    read_len = len;
+    pos = off;
+    left = len;
+    wanted = len;
+#endif
+  }
 
-  void retry()
+  // Filer/Objecter submit — must not hold client_lock (avoids serializing
+  // concurrent ZC reads behind Objecter rwlock / message send under the mutex).
+  void submit()
   {
     filer->read_trunc(in->ino, &layout, snapid, pos, left, &tbl, 0,
                       truncate_size, truncate_seq, this);
@@ -114,6 +153,19 @@ public:
   {
     std::unique_lock lock(clnt->client_lock);
 
+    auto effective_size = in->effective_size();
+#if defined(__linux__)
+    auto target_len = std::min(len,
+                               effective_size > off ? effective_size - off : 0);
+    bufferlist* pbl = (fscrypt_denc ? &encbl : bl);
+#else
+    bufferlist* pbl = bl;
+#endif
+    // Defer claim_append of this completion's tbl until we either retry
+    // (must accumulate under lock) or leave client_lock on the success path
+    // (large non-FSCrypt reads: avoid holding the mutex across MiB copies).
+    bool have_tbl = false;
+
     if (r == -ENOENT) {
       r = 0;
     } else if (r < 0) {
@@ -125,14 +177,19 @@ public:
       read_bytes += r;
       pos += r;
       left -= r;
-      bl->claim_append(tbl);
+      have_tbl = true;
     }
 
     if (r >= 0 && static_cast<uint64_t>(r) < wanted) {
+      // Short OSD read: materialize this chunk before zero-fill / getattr /
+      // retry so accumulated ciphertext/plaintext stays in pbl across hops.
+      if (have_tbl) {
+        pbl->claim_append(tbl);
+        have_tbl = false;
+      }
       // Short OSD read: zero up to known EOF like C_Read_Sync_NonBlocking,
       // then re-check size. Retry the remainder only if the file grew / we
       // have not reached EOF yet.
-      auto effective_size = in->effective_size();
       if (pos < effective_size) {
         int64_t some = effective_size - pos;
         if (static_cast<uint64_t>(some) > left) {
@@ -140,13 +197,12 @@ public:
         }
         auto z = buffer::ptr_node::create(some);
         z->zero();
-        bl->push_back(std::move(z));
+        pbl->push_back(std::move(z));
         read_bytes += some;
         pos += some;
         left -= some;
         if (left == 0) {
-          r = read_bytes;
-          goto done;
+          goto success;
         }
       }
 
@@ -160,20 +216,55 @@ public:
 
       effective_size = in->effective_size();
       if (pos >= effective_size || left == 0) {
-        r = read_bytes;
-        goto done;
+        goto success;
       }
 
       wanted = left;
       truncate_size = in->truncate_size;
       truncate_seq = in->truncate_seq;
-      // Keep client_lock across submit; fini stays false until final completion.
-      retry();
+      // Submit under client_lock like C_Read_Sync_NonBlocking so an inline
+      // Objecter completion cannot re-enter finish() on this object. Initial
+      // submits from async_read() run unlocked after prepare().
+      submit();
       return;
     }
 
+  success:
     if (r >= 0) {
-      r = read_bytes;
+      // Buffer assembly (and FSCrypt decrypt) do not touch Client state —
+      // drop client_lock so concurrent ZC reads are not serialized on memcpy.
+      lock.unlock();
+      if (have_tbl) {
+        pbl->claim_append(tbl);
+        have_tbl = false;
+      }
+#if defined(__linux__)
+      if (fscrypt_denc) {
+        if (read_len > target_len) {
+          clnt->logger->inc(l_c_fscrypt_rd_amp, read_len - target_len);
+        }
+        std::vector<FSCryptFDataDenc::Segment> holes;
+        auto dec_start = mono_clock_now();
+        r = fscrypt_denc->decrypt_bl(off, target_len, read_start, holes, pbl);
+        clnt->logger->tinc(l_c_fscrypt_dec_lat, mono_clock_now() - dec_start);
+        if (r >= 0) {
+          bl->claim_append(*pbl);
+          clnt->logger->tinc(l_c_fscrypt_rd_lat, mono_clock_now() - start_time);
+        }
+      }
+#endif
+      if (r >= 0) {
+        // Match C_Read_Sync_NonBlocking: full physical read → report logical len.
+        if (read_len == read_bytes) {
+          r = len;
+        } else {
+          r = read_bytes;
+        }
+      }
+      lock.lock();
+      if (r < 0) {
+        goto done;
+      }
     }
 
   done:
@@ -219,6 +310,9 @@ public:
  * Filer write completion under client_lock (via C_Lock_Client_Finisher).
  * Updates size, drops BUFFER/WR (WR after optional fsync), then user cb.
  * Holds Client* only — never ZeroCopyClient* (stack wrappers must not be pinned).
+ *
+ * Payload lifetime: WriteEncMgr holds plaintext (and ciphertext after encrypt)
+ * until Objecter completion; do not keep a separate held_bl.
  */
 class C_ZC_Write : public Context {
 public:
@@ -226,27 +320,26 @@ public:
   Fh* fh;
   InodeRef in;
   utime_t start;
-  uint64_t offset;
-  uint64_t size;
-  uint64_t fpos; // 0 = do not update fh pos
+  uint64_t req_ofs; ///< logical (plaintext) offset
+  uint64_t req_size; ///< logical (plaintext) length
+  uint64_t fpos; ///< 0 = do not update fh pos
   bool do_fsync;
   bool syncdataonly;
   IoCallback cb;
-  bufferlist* held_bl; // keeps payload alive for Objecter
+  ceph::ref_t<Client::WriteEncMgr> enc_mgr;
 
-  C_ZC_Write(Client* clnt, Fh* fh, InodeRef in, utime_t start, uint64_t offset,
-             uint64_t size, uint64_t fpos, bool do_fsync, bool syncdataonly,
-             IoCallback cb, bufferlist* held_bl) :
-    clnt(clnt), fh(fh), in(std::move(in)), start(start), offset(offset),
-    size(size), fpos(fpos), do_fsync(do_fsync), syncdataonly(syncdataonly),
-    cb(std::move(cb)), held_bl(held_bl)
+  C_ZC_Write(Client* clnt, Fh* fh, InodeRef in, utime_t start, uint64_t req_ofs,
+             uint64_t req_size, uint64_t fpos, bool do_fsync, bool syncdataonly,
+             IoCallback cb, ceph::ref_t<Client::WriteEncMgr> enc_mgr) :
+    clnt(clnt), fh(fh), in(std::move(in)), start(start), req_ofs(req_ofs),
+    req_size(req_size), fpos(fpos), do_fsync(do_fsync),
+    syncdataonly(syncdataonly), cb(std::move(cb)), enc_mgr(std::move(enc_mgr))
   {
     fh->get();
   }
 
   ~C_ZC_Write() override
   {
-    delete held_bl;
     // Destroyed under client_lock (C_Lock_Client_Finisher → complete). Do not
     // re-lock — match C_Readahead. fh->put() alone never deletes.
     ceph_assert(ceph_mutex_is_locked_by_me(clnt->client_lock));
@@ -259,10 +352,17 @@ public:
 
     clnt->put_cap_ref(in.get(), CEPH_CAP_FILE_BUFFER);
 
+    const bool encrypted = enc_mgr->encrypted();
+    const int64_t phys_ofs = enc_mgr->get_ofs();
+    const uint64_t phys_size = enc_mgr->get_size();
+
     int64_t result = r;
     if (r >= 0) {
-      result = clnt->_write_success(fh, start, fpos, offset, size, offset, size,
-                                    in.get(), false);
+      result = clnt->_write_success(fh, start, fpos, req_ofs, req_size,
+                                    phys_ofs, phys_size, in.get(), encrypted);
+      if (encrypted) {
+        clnt->logger->tinc(l_c_fscrypt_wr_lat, mono_clock_now() - start);
+      }
     }
 
     if (r >= 0 && do_fsync) {
@@ -457,8 +557,10 @@ int ZeroCopyClient::async_read(Fh* fh, uint64_t off, uint64_t len, IoCallback cb
   client->logger->inc(l_c_aio_ops);
   client->inc_aio_in_flight();
 
+  // prepare_data_read needs client_lock for inode fields; Filer submit does not.
+  read_ctx->prepare();
   lock.unlock();
-  read_ctx->start();
+  read_ctx->submit();
   return 0;
 }
 
@@ -565,32 +667,37 @@ int ZeroCopyClient::async_write(Fh* fh, uint64_t off, bufferlist data,
     return 0;
   }
 
-  client->get_cap_ref(in, CEPH_CAP_FILE_BUFFER);
+  // Filer-only sink today (ObjectCacher routing is separate). WriteEncMgr
+  // performs optional FSCrypt RMW+encrypt (copy into ciphertext bl) then
+  // filer->write_trunc. BUFFER cap is taken inside do_write.
+  auto enc_mgr = ceph::make_ref<Client::WriteEncMgr_NotBuffered>(
+      client, fh, offset, size, data, true /* async */);
+  r = enc_mgr->init();
+  if (r < 0) {
+    client->put_cap_ref(in, CEPH_CAP_FILE_WR);
+    lock.unlock();
+    queue_user_cb(client, std::move(cb), r, {});
+    return 0;
+  }
 
-  auto* held_bl = new bufferlist(std::move(data));
   auto* write_ctx = new C_ZC_Write(client, fh, InodeRef(in), start, offset,
                                    size, fpos, fsync, syncdataonly,
-                                   std::move(cb), held_bl);
+                                   std::move(cb), enc_mgr);
 
   Context* filer_onfinish =
       new C_OnFinisher(new Client::C_Lock_Client_Finisher(client, write_ctx),
                        &client->objecter_finisher);
 
-  SnapContext snapc = in->snaprealm->get_snap_context();
-  file_layout_t layout = in->layout;
-  uint64_t trunc_size = in->truncate_size;
-  uint32_t trunc_seq = in->truncate_seq;
-  inodeno_t ino = in->ino;
-
   // Match _write / C_Write_Finisher (held through optional fsync).
   client->logger->inc(l_c_aio_ops);
   client->inc_aio_in_flight();
 
+  // read_modify_write requires client_lock for the encrypted RMW path.
+  // Ownership of filer_onfinish transfers into WriteEncMgr's completion
+  // lambda (and then Objecter). Match Client::_write Filer async: do not
+  // specially unwind on rare early RMW errors.
+  (void)enc_mgr->read_modify_write(filer_onfinish);
   lock.unlock();
-
-  client->filer->write_trunc(ino, &layout, snapc, offset, size, *held_bl,
-                             ceph::real_clock::now(), 0, trunc_size, trunc_seq,
-                             filer_onfinish);
   return 0;
 }
 

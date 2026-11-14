@@ -25,6 +25,7 @@
 
 #include "gtest/gtest.h"
 #include "include/cephfs/libcephfs.h"
+#include "include/compat.h"
 
 namespace {
 
@@ -161,7 +162,7 @@ TEST(LibCephFS, ZeroCopyUpperLayerAllocWrite)
   ASSERT_EQ(len, wiov[0].iov_len);
   // Page-aligned base for upper-layer readv.
   EXPECT_EQ(0u, reinterpret_cast<uintptr_t>(wiov[0].iov_base) &
-                    (static_cast<uintptr_t>(getpagesize()) - 1));
+                    (static_cast<uintptr_t>(get_page_size()) - 1));
   std::memset(wiov[0].iov_base, 0xa5, len);
   std::string expected(static_cast<char*>(wiov[0].iov_base), len);
 
