@@ -65,6 +65,7 @@ MDSOpWorkQueue::enqueue(OpWorkItem* item, DispatchLane lane)
       return;
     }
     const uint8_t producer = q.producer_bank.load(std::memory_order_relaxed);
+    item->note_enqueued();
     q.lists[producer].push_back(*item);
   }
 
@@ -140,6 +141,19 @@ MDSOpWorkQueue::has_work_for_consumer()
     }
   }
   return false;
+}
+
+size_t
+MDSOpWorkQueue::count()
+{
+  size_t n = 0;
+  for (auto& q : lanes) {
+    std::lock_guard lock(q.lock);
+    for (auto& list : q.lists) {
+      n += list.size();
+    }
+  }
+  return n;
 }
 
 void

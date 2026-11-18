@@ -47,6 +47,12 @@ OpWorkItem::create_callable(DispatchLane lane, std::function<void()> fn)
 }
 
 void
+OpWorkItem::note_enqueued()
+{
+  enqueued_at = ceph::coarse_mono_clock::now();
+}
+
+void
 OpWorkItem::destroy()
 {
   delete callable;
