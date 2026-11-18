@@ -2,23 +2,33 @@
 # -*- mode:python; tab-width:4; indent-tabs-mode:nil -*-
 # vim: ts=4 sw=4 expandtab
 #
-# Distributed crash monitor for MDS + ceph-fuse.
+# Distributed crash monitor for MDS (and optionally ceph-fuse).
 #
-# Watches the MDS admin socket (local) and ceph-fuse asoks on --client-host
-# peers (via SSH). At watch start, records each process's log path with
-# `config get log_file`. When ANY monitored process dies:
+# Always watches the local MDS admin socket. With --watch-fuse, also watches
+# ceph-fuse asoks on --client-host peers (via SSH). Kernel ceph mounts do not
+# need --watch-fuse; pass --client-host so mds-stall-debug.py can still collect
+# client debugfs. With --collect-kernel-logs, also grabs ceph/libceph/rbd
+# dmesg + journalctl lines (and dynamic_debug control) from each client.
+# At watch start, records each process's log path with `config get log_file`.
+# When ANY monitored process dies:
 #   1. `log dump` surviving processes
 #   2. copy all known logs into one stall directory
-#   3. run mds-stall-debug.py for MDS/client diagnostics
-#   4. if the MDS died: gdb the newest core + copy settings
+#   3. optional: collect kernel ceph/libceph/rbd logs from clients
+#   4. run mds-stall-debug.py for MDS/client diagnostics
+#   5. if the MDS died: gdb the newest core + copy settings
 #
-# Example:
+# Example (kernel clients):
 #   ./mds-crash-monitor.py \
 #       --asok /var/run/ceph/ceph-mds.mds_reactor.mon-000.0.asok \
 #       --output-dir /cephfs_perf/results/my-run \
 #       --client-host client-000 --client-host client-001 \
+#       --collect-kernel-logs \
 #       --crash-dir /crash \
 #       --ceph-mds /home/root/usr/local/wip-mds-hotpath-phase3/bin/ceph-mds
+#
+# Example (ceph-fuse clients):
+#   ./mds-crash-monitor.py ... --watch-fuse \
+#       --client-host client-000 --client-host client-001
 #
 
 from __future__ import annotations
@@ -294,9 +304,12 @@ def copy_settings(stall_dir: Path, settings: Optional[Path]) -> None:
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=(
-            "Distributed monitor for MDS + ceph-fuse asoks. When any monitored "
-            "process crashes, dump survivor logs, collect them, and run "
-            "mds-stall-debug.py (plus gdb if the MDS died)."
+            "Distributed monitor for the MDS asok (and optionally ceph-fuse). "
+            "When any monitored process crashes, dump survivor logs, collect "
+            "them, and run mds-stall-debug.py (plus gdb if the MDS died). "
+            "Kernel ceph mounts work without --watch-fuse; use --client-host "
+            "so stall-debug can collect client debugfs, and "
+            "--collect-kernel-logs for ceph/libceph/rbd dmesg lines."
         ),
     )
     p.add_argument(
@@ -359,7 +372,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         type=Path,
         default=Path("/var/run/ceph"),
         help="Directory for ceph-fuse-<host>.asok on clients "
-        "(default: /var/run/ceph)",
+        "(used with --watch-fuse; default: /var/run/ceph)",
     )
     p.add_argument(
         "--mds-settings",
@@ -371,17 +384,35 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--client-host",
         action="append",
         default=None,
-        help="Client host whose ceph-fuse asok is monitored (repeatable; "
+        help="Client host for stall-debug (debugfs / log copy) and, with "
+        "--watch-fuse, for ceph-fuse asok monitoring (repeatable; "
         f"default: {', '.join(DEFAULT_CLIENT_HOSTS)})",
     )
     p.add_argument(
         "--client-ssh-user",
         help="SSH username for probing/copying from --client-host",
     )
-    p.add_argument(
+    fuse_group = p.add_mutually_exclusive_group()
+    fuse_group.add_argument(
+        "--watch-fuse",
+        action="store_true",
+        help="Also monitor ceph-fuse asoks on --client-host peers "
+        "(default: off; omit for kernel ceph mounts)",
+    )
+    fuse_group.add_argument(
         "--no-fuse-watch",
         action="store_true",
-        help="Only watch the MDS asok (legacy single-process mode)",
+        help=argparse.SUPPRESS,  # legacy alias; fuse watch is off by default
+    )
+    p.add_argument(
+        "--collect-kernel-logs",
+        action="store_true",
+        help=(
+            "After a crash, collect kernel ceph / libceph / rbd logs from each "
+            "--client-host (dmesg + journalctl -k filtered lines, and matching "
+            "dynamic_debug/control entries). Intended for kernel mounts with "
+            "kcon_all.sh-style dynamic debug enabled."
+        ),
     )
     p.add_argument(
         "--grafana-url",
@@ -452,6 +483,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     settings = args.mds_settings.expanduser() if args.mds_settings else None
     client_hosts = args.client_host if args.client_host else list(DEFAULT_CLIENT_HOSTS)
     ssh_user = args.client_ssh_user
+    # Fuse asok watching is opt-in. --no-fuse-watch remains a no-op alias for
+    # older scripts (default is already MDS-only / kernel-friendly).
+    watch_fuse = bool(args.watch_fuse)
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -470,11 +504,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"error: failed to import helpers from {stall_debug}: {exc}")
         return 2
 
+    if watch_fuse:
+        log(
+            f"watching MDS + ceph-fuse on {len(client_hosts)} client host(s)"
+        )
+    else:
+        log(
+            "watching MDS only (kernel-friendly; pass --watch-fuse to also "
+            "monitor ceph-fuse asoks)"
+        )
+
     inventory = sd.build_cluster_watch_inventory(
         mds_asok=str(asok),
         mds_host=None,  # local MDS
         mds_log=mds_log_override,
-        client_hosts=None if args.no_fuse_watch else client_hosts,
+        client_hosts=client_hosts if watch_fuse else None,
         asok_dir=str(args.fuse_asok_dir.expanduser()),
         client_fuse_log_dir=str(args.log_dir.expanduser()),
         ssh_user=ssh_user,
@@ -530,6 +574,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         event=f"{crashed_role}-abort",
     )
 
+    # 1b) Kernel client logs ASAP (ring buffer can wrap during stall-debug).
+    klog_summary: Optional[Dict[str, Any]] = None
+    if args.collect_kernel_logs:
+        log(
+            f"collecting kernel ceph/libceph/rbd logs from "
+            f"{len(client_hosts)} client host(s)"
+        )
+        try:
+            klog_summary = sd.collect_client_kernel_logs(
+                output_dir=stall_dir,
+                hosts=list(client_hosts),
+                ssh_user=ssh_user,
+                timeout=args.timeout,
+                include_local=False,
+            )
+            log(
+                "kernel logs: copied={copied} empty={empty} errors={errors}".format(
+                    copied=klog_summary.get("copied", 0),
+                    empty=klog_summary.get("empty", 0),
+                    errors=klog_summary.get("errors", 0),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            log(f"warning: kernel log collection failed: {exc}")
+
     # 2) Stall diagnostics (MDS asok may be dead; best-effort).
     run_stall_debug(
         stall_dir=stall_dir,
@@ -541,6 +610,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         extra_args=args.stall_debug_arg,
         ssh_user=ssh_user,
     )
+
+    if klog_summary is not None:
+        try:
+            sd.append_client_kernel_log_report_section(
+                stall_dir / "report.txt", klog_summary,
+            )
+        except Exception as exc:  # noqa: BLE001 - best-effort
+            log(f"warning: failed to append kernel log report: {exc}")
 
     # 3) MDS-only: gdb core + settings.
     if crashed_role == "mds":

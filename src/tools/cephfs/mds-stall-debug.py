@@ -16,6 +16,8 @@
 #   ./mds-stall-debug.py --daemon mds.myfs-0.abc --client-debugfs \
 #       --client-host client-000 --client-host client-001
 #   (also copies /var/log/ceph/ceph-fuse-<host>.log when present)
+#   ./mds-stall-debug.py --daemon mds.myfs-0.abc --client-kernel-logs \
+#       --client-host client-000   # dmesg/journalctl ceph|libceph|rbd
 #
 # For cluster-wide crash capture (MDS + all ceph-fuse), prefer
 # mds-crash-monitor.py — it watches every asok, dumps survivors, collects
@@ -962,6 +964,11 @@ CLIENT_DEBUGFS_DEFAULT_FILES = ("mdsc", "mds_sessions", "osdc", "caps")
 CLIENT_FUSE_LOG_DIR = "client_logs"
 CLIENT_FUSE_LOG_SUMMARY = "client_fuse_logs.json"
 CLIENT_FUSE_LOG_DEFAULT_DIR = "/var/log/ceph"
+CLIENT_KERNEL_LOG_DIR = "client_kernel_logs"
+CLIENT_KERNEL_LOG_SUMMARY = "client_kernel_logs.json"
+# Dynamic-debug for ceph.ko / libceph.ko / rbd.ko lands in the kernel
+# ring buffer (see src/script/kcon_all.sh and doc/cephfs/troubleshooting.rst).
+CLIENT_KERNEL_LOG_GREP = r"ceph|libceph|rbd"
 CLIENT_FUSE_ASOK_DEFAULT_DIR = "/var/run/ceph"
 FUSE_ABORT_SUMMARY = "fuse_abort.json"
 FUSE_WATCH_INVENTORY = "fuse_watch_inventory.json"
@@ -2824,6 +2831,354 @@ def append_client_fuse_log_report_section(
         handle.write("\n")
 
 
+def _is_local_client_host(host: str) -> bool:
+    return host in ("localhost", "127.0.0.1", "::1")
+
+
+def _write_capture_result(
+    dest: Path,
+    text: str,
+    *,
+    status_if_empty: str = "empty",
+) -> Dict[str, Any]:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(text, encoding="utf-8", errors="replace")
+    nbytes = dest.stat().st_size if dest.exists() else 0
+    return {
+        "status": "copied" if nbytes else status_if_empty,
+        "path": str(dest),
+        "bytes": nbytes,
+    }
+
+
+def _run_capture_to_file(
+    cmd: List[str],
+    dest: Path,
+    *,
+    timeout: int,
+) -> Dict[str, Any]:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with dest.open("w", encoding="utf-8", errors="replace") as fh:
+            proc = subprocess.run(
+                cmd,
+                stdout=fh,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"status": "error", "error": str(exc), "path": str(dest)}
+    nbytes = dest.stat().st_size if dest.exists() else 0
+    if proc.returncode != 0 and nbytes == 0:
+        err = (proc.stderr or "").strip() or f"exit {proc.returncode}"
+        return {"status": "error", "error": err, "path": str(dest)}
+    return {
+        "status": "copied" if nbytes else "empty",
+        "path": str(dest),
+        "bytes": nbytes,
+        "returncode": proc.returncode,
+    }
+
+
+def _ssh_capture_to_file(
+    host: str,
+    remote_cmd: str,
+    dest: Path,
+    *,
+    timeout: int,
+    ssh_user: Optional[str] = None,
+) -> Dict[str, Any]:
+    target = f"{ssh_user}@{host}" if ssh_user else host
+    cmd = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ConnectTimeout=10",
+        target,
+        remote_cmd,
+    ]
+    return _run_capture_to_file(cmd, dest, timeout=timeout)
+
+
+def _filter_kernel_log_text(text: str) -> str:
+    pat = re.compile(CLIENT_KERNEL_LOG_GREP, re.IGNORECASE)
+    lines = [ln for ln in text.splitlines() if pat.search(ln)]
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
+def collect_client_kernel_logs_local(
+    dest_dir: Path,
+    *,
+    timeout: int,
+) -> Dict[str, Any]:
+    """Collect ceph/libceph/rbd kernel logs from the local host."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    artifacts: Dict[str, Any] = {}
+
+    dmesg_text = ""
+    dmesg_info: Dict[str, Any] = {"status": "error", "error": "dmesg unavailable"}
+    for args in (
+        ["dmesg", "-T"],
+        ["dmesg"],
+        ["sudo", "dmesg", "-T"],
+        ["sudo", "dmesg"],
+    ):
+        try:
+            proc = subprocess.run(
+                args,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            dmesg_info = {"status": "error", "error": str(exc)}
+            continue
+        if proc.returncode == 0:
+            dmesg_text = proc.stdout or ""
+            dmesg_info = _write_capture_result(dest_dir / "dmesg.txt", dmesg_text)
+            dmesg_info["command"] = " ".join(args)
+            break
+        dmesg_info = {
+            "status": "error",
+            "error": (proc.stderr or "").strip() or f"exit {proc.returncode}",
+            "command": " ".join(args),
+        }
+    artifacts["dmesg"] = dmesg_info
+
+    filtered = _filter_kernel_log_text(dmesg_text)
+    artifacts["dmesg_ceph"] = _write_capture_result(
+        dest_dir / "dmesg-ceph-libceph-rbd.txt",
+        filtered,
+        status_if_empty="empty",
+    )
+
+    dyn_path = Path("/sys/kernel/debug/dynamic_debug/control")
+    dyn_text = ""
+    if dyn_path.is_file():
+        try:
+            dyn_text = dyn_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            try:
+                proc = subprocess.run(
+                    ["sudo", "cat", str(dyn_path)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=min(timeout, 30),
+                )
+                if proc.returncode == 0:
+                    dyn_text = proc.stdout or ""
+            except (subprocess.TimeoutExpired, OSError) as exc:
+                artifacts["dynamic_debug"] = {
+                    "status": "error",
+                    "error": str(exc),
+                }
+    if "dynamic_debug" not in artifacts:
+        artifacts["dynamic_debug"] = _write_capture_result(
+            dest_dir / "dynamic_debug-ceph-libceph-rbd.txt",
+            _filter_kernel_log_text(dyn_text),
+        )
+
+    journal_cmd = (
+        "journalctl -k -b --no-pager 2>/dev/null "
+        f"| grep -E '{CLIENT_KERNEL_LOG_GREP}' || true"
+    )
+    artifacts["journalctl_kernel_ceph"] = _run_capture_to_file(
+        ["bash", "-lc", journal_cmd],
+        dest_dir / "journalctl-kernel-ceph-libceph-rbd.txt",
+        timeout=timeout,
+    )
+
+    statuses = [a.get("status") for a in artifacts.values()]
+    if any(s == "copied" for s in statuses):
+        overall = "copied"
+    elif any(s != "error" for s in statuses):
+        overall = "empty"
+    else:
+        overall = "error"
+    return {
+        "host": "localhost",
+        "status": overall,
+        "dest_dir": str(dest_dir),
+        "artifacts": artifacts,
+    }
+
+
+def collect_client_kernel_logs_remote(
+    host: str,
+    dest_dir: Path,
+    *,
+    timeout: int,
+    ssh_user: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Collect ceph/libceph/rbd kernel logs from a remote client via SSH."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    grep = CLIENT_KERNEL_LOG_GREP
+    artifacts: Dict[str, Any] = {}
+
+    artifacts["dmesg"] = _ssh_capture_to_file(
+        host,
+        "(dmesg -T 2>/dev/null || dmesg)",
+        dest_dir / "dmesg.txt",
+        timeout=timeout,
+        ssh_user=ssh_user,
+    )
+    artifacts["dmesg_ceph"] = _ssh_capture_to_file(
+        host,
+        f"(dmesg -T 2>/dev/null || dmesg) | grep -E '{grep}' || true",
+        dest_dir / "dmesg-ceph-libceph-rbd.txt",
+        timeout=timeout,
+        ssh_user=ssh_user,
+    )
+    artifacts["dynamic_debug"] = _ssh_capture_to_file(
+        host,
+        (
+            "ctrl=/sys/kernel/debug/dynamic_debug/control; "
+            f"grep -E '{grep}' \"$ctrl\" 2>/dev/null "
+            f"|| sudo grep -E '{grep}' \"$ctrl\" 2>/dev/null "
+            "|| true"
+        ),
+        dest_dir / "dynamic_debug-ceph-libceph-rbd.txt",
+        timeout=timeout,
+        ssh_user=ssh_user,
+    )
+    artifacts["journalctl_kernel_ceph"] = _ssh_capture_to_file(
+        host,
+        f"journalctl -k -b --no-pager 2>/dev/null | grep -E '{grep}' || true",
+        dest_dir / "journalctl-kernel-ceph-libceph-rbd.txt",
+        timeout=timeout,
+        ssh_user=ssh_user,
+    )
+
+    statuses = [a.get("status") for a in artifacts.values()]
+    if any(s == "copied" for s in statuses):
+        overall = "copied"
+    elif any(s != "error" for s in statuses):
+        overall = "empty"
+    else:
+        overall = "error"
+    return {
+        "host": host,
+        "status": overall,
+        "dest_dir": str(dest_dir),
+        "artifacts": artifacts,
+    }
+
+
+def collect_client_kernel_logs(
+    *,
+    output_dir: Path,
+    hosts: Optional[List[str]] = None,
+    ssh_user: Optional[str] = None,
+    timeout: int = 60,
+    include_local: bool = True,
+) -> Dict[str, Any]:
+    """
+    Collect kernel ring-buffer / journal lines for the ceph, libceph, and rbd
+    modules from each client (dynamic debug via kcon_all.sh style logging).
+
+    Per host under client_kernel_logs/<host>/:
+      - dmesg.txt
+      - dmesg-ceph-libceph-rbd.txt
+      - dynamic_debug-ceph-libceph-rbd.txt
+      - journalctl-kernel-ceph-libceph-rbd.txt
+    """
+    out_root = output_dir / CLIENT_KERNEL_LOG_DIR
+    host_list: List[str] = []
+    if include_local and not hosts:
+        host_list = ["localhost"]
+    for host in hosts or []:
+        host_list.append(host)
+
+    results: List[Dict[str, Any]] = []
+    for host in host_list:
+        label = sanitize_host_label(
+            client_fuse_host_label(host) if not _is_local_client_host(host)
+            else "localhost"
+        )
+        dest = out_root / label
+        try:
+            if _is_local_client_host(host):
+                entry = collect_client_kernel_logs_local(dest, timeout=timeout)
+            else:
+                entry = collect_client_kernel_logs_remote(
+                    host, dest, timeout=timeout, ssh_user=ssh_user,
+                )
+        except Exception as exc:  # noqa: BLE001 - best-effort per host
+            entry = {
+                "host": host,
+                "status": "error",
+                "error": str(exc),
+                "dest_dir": str(dest),
+                "artifacts": {},
+            }
+        results.append(entry)
+
+    summary = {
+        "grep": CLIENT_KERNEL_LOG_GREP,
+        "host_count": len(results),
+        "copied": sum(1 for r in results if r.get("status") == "copied"),
+        "empty": sum(1 for r in results if r.get("status") == "empty"),
+        "errors": sum(1 for r in results if r.get("status") == "error"),
+        "hosts": results,
+        "collected_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    write_json_artifact(output_dir / CLIENT_KERNEL_LOG_SUMMARY, summary)
+    return summary
+
+
+def format_client_kernel_log_report(summary: Dict[str, Any]) -> List[str]:
+    lines = ["== Client kernel logs (ceph / libceph / rbd) =="]
+    lines.append(
+        "Hosts={hosts}, copied={copied}, empty={empty}, errors={errors} "
+        "(dmesg + journalctl -k filtered for {grep}; dynamic_debug control)".format(
+            hosts=summary.get("host_count", 0),
+            copied=summary.get("copied", 0),
+            empty=summary.get("empty", 0),
+            errors=summary.get("errors", 0),
+            grep=summary.get("grep", CLIENT_KERNEL_LOG_GREP),
+        )
+    )
+    for host in summary.get("hosts") or []:
+        status = host.get("status") or "?"
+        extra = ""
+        if host.get("error"):
+            extra = f": {host.get('error')}"
+        elif host.get("dest_dir"):
+            arts = host.get("artifacts") or {}
+            copied = [
+                name for name, info in arts.items()
+                if (info or {}).get("status") == "copied"
+            ]
+            if copied:
+                extra = f" -> {host.get('dest_dir')} ({', '.join(copied)})"
+            else:
+                extra = f" ({host.get('dest_dir')})"
+        lines.append(f"- {host.get('host')}: {status}{extra}")
+    return lines
+
+
+def append_client_kernel_log_report_section(
+    report_path: Path,
+    summary: Dict[str, Any],
+) -> None:
+    if not report_path.exists():
+        return
+    section = format_client_kernel_log_report(summary)
+    with report_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+        handle.write("\n".join(section))
+        handle.write("\n")
+
+
 def _watch_log(msg: str) -> None:
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"[{ts}] {msg}", flush=True)
@@ -4046,6 +4401,7 @@ def collect_from_dir(
     client_debugfs_files: Optional[List[str]] = None,
     client_ssh_user: Optional[str] = None,
     client_fuse_log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
+    client_kernel_logs: bool = False,
 ) -> None:
     blocked_path = input_dir / "blocked_ops.json"
     locks_path = input_dir / "ops_locks.json"
@@ -4203,6 +4559,17 @@ def collect_from_dir(
         append_client_fuse_log_report_section(
             output_dir / "report.txt", fuse_summary,
         )
+    if client_kernel_logs:
+        klog_summary = collect_client_kernel_logs(
+            output_dir=output_dir,
+            hosts=client_hosts,
+            ssh_user=client_ssh_user,
+            timeout=metrics_timeout,
+            include_local=not client_hosts,
+        )
+        append_client_kernel_log_report_section(
+            output_dir / "report.txt", klog_summary,
+        )
 
 
 def collect(
@@ -4230,11 +4597,13 @@ def collect(
     client_debugfs_files: Optional[List[str]] = None,
     client_ssh_user: Optional[str] = None,
     client_fuse_log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
+    client_kernel_logs: bool = False,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     collection_errors: Dict[str, str] = {}
     allow_partial = bool(
-        client_debugfs or client_hosts or grafana_url or prometheus_url
+        client_debugfs or client_hosts or client_kernel_logs
+        or grafana_url or prometheus_url
     )
 
     blocked, err = invoke_optional(invoke, ["dump_blocked_ops"])
@@ -4434,6 +4803,17 @@ def collect(
         )
         append_client_fuse_log_report_section(
             output_dir / "report.txt", fuse_summary,
+        )
+    if client_kernel_logs:
+        klog_summary = collect_client_kernel_logs(
+            output_dir=output_dir,
+            hosts=client_hosts,
+            ssh_user=client_ssh_user,
+            timeout=metrics_timeout,
+            include_local=not client_hosts,
+        )
+        append_client_kernel_log_report_section(
+            output_dir / "report.txt", klog_summary,
         )
 
     if collection_errors:
@@ -4648,6 +5028,16 @@ def main() -> int:
         help=(
             "Directory on each client for ceph-fuse-<host>.log "
             f"(default: {CLIENT_FUSE_LOG_DEFAULT_DIR}). Copied when present."
+        ),
+    )
+    parser.add_argument(
+        "--client-kernel-logs",
+        action="store_true",
+        help=(
+            "Collect kernel ceph / libceph / rbd logs from each --client-host "
+            "(dmesg + journalctl -k filtered lines, plus matching "
+            "dynamic_debug/control entries). Useful with kcon_all.sh-style "
+            "dynamic debug on kernel mounts."
         ),
     )
     parser.add_argument(
@@ -4873,6 +5263,7 @@ def main() -> int:
             "client_debugfs_files": files or list(CLIENT_DEBUGFS_DEFAULT_FILES),
             "client_ssh_user": args.client_ssh_user,
             "client_fuse_log_dir": args.client_fuse_log_dir,
+            "client_kernel_logs": args.client_kernel_logs,
         }
 
     if args.from_dir and not (args.mds or args.daemon):
