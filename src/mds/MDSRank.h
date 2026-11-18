@@ -314,6 +314,8 @@ class MDSRank {
     }
 
     void handle_write_error(int err);
+    /// Off-thread entry: takes mds_lock (classic) or submit_callable(Control)
+    /// (reactor). Prefer handle_write_error when already rank-exclusive.
     void handle_write_error_with_lock(int err);
 
     void update_mlogger();
@@ -470,6 +472,8 @@ class MDSRank {
       return inject_journal_corrupt_dentry_first;
     }
 
+    /// Sync cache lookups for MetricsHandler.  Under reactor these hop to
+    /// the Control lane (caller blocks); classic takes mds_lock inline.
     std::string get_path(inodeno_t ino);
     uint64_t get_inode_rbytes(inodeno_t ino);
 
@@ -660,6 +664,9 @@ class MDSRank {
     void active_start();
     void stopping_start();
     void stopping_done();
+
+    /// Phase 2 Option A: gate Client/Maintenance drain during boot/replay.
+    void update_reactor_boot_policy();
 
     void validate_sessions();
 

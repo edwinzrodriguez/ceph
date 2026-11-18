@@ -383,8 +383,8 @@ void MetricsHandler::handle_payload(Session* session,  const SubvolumeMetricsPay
   resolved_paths.reserve(payload.subvolume_metrics.size());
 
   {
-    // Scoped unlock: resolve paths without holding the metrics lock
-    // to avoid contention with mds_lock inside get_path().
+    // Scoped unlock: resolve paths without holding the metrics lock.
+    // get_path() is rank-exclusive (Control lane under reactor, or mds_lock).
     UnlockGuard unlock_guard{lk};
     for (const auto& metric : payload.subvolume_metrics) {
       std::string path = mds->get_path(metric.subvolume_id);
@@ -521,7 +521,7 @@ void MetricsHandler::update_rank0(std::unique_lock<ceph::mutex>& locker) {
     }
   }
 
-  // Step 2 (unlocked): fetch rbytes under mds_lock via helper
+  // Step 2 (unlocked): fetch rbytes via rank-exclusive helper
   std::unordered_map<inodeno_t, uint64_t> subvol_used_bytes;
   {
     UnlockGuard unlock_guard{locker};
