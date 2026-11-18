@@ -20,6 +20,13 @@
 #include "common/perf_counters.h"
 #include "include/compat.h"
 
+#include "MDCache.h"
+#include "MDSContext.h"
+#include "MDSDaemon.h"
+#include "MDSRank.h"
+#include "OpWorkItem.h"
+#include "classify.h"
+
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 
@@ -180,13 +187,15 @@ ReactorDispatchEngine::submit_io_completion(MDSIOContextBase* ioctx, int r)
 void
 ReactorDispatchEngine::submit_advance_queues()
 {
-  queue.wake();
+  OpWorkItem* item = OpWorkItem::create_advance();
+  enqueue_item(item, DispatchLane::Control);
 }
 
 void
 ReactorDispatchEngine::submit_trim_tick()
 {
-  queue.wake();
+  OpWorkItem* item = OpWorkItem::create_trim();
+  enqueue_item(item, DispatchLane::Maintenance);
 }
 
 void
@@ -201,7 +210,7 @@ ReactorDispatchEngine::submit_callable(
 void
 ReactorDispatchEngine::note_finished_queued()
 {
-  queue.wake();
+  submit_advance_queues();
 }
 
 void
@@ -259,6 +268,12 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
       execute_io_completion(item->io_ctx, item->rval);
       break;
 
+    case WorkKind::AdvanceQueues:
+      if (ctx.rank) {
+        ctx.rank->_advance_queues();
+      }
+      break;
+
     case WorkKind::Callable:
       if (item->callable && *item->callable) {
         (*item->callable)();
@@ -266,6 +281,9 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
       break;
 
     case WorkKind::TrimQuantum:
+      if (ctx.rank && ctx.rank->mdcache) {
+        ctx.rank->mdcache->trim_quantum();
+      }
       break;
     }
   }
