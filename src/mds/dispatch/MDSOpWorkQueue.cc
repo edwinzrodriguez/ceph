@@ -45,6 +45,7 @@ MDSOpWorkQueue::clear_lane(LaneQueue& lane)
       OpWorkItem& item = list.front();
       list.pop_front();
       depth.fetch_sub(1, std::memory_order_relaxed);
+      lane.depth.fetch_sub(1, std::memory_order_relaxed);
       item.destroy();
     }
   }
@@ -69,6 +70,7 @@ MDSOpWorkQueue::enqueue(OpWorkItem* item, DispatchLane lane)
     item->note_enqueued();
     q.lists[producer].push_back(*item);
     depth.fetch_add(1, std::memory_order_relaxed);
+    q.depth.fetch_add(1, std::memory_order_relaxed);
   }
 
   {
@@ -87,6 +89,7 @@ MDSOpWorkQueue::try_pop_consumer(LaneQueue& lane)
   OpWorkItem& item = list.front();
   list.pop_front();
   depth.fetch_sub(1, std::memory_order_relaxed);
+  lane.depth.fetch_sub(1, std::memory_order_relaxed);
   return &item;
 }
 
@@ -155,6 +158,13 @@ size_t
 MDSOpWorkQueue::count() const
 {
   return depth.load(std::memory_order_relaxed);
+}
+
+size_t
+MDSOpWorkQueue::count(DispatchLane lane) const
+{
+  ceph_assert(lane < DispatchLane::Count);
+  return lanes[static_cast<size_t>(lane)].depth.load(std::memory_order_relaxed);
 }
 
 void
