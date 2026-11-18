@@ -26,12 +26,16 @@
  * mds_reactor_slice_backlog_target.
  * TrimQuantum/LogTrim are single-flight and cooperatively time-sliced.
  *
+ * Rank exclusivity: after boot, execute_item does not take mds_lock; the
+ * registered op thread owns exclusivity (MDS_ASSERT_RANK_EXCLUSIVE /
+ * ReactorOwnerToken). Classic mode, SafeTimer, and lifecycle paths still use
+ * the real mutex.
+ *
  * Boot exclusivity: while MDSRank is creating, starting,
- * or in any replay state, drain only Control and IOComplete. Client and
- * Maintenance items remain queued so MDLog::_replay_thread /
- * _recovery_thread can hold mds_lock without racing the op thread on
- * those lanes. Cleared via set_boot_exclusive(false) when leaving those
- * states.
+ * or in any replay state, drain only Control and IOComplete, and take a real
+ * MdsLockGuard so those items serialize with MDLog::_replay_thread /
+ * _recovery_thread (which still hold mds_lock). Client and Maintenance remain
+ * queued until set_boot_exclusive(false).
  */
 
 #pragma once
