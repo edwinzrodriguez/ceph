@@ -4281,9 +4281,13 @@ void Locker::handle_client_cap_release(const cref_t<MClientCapRelease> &m)
 
   Session *session = mds->get_session(m);
 
+  CapReleaseEvalBatch batch;
   for (const auto &cap : m->caps) {
-    _do_cap_release(client, inodeno_t((uint64_t)cap.ino) , cap.cap_id, cap.migrate_seq, cap.issue_seq);
+    _do_cap_release(
+        client, inodeno_t((uint64_t)cap.ino), cap.cap_id, cap.migrate_seq,
+        cap.issue_seq, session, &batch);
   }
+  flush_cap_release_eval_batch(batch);
 
   if (session) {
     session->notify_cap_release(m->caps.size());
@@ -4305,20 +4309,45 @@ public:
   }
 };
 
-void Locker::_do_cap_release(client_t client, inodeno_t ino, uint64_t cap_id,
-			     ceph_seq_t mseq, ceph_seq_t seq)
+namespace {
+bool
+cap_release_gather_needed(CInode* in)
+{
+  return !in->filelock.is_stable() || !in->authlock.is_stable() ||
+         !in->linklock.is_stable() || !in->xattrlock.is_stable();
+}
+} // anonymous namespace
+
+void
+Locker::_do_cap_release(
+    client_t client,
+    inodeno_t ino,
+    uint64_t cap_id,
+    ceph_seq_t mseq,
+    ceph_seq_t seq,
+    Session* session,
+    CapReleaseEvalBatch* batch)
 {
   if (mds->logger)
     mds->logger->inc(l_mds_cap_release);
 
-  CInode *in = mdcache->get_inode(ino);
+  CInode* in = nullptr;
+  Capability* cap = nullptr;
+  if (session) {
+    cap = session->find_cap(ino);
+    if (cap)
+      in = cap->get_inode();
+  }
+  if (!in)
+    in = mdcache->get_inode(ino);
   if (!in) {
     if (mds->logger)
       mds->logger->inc(l_mds_cap_release_ignored);
     dout(7) << "_do_cap_release missing ino " << ino << dendl;
     return;
   }
-  Capability *cap = in->get_client_cap(client);
+  if (!cap)
+    cap = in->get_client_cap(client);
   if (!cap) {
     if (mds->logger)
       mds->logger->inc(l_mds_cap_release_ignored);
@@ -4350,18 +4379,53 @@ void Locker::_do_cap_release(client_t client, inodeno_t ino, uint64_t cap_id,
       mds->logger->inc(l_mds_cap_release_stale_seq);
     dout(7) << " issue_seq " << seq << " < " << cap->get_last_issue() << dendl;
     // clean out any old revoke history
-    cap->clean_revoke_from(seq);
-    if (mds->logger)
-      mds->logger->inc(l_mds_cap_release_eval);
-    eval_cap_gather(in);
+    const bool revoke_changed = cap->clean_revoke_from(seq);
+    if (!revoke_changed && !cap_release_gather_needed(in))
+      return;
+    if (batch) {
+      batch->gather.insert(in);
+      batch->deferred_eval_ops++;
+    } else {
+      if (mds->logger)
+        mds->logger->inc(l_mds_cap_release_eval);
+      eval_cap_gather(in);
+    }
     return;
   }
   if (mds->logger)
     mds->logger->inc(l_mds_cap_release_remove);
-  remove_client_cap(in, cap);
+  remove_client_cap(in, cap, false, batch);
 }
 
-void Locker::remove_client_cap(CInode *in, Capability *cap, bool kill)
+void
+Locker::flush_cap_release_eval_batch(CapReleaseEvalBatch& batch)
+{
+  unsigned eval_count = 0;
+  for (CInode* in : batch.gather) {
+    if (batch.try_eval.count(in))
+      continue;
+    if (mds->logger)
+      mds->logger->inc(l_mds_cap_release_eval);
+    eval_cap_gather(in);
+    eval_count++;
+  }
+  for (CInode* in : batch.try_eval) {
+    if (mds->logger)
+      mds->logger->inc(l_mds_cap_release_eval);
+    try_eval(in, CEPH_CAP_LOCKS);
+    eval_count++;
+  }
+  if (mds->logger && batch.deferred_eval_ops > eval_count)
+    mds->logger->inc(
+        l_mds_cap_release_eval_batched, batch.deferred_eval_ops - eval_count);
+}
+
+void
+Locker::remove_client_cap(
+    CInode* in,
+    Capability* cap,
+    bool kill,
+    CapReleaseEvalBatch* batch)
 {
   client_t client = cap->get_client();
   // clean out any pending snapflush state
@@ -4395,9 +4459,14 @@ void Locker::remove_client_cap(CInode *in, Capability *cap, bool kill)
     request_inode_file_caps(in);
   }
 
-  if (mds->logger)
-    mds->logger->inc(l_mds_cap_release_eval);
-  try_eval(in, CEPH_CAP_LOCKS);
+  if (batch) {
+    batch->try_eval.insert(in);
+    batch->deferred_eval_ops++;
+  } else {
+    if (mds->logger)
+      mds->logger->inc(l_mds_cap_release_eval);
+    try_eval(in, CEPH_CAP_LOCKS);
+  }
 }
 
 std::set<client_t> Locker::get_late_revoking_clients(double timeout)
