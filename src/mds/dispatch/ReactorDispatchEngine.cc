@@ -102,6 +102,32 @@ ReactorDispatchEngine::refresh_cached_conf()
   queue_len_abort_limit.store(
       g_conf().get_val<uint64_t>("mds_reactor_queue_len_abort"),
       std::memory_order_relaxed);
+  const uint64_t prev_client_high =
+      client_enqueue_high.load(std::memory_order_relaxed);
+  client_enqueue_high.store(
+      g_conf().get_val<uint64_t>("mds_reactor_client_enqueue_high"),
+      std::memory_order_relaxed);
+  client_enqueue_low.store(
+      g_conf().get_val<uint64_t>("mds_reactor_client_enqueue_low"),
+      std::memory_order_relaxed);
+  // Disabling throttle (or lowering high) must wake any waiters.
+  if (prev_client_high != 0 &&
+      (client_enqueue_high.load(std::memory_order_relaxed) == 0 ||
+       client_enqueue_high.load(std::memory_order_relaxed) < prev_client_high)) {
+    maybe_notify_client_enqueue_throttle();
+  }
+  const uint64_t prev_io_high = io_enqueue_high.load(std::memory_order_relaxed);
+  io_enqueue_high.store(
+      g_conf().get_val<uint64_t>("mds_reactor_io_enqueue_high"),
+      std::memory_order_relaxed);
+  io_enqueue_low.store(
+      g_conf().get_val<uint64_t>("mds_reactor_io_enqueue_low"),
+      std::memory_order_relaxed);
+  if (prev_io_high != 0 &&
+      (io_enqueue_high.load(std::memory_order_relaxed) == 0 ||
+       io_enqueue_high.load(std::memory_order_relaxed) < prev_io_high)) {
+    maybe_notify_io_enqueue_throttle();
+  }
   cache_trim_max_duration_ms.store(
       g_conf()
           .get_val<std::chrono::milliseconds>("mds_cache_trim_max_duration")
@@ -146,6 +172,28 @@ ReactorDispatchEngine::refresh_cached_conf()
               "mds_reactor_lane_slice_client_max")
           .count(),
       std::memory_order_relaxed);
+  client_slice_min_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>(
+              "mds_reactor_lane_slice_client_min")
+          .count(),
+      std::memory_order_relaxed);
+  io_slice_max_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_reactor_lane_slice_io_max")
+          .count(),
+      std::memory_order_relaxed);
+  io_slice_min_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_reactor_lane_slice_io_min")
+          .count(),
+      std::memory_order_relaxed);
+  maintenance_slice_max_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>(
+              "mds_reactor_lane_slice_maintenance_max")
+          .count(),
+      std::memory_order_relaxed);
   maintenance_slice_min_ms.store(
       g_conf()
           .get_val<std::chrono::milliseconds>(
@@ -163,6 +211,10 @@ void
 ReactorDispatchEngine::handle_conf_change(const std::set<std::string>& changed)
 {
   if (changed.count("mds_reactor_queue_len_abort") ||
+      changed.count("mds_reactor_client_enqueue_high") ||
+      changed.count("mds_reactor_client_enqueue_low") ||
+      changed.count("mds_reactor_io_enqueue_high") ||
+      changed.count("mds_reactor_io_enqueue_low") ||
       changed.count("mds_cache_trim_max_duration") ||
       changed.count("mds_log_trim_max_duration") ||
       changed.count("mds_reactor_lane_slice_control") ||
@@ -172,6 +224,10 @@ ReactorDispatchEngine::handle_conf_change(const std::set<std::string>& changed)
       changed.count("mds_reactor_slice_exec_window") ||
       changed.count("mds_reactor_slice_backlog_target") ||
       changed.count("mds_reactor_lane_slice_client_max") ||
+      changed.count("mds_reactor_lane_slice_client_min") ||
+      changed.count("mds_reactor_lane_slice_io_max") ||
+      changed.count("mds_reactor_lane_slice_io_min") ||
+      changed.count("mds_reactor_lane_slice_maintenance_max") ||
       changed.count("mds_reactor_lane_slice_maintenance_min")) {
     refresh_cached_conf();
   }
@@ -203,21 +259,87 @@ ReactorDispatchEngine::client_backlog_us() const
 }
 
 double
-ReactorDispatchEngine::client_adapt_t() const
+ReactorDispatchEngine::backlog_adapt_t(uint64_t backlog_us) const
 {
   const uint64_t target =
       slice_backlog_target_us.load(std::memory_order_relaxed);
   if (target == 0) {
     return 0.0;
   }
-  const uint64_t backlog = client_backlog_us();
   constexpr double max_ratio = 4.0;
-  const double ratio = static_cast<double>(backlog) /
+  const double ratio = static_cast<double>(backlog_us) /
                        static_cast<double>(target);
   if (ratio < 1.0) {
     return 0.0;
   }
   return std::min(1.0, (std::min(ratio, max_ratio) - 1.0) / (max_ratio - 1.0));
+}
+
+std::pair<DispatchLane, uint64_t>
+ReactorDispatchEngine::dominant_adaptable_backlog() const
+{
+  // Control is not adapted. Pick the busiest among the other three.
+  static constexpr DispatchLane k_adaptable[] = {
+      DispatchLane::IOComplete,
+      DispatchLane::Maintenance,
+      DispatchLane::Client,
+  };
+  DispatchLane dominant = DispatchLane::Client;
+  uint64_t max_bl = 0;
+  for (const auto lane : k_adaptable) {
+    const uint64_t bl = estimated_backlog_us(lane);
+    if (bl > max_bl) {
+      max_bl = bl;
+      dominant = lane;
+    }
+  }
+  return {dominant, max_bl};
+}
+
+int64_t
+ReactorDispatchEngine::lane_slice_max_ms(DispatchLane lane) const
+{
+  switch (lane) {
+  case DispatchLane::IOComplete:
+    return io_slice_max_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Maintenance:
+    return maintenance_slice_max_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Client:
+    return client_slice_max_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Control:
+  case DispatchLane::Count:
+    break;
+  }
+  return 0;
+}
+
+int64_t
+ReactorDispatchEngine::lane_slice_min_ms(DispatchLane lane) const
+{
+  switch (lane) {
+  case DispatchLane::IOComplete:
+    return io_slice_min_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Maintenance:
+    return maintenance_slice_min_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Client:
+    return client_slice_min_ms.load(std::memory_order_relaxed);
+  case DispatchLane::Control:
+  case DispatchLane::Count:
+    break;
+  }
+  return 0;
+}
+
+int64_t
+ReactorDispatchEngine::lerp_slice_ms(int64_t base, int64_t bound, double t)
+{
+  if (t <= 0.0) {
+    return base;
+  }
+  if (t >= 1.0) {
+    return bound;
+  }
+  return base + static_cast<int64_t>((bound - base) * t);
 }
 
 int64_t
@@ -229,32 +351,35 @@ ReactorDispatchEngine::lane_slice_ms(DispatchLane lane) const
   if (base <= 0) {
     return base;
   }
-  if (lane != DispatchLane::Client && lane != DispatchLane::Maintenance) {
+  // Control keeps a stable slice so maps/session traffic still get a turn.
+  if (lane == DispatchLane::Control) {
     return base;
   }
 
-  const double t = client_adapt_t();
+  const auto [dominant, dom_backlog] = dominant_adaptable_backlog();
+  const double t = backlog_adapt_t(dom_backlog);
   if (t <= 0.0) {
     return base;
   }
 
-  if (lane == DispatchLane::Client) {
-    int64_t max_ms = client_slice_max_ms.load(std::memory_order_relaxed);
+  if (lane == dominant) {
+    int64_t max_ms = lane_slice_max_ms(lane);
     if (max_ms < base) {
       max_ms = base;
     }
-    return base + static_cast<int64_t>((max_ms - base) * t);
+    return lerp_slice_ms(base, max_ms, t);
   }
 
-  // Maintenance: cut toward floor under Client backlog pressure.
-  int64_t min_ms = maintenance_slice_min_ms.load(std::memory_order_relaxed);
+  // Non-dominant adaptable lane: cut toward floor so the busy lane gets more
+  // relative time without starving anyone completely.
+  int64_t min_ms = lane_slice_min_ms(lane);
   if (min_ms < 0) {
     min_ms = 0;
   }
   if (min_ms > base) {
     min_ms = base;
   }
-  return base - static_cast<int64_t>((base - min_ms) * t);
+  return lerp_slice_ms(base, min_ms, t);
 }
 
 void
@@ -285,10 +410,36 @@ ReactorDispatchEngine::maybe_abort_on_queue_depth(size_t depth)
     return;
   }
 
+  static constexpr const char* lane_names[] = {
+      "Control", "IOComplete", "Maintenance", "Client"};
+  const auto [dominant, dom_backlog] = dominant_adaptable_backlog();
+  const double adapt_t = backlog_adapt_t(dom_backlog);
+  const size_t nlanes = static_cast<size_t>(DispatchLane::Count);
+
   derr << "mds_reactor_queue_len_abort: dispatch queue depth " << depth
        << " >= limit " << limit
        << " (queue_len_max=" << queue_len_max.load(std::memory_order_relaxed)
        << ")" << dendl;
+  for (size_t i = 0; i < nlanes; ++i) {
+    const auto lane = static_cast<DispatchLane>(i);
+    derr << "  lane " << lane_names[i]
+         << ": depth=" << queue.count(lane)
+         << " avg_exec_us=" << avg_exec_us(lane)
+         << " backlog_us=" << estimated_backlog_us(lane)
+         << " slice_ms=" << lane_slice_ms(lane)
+         << " (base="
+         << lane_slice_ms_cached[i].load(std::memory_order_relaxed)
+         << " min=" << lane_slice_min_ms(lane)
+         << " max=" << lane_slice_max_ms(lane) << ")" << dendl;
+  }
+  derr << "  adaptive: target_us="
+       << slice_backlog_target_us.load(std::memory_order_relaxed)
+       << " dominant=" << lane_names[static_cast<size_t>(dominant)]
+       << " dominant_backlog_us=" << dom_backlog << " adapt_t=" << adapt_t
+       << " client_enqueue_throttle_waiters="
+       << client_enqueue_throttle_waiters.load(std::memory_order_relaxed)
+       << " io_enqueue_throttle_waiters="
+       << io_enqueue_throttle_waiters.load(std::memory_order_relaxed) << dendl;
   publish_queue_depth_metrics();
   if (g_ceph_context && g_ceph_context->_log) {
     g_ceph_context->_log->dump_recent();
@@ -296,6 +447,175 @@ ReactorDispatchEngine::maybe_abort_on_queue_depth(size_t depth)
   ceph_abort_msg(
       "mds_reactor_queue_len_abort: reactor dispatch queue depth exceeded "
       "mds_reactor_queue_len_abort");
+}
+
+uint64_t
+ReactorDispatchEngine::client_enqueue_low_watermark(uint64_t high) const
+{
+  if (high == 0) {
+    return 0;
+  }
+  uint64_t low = client_enqueue_low.load(std::memory_order_relaxed);
+  if (low == 0 || low >= high) {
+    low = high / 2;
+  }
+  return low;
+}
+
+void
+ReactorDispatchEngine::maybe_throttle_client_enqueue()
+{
+  // Op thread must never block here (it is the sole Client drain).
+  if (mds::reactor_is_op_thread()) {
+    return;
+  }
+  // Boot exclusivity leaves Client queued and undrained — do not stall.
+  if (boot_exclusive.load(std::memory_order_acquire)) {
+    return;
+  }
+
+  uint64_t high = client_enqueue_high.load(std::memory_order_relaxed);
+  if (high == 0) {
+    return;
+  }
+  // Fast path only when below high and no cohort is draining to low.
+  // Otherwise new producers refill the (low, high) band and defeat hysteresis.
+  if (queue.count(DispatchLane::Client) < high &&
+      client_enqueue_throttle_waiters.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+
+  uint64_t low = client_enqueue_low_watermark(high);
+  std::unique_lock lock(client_enqueue_throttle_lock);
+  bool counted_wait = false;
+  while (!stop.load(std::memory_order_acquire) &&
+         !(ctx.daemon && ctx.daemon->stopping) &&
+         (high = client_enqueue_high.load(std::memory_order_relaxed)) != 0 &&
+         queue.count(DispatchLane::Client) >
+             (low = client_enqueue_low_watermark(high)) &&
+         (queue.count(DispatchLane::Client) >= high || counted_wait ||
+          client_enqueue_throttle_waiters.load(std::memory_order_relaxed) > 0)) {
+    if (!counted_wait) {
+      client_enqueue_throttle_waits.fetch_add(1, std::memory_order_relaxed);
+      counted_wait = true;
+    }
+    client_enqueue_throttle_waiters.fetch_add(1, std::memory_order_relaxed);
+    dout(5) << "client enqueue throttle: waiting (depth="
+            << queue.count(DispatchLane::Client) << " high=" << high
+            << " low=" << low << ")" << dendl;
+    client_enqueue_throttle_cond.wait_for(
+        lock, std::chrono::milliseconds(10), [this, &high, &low] {
+          if (stop.load(std::memory_order_acquire) ||
+              (ctx.daemon && ctx.daemon->stopping)) {
+            return true;
+          }
+          high = client_enqueue_high.load(std::memory_order_relaxed);
+          if (high == 0) {
+            return true;
+          }
+          low = client_enqueue_low_watermark(high);
+          return queue.count(DispatchLane::Client) <= low;
+        });
+    client_enqueue_throttle_waiters.fetch_sub(1, std::memory_order_relaxed);
+  }
+}
+
+void
+ReactorDispatchEngine::maybe_notify_client_enqueue_throttle()
+{
+  if (client_enqueue_throttle_waiters.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+  const uint64_t high = client_enqueue_high.load(std::memory_order_relaxed);
+  if (high == 0 || stop.load(std::memory_order_acquire) ||
+      (ctx.daemon && ctx.daemon->stopping) ||
+      queue.count(DispatchLane::Client) <= client_enqueue_low_watermark(high)) {
+    std::lock_guard lock(client_enqueue_throttle_lock);
+    client_enqueue_throttle_cond.notify_all();
+  }
+}
+
+uint64_t
+ReactorDispatchEngine::io_enqueue_low_watermark(uint64_t high) const
+{
+  if (high == 0) {
+    return 0;
+  }
+  uint64_t low = io_enqueue_low.load(std::memory_order_relaxed);
+  if (low == 0 || low >= high) {
+    low = high / 2;
+  }
+  return low;
+}
+
+void
+ReactorDispatchEngine::maybe_throttle_io_enqueue()
+{
+  // Op thread must never block here (it is the sole IOComplete drain).
+  if (mds::reactor_is_op_thread()) {
+    return;
+  }
+
+  uint64_t high = io_enqueue_high.load(std::memory_order_relaxed);
+  if (high == 0) {
+    return;
+  }
+  // Fast path only when below high and no cohort is draining to low.
+  // Otherwise Objecter/io-pool threads refill the (low, high) band while the
+  // original waiters hold, and IOComplete depth races past the abort fuse.
+  if (queue.count(DispatchLane::IOComplete) < high &&
+      io_enqueue_throttle_waiters.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+
+  uint64_t low = io_enqueue_low_watermark(high);
+  std::unique_lock lock(io_enqueue_throttle_lock);
+  bool counted_wait = false;
+  while (!stop.load(std::memory_order_acquire) &&
+         !(ctx.daemon && ctx.daemon->stopping) &&
+         (high = io_enqueue_high.load(std::memory_order_relaxed)) != 0 &&
+         queue.count(DispatchLane::IOComplete) >
+             (low = io_enqueue_low_watermark(high)) &&
+         (queue.count(DispatchLane::IOComplete) >= high || counted_wait ||
+          io_enqueue_throttle_waiters.load(std::memory_order_relaxed) > 0)) {
+    if (!counted_wait) {
+      io_enqueue_throttle_waits.fetch_add(1, std::memory_order_relaxed);
+      counted_wait = true;
+    }
+    io_enqueue_throttle_waiters.fetch_add(1, std::memory_order_relaxed);
+    dout(5) << "io enqueue throttle: waiting (depth="
+            << queue.count(DispatchLane::IOComplete) << " high=" << high
+            << " low=" << low << ")" << dendl;
+    io_enqueue_throttle_cond.wait_for(
+        lock, std::chrono::milliseconds(10), [this, &high, &low] {
+          if (stop.load(std::memory_order_acquire) ||
+              (ctx.daemon && ctx.daemon->stopping)) {
+            return true;
+          }
+          high = io_enqueue_high.load(std::memory_order_relaxed);
+          if (high == 0) {
+            return true;
+          }
+          low = io_enqueue_low_watermark(high);
+          return queue.count(DispatchLane::IOComplete) <= low;
+        });
+    io_enqueue_throttle_waiters.fetch_sub(1, std::memory_order_relaxed);
+  }
+}
+
+void
+ReactorDispatchEngine::maybe_notify_io_enqueue_throttle()
+{
+  if (io_enqueue_throttle_waiters.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+  const uint64_t high = io_enqueue_high.load(std::memory_order_relaxed);
+  if (high == 0 || stop.load(std::memory_order_acquire) ||
+      (ctx.daemon && ctx.daemon->stopping) ||
+      queue.count(DispatchLane::IOComplete) <= io_enqueue_low_watermark(high)) {
+    std::lock_guard lock(io_enqueue_throttle_lock);
+    io_enqueue_throttle_cond.notify_all();
+  }
 }
 
 void
@@ -308,6 +628,10 @@ ReactorDispatchEngine::publish_queue_depth_metrics()
   flush_logger_metrics();
 
   PerfCounters* logger = ctx.rank->logger;
+  const auto [dominant, dom_backlog] = dominant_adaptable_backlog();
+  const double adapt_t = backlog_adapt_t(dom_backlog);
+  const uint64_t adapt_t_milli = static_cast<uint64_t>(adapt_t * 1000.0 + 0.5);
+
   logger->set(l_mds_reactor_dispatch_queue_len, queue.count());
   logger->set(
       l_mds_dispatch_queue_len_max,
@@ -316,14 +640,43 @@ ReactorDispatchEngine::publish_queue_depth_metrics()
       l_mds_reactor_dispatch_queue_len_client,
       queue.count(DispatchLane::Client));
   logger->set(
+      l_mds_reactor_dispatch_queue_len_io,
+      queue.count(DispatchLane::IOComplete));
+  logger->set(
+      l_mds_reactor_dispatch_queue_len_maintenance,
+      queue.count(DispatchLane::Maintenance));
+  logger->set(
       l_mds_reactor_client_avg_exec_us, avg_exec_us(DispatchLane::Client));
+  logger->set(
+      l_mds_reactor_io_avg_exec_us, avg_exec_us(DispatchLane::IOComplete));
+  logger->set(
+      l_mds_reactor_maintenance_avg_exec_us,
+      avg_exec_us(DispatchLane::Maintenance));
   logger->set(l_mds_reactor_client_backlog_us, client_backlog_us());
+  logger->set(
+      l_mds_reactor_io_backlog_us,
+      estimated_backlog_us(DispatchLane::IOComplete));
+  logger->set(
+      l_mds_reactor_maintenance_backlog_us,
+      estimated_backlog_us(DispatchLane::Maintenance));
+  logger->set(l_mds_reactor_dominant_backlog_us, dom_backlog);
+  logger->set(l_mds_reactor_adapt_t_milli, adapt_t_milli);
+  logger->set(l_mds_reactor_dominant_lane, static_cast<uint64_t>(dominant));
   logger->set(
       l_mds_reactor_slice_client_effective_ms,
       lane_slice_ms(DispatchLane::Client));
   logger->set(
+      l_mds_reactor_slice_io_effective_ms,
+      lane_slice_ms(DispatchLane::IOComplete));
+  logger->set(
       l_mds_reactor_slice_maintenance_effective_ms,
       lane_slice_ms(DispatchLane::Maintenance));
+  logger->set(
+      l_mds_reactor_client_enqueue_throttle_waiters,
+      client_enqueue_throttle_waiters.load(std::memory_order_relaxed));
+  logger->set(
+      l_mds_reactor_io_enqueue_throttle_waiters,
+      io_enqueue_throttle_waiters.load(std::memory_order_relaxed));
 }
 
 void
@@ -333,11 +686,38 @@ ReactorDispatchEngine::flush_logger_metrics()
     return;
   }
   mds::dispatch_perf::flush_to_logger(ctx.rank->logger, local_metrics);
+  // Publish throttle wait counter increments accumulated since last flush.
+  const uint64_t client_waits =
+      client_enqueue_throttle_waits.exchange(0, std::memory_order_relaxed);
+  if (client_waits) {
+    ctx.rank->logger->inc(
+        l_mds_reactor_client_enqueue_throttle_waits, client_waits);
+  }
+  const uint64_t io_waits =
+      io_enqueue_throttle_waits.exchange(0, std::memory_order_relaxed);
+  if (io_waits) {
+    ctx.rank->logger->inc(l_mds_reactor_io_enqueue_throttle_waits, io_waits);
+  }
 }
 
 void
 ReactorDispatchEngine::enqueue_item(OpWorkItem* item, DispatchLane lane)
 {
+  if (lane == DispatchLane::Client) {
+    maybe_throttle_client_enqueue();
+    if (stop.load(std::memory_order_acquire) ||
+        (ctx.daemon && ctx.daemon->stopping)) {
+      item->destroy();
+      return;
+    }
+  } else if (lane == DispatchLane::IOComplete) {
+    maybe_throttle_io_enqueue();
+    if (stop.load(std::memory_order_acquire) ||
+        (ctx.daemon && ctx.daemon->stopping)) {
+      item->destroy();
+      return;
+    }
+  }
   queue.enqueue(item, lane);
   note_enqueued();
 }
@@ -401,6 +781,15 @@ ReactorDispatchEngine::shutdown()
     return;
   }
 
+  {
+    std::lock_guard lock(client_enqueue_throttle_lock);
+    client_enqueue_throttle_cond.notify_all();
+  }
+  {
+    std::lock_guard lock(io_enqueue_throttle_lock);
+    io_enqueue_throttle_cond.notify_all();
+  }
+
   queue.shutdown();
 
   if (op_thread.joinable()) {
@@ -417,6 +806,8 @@ ReactorDispatchEngine::shutdown()
   if (ctx.rank && ctx.rank->logger) {
     ctx.rank->logger->set(l_mds_reactor_dispatch_queue_len, 0);
     ctx.rank->logger->set(l_mds_dispatch_queue_len_max, 0);
+    ctx.rank->logger->set(l_mds_reactor_client_enqueue_throttle_waiters, 0);
+    ctx.rank->logger->set(l_mds_reactor_io_enqueue_throttle_waiters, 0);
   }
 }
 
@@ -438,8 +829,30 @@ ReactorDispatchEngine::submit_inbound(const ref_t<Message>& m)
 void
 ReactorDispatchEngine::submit_io_completion(MDSIOContextBase* ioctx, int r)
 {
+  // Nested on the op thread (e.g. Journaler::_finish_flush holds Journaler::lock
+  // then finish_contexts → MDSLogContextBase::complete). Must not execute
+  // inline (re-enters Journaler) and must not re-enqueue onto IOComplete (op
+  // thread skips throttle → queue-depth abort). Defer until execute_item
+  // finishes and outer locks are dropped.
+  if (mds::reactor_is_op_thread() && execute_depth > 0) {
+    deferred_io_completions.emplace_back(ioctx, r);
+    return;
+  }
   OpWorkItem* item = OpWorkItem::create_io(ioctx, r);
   enqueue_item(item, DispatchLane::IOComplete);
+}
+
+void
+ReactorDispatchEngine::drain_deferred_io_completions()
+{
+  // execute_depth stays > 0 so further nested completes keep deferring.
+  while (!deferred_io_completions.empty()) {
+    auto batch = std::move(deferred_io_completions);
+    deferred_io_completions.clear();
+    for (auto& [ioctx, r] : batch) {
+      execute_io_completion(ioctx, r);
+    }
+  }
 }
 
 void
@@ -592,6 +1005,7 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
     owner_token.emplace(*ctx.mds_lock, token);
   }
 
+  ++execute_depth;
   switch (item->kind) {
   case WorkKind::InboundMessage:
     ++local_metrics.inbound;
@@ -638,6 +1052,10 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
     }
     break;
   }
+
+  // After the item returns, outer locks (e.g. Journaler::lock) are dropped.
+  drain_deferred_io_completions();
+  --execute_depth;
 
   record_execute_metrics(*item, exec_start);
   item->destroy();
@@ -695,12 +1113,20 @@ ReactorDispatchEngine::op_thread_main()
       if (!item) {
         break; // all drainable lanes empty
       }
+      const DispatchLane item_lane = item->lane;
       execute_item(item);
       ++processed;
+      if (item_lane == DispatchLane::Client) {
+        maybe_notify_client_enqueue_throttle();
+      } else if (item_lane == DispatchLane::IOComplete) {
+        maybe_notify_io_enqueue_throttle();
+      }
     }
 
     if (processed > 0) {
       publish_queue_depth_metrics();
+      maybe_notify_client_enqueue_throttle();
+      maybe_notify_io_enqueue_throttle();
       continue;
     }
 
