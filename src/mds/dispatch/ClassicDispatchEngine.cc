@@ -18,10 +18,10 @@
  *
  * Inline implementation of MDSDispatchEngine for classic mode:
  *   submit_inbound  -> lock mds_lock, MDSDaemon::dispatch_inbound_locked()
- *   submit_io_completion -> lock mds_lock, MDSContext::complete() path
  *   submit_callable -> lock mds_lock, run fn (for future timer/asok routing)
  *
- * No queuing or extra threads; intended to be behavior-identical to original MDS.
+ * IO completions remain in MDSIOContextBase::complete (finisher / inline lock).
+ * submit_io_completion() mirrors the reactor execute path but is unused in classic.
  */
 
 #include "ClassicDispatchEngine.h"

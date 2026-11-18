@@ -5,6 +5,10 @@ set(mds_srcs
   MDSRank.cc
   dispatch/ClassicDispatchEngine.cc
   dispatch/MDSDispatchEngine.cc
+  dispatch/OpWorkItem.cc
+  dispatch/MDSOpWorkQueue.cc
+  dispatch/classify.cc
+  dispatch/ReactorDispatchEngine.cc
   Beacon.cc
   flock.cc
   locks.c

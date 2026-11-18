@@ -101,7 +101,8 @@ void MDSIOContextBase::complete(int r) {
   dout(10) << "MDSIOContextBase::complete: " << typeid(*this).name() << dendl;
   ceph_assert(mds != NULL);
 
-  if (auto* engine = mds->get_dispatch_engine()) {
+  if (auto* engine = mds->get_dispatch_engine();
+      engine && engine->is_reactor()) {
     engine->submit_io_completion(this, r);
     return;
   }
@@ -153,7 +154,14 @@ void C_IO_Wrapper::complete(int r)
   if (async) {
     dout(20) << "C_IO_Wrapper::complete " << r << " async" << dendl;
     async = false;
-    get_mds()->finisher->queue(this, r);
+    MDSRank* mds = get_mds();
+    if (auto* engine = mds->get_dispatch_engine();
+        engine && engine->is_reactor()) {
+      // Reactor: enqueue for the op thread; do not use the finisher.
+      MDSIOContextBase::complete(r);
+      return;
+    }
+    mds->finisher->queue(this, r);
   } else {
     dout(20) << "C_IO_Wrapper::complete " << r << " sync" << dendl;
     MDSIOContext::complete(r);

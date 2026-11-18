@@ -16,23 +16,20 @@
 /**
  * OpWorkItem.h
  *
- * Shared vocabulary for the MDS dispatch subsystem (classic/reactor).
- *
- * DispatchLane and WorkKind classify work posted to the dispatch engine.
- * ClassicDispatchEngine does not queue work yet; these types are
- * defined here so ReactorDispatchEngine can use a single envelope
- * without introducing a parallel MDS op hierarchy.
- *
- * Usage (future reactor mode):
- *   - Producers enqueue OpWorkItem instances into per-lane dequeues.
- *   - lane is set at construction and cached on the item for metrics/requeue;
- *     dequeue priority is determined by which queue holds the item.
- *   - Server, MDCache, and MDRequest code below the drain point stay unchanged.
+ * Work envelope for the MDS dispatch subsystem. Each item lives on the heap and
+ * is linked into per-lane boost::intrusive::list queues via list_hook.
  */
 
 #pragma once
 
 #include <cstdint>
+#include <functional>
+
+#include <boost/intrusive/list.hpp>
+
+#include "msg/Message.h"
+
+class MDSIOContextBase;
 
 /// Priority lane for reactor-mode scheduling (high -> low).
 enum class DispatchLane : uint8_t {
@@ -41,7 +38,6 @@ enum class DispatchLane : uint8_t {
   Client = 2,
   Maintenance = 3,
 
-  // Keep this last
   Count
 };
 
@@ -51,4 +47,21 @@ enum class WorkKind : uint8_t {
   IOCompletion,
   TrimQuantum,
   Callable,
+};
+
+struct OpWorkItem
+  : boost::intrusive::list_base_hook<
+        boost::intrusive::link_mode<boost::intrusive::normal_link>> {
+  WorkKind kind = WorkKind::InboundMessage;
+  DispatchLane lane = DispatchLane::Client;
+
+  ref_t<Message> msg;
+  MDSIOContextBase* io_ctx = nullptr;
+  int rval = 0;
+  std::function<void()>* callable = nullptr;
+
+  static OpWorkItem* create_inbound(const ref_t<Message>& m, DispatchLane lane);
+  static OpWorkItem* create_io(MDSIOContextBase* ctx, int r);
+  static OpWorkItem* create_callable(DispatchLane lane, std::function<void()> fn);
+  void destroy();
 };
