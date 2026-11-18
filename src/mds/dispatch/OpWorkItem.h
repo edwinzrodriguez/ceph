@@ -65,7 +65,7 @@ struct OpWorkItem
   std::function<void()>* callable = nullptr;
 
   /// Set when the item enters MDSOpWorkQueue (reactor perf counters).
-  ceph::coarse_mono_time enqueued_at{};
+  ceph::fast_mono_time enqueued_at{};
 
   static OpWorkItem* create_inbound(const ref_t<Message>& m, DispatchLane lane);
   static OpWorkItem* create_io(MDSIOContextBase* ctx, int r);
