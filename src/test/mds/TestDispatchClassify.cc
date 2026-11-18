@@ -64,6 +64,58 @@ TEST(MDSDispatchClassify, MaintenanceMessages)
   }
 }
 
+TEST(MDSDispatchClassify, ClientMetricsIsClient)
+{
+  auto m = ceph::make_ref<MGenericMessage>(CEPH_MSG_CLIENT_METRICS);
+  EXPECT_EQ(classify_inbound_message(*m), DispatchLane::Client);
+}
+
+TEST(MDSDispatchClassify, WorkClassControlAndMaintenance)
+{
+  auto mds_map = ceph::make_ref<MGenericMessage>(CEPH_MSG_MDS_MAP);
+  OpWorkItem* control =
+      OpWorkItem::create_inbound(mds_map, DispatchLane::Control);
+  EXPECT_EQ(classify_dispatch_work_class(*control), DispatchWorkClass::MdsMap);
+  control->destroy();
+
+  auto scrub = ceph::make_ref<MGenericMessage>(MSG_MDS_SCRUB);
+  OpWorkItem* maint =
+      OpWorkItem::create_inbound(scrub, DispatchLane::Maintenance);
+  EXPECT_EQ(classify_dispatch_work_class(*maint), DispatchWorkClass::Scrub);
+  maint->destroy();
+
+  auto caps = ceph::make_ref<MGenericMessage>(CEPH_MSG_CLIENT_CAPS);
+  OpWorkItem* client = OpWorkItem::create_inbound(caps, DispatchLane::Client);
+  EXPECT_FALSE(classify_dispatch_work_class(*client).has_value());
+  client->destroy();
+}
+
+TEST(MDSDispatchClassify, WorkClassSynthetic)
+{
+  OpWorkItem* io = OpWorkItem::create_io(nullptr, 0);
+  EXPECT_EQ(classify_dispatch_work_class(*io), DispatchWorkClass::IOCompletion);
+  io->destroy();
+
+  OpWorkItem* advance = OpWorkItem::create_advance();
+  EXPECT_EQ(
+      classify_dispatch_work_class(*advance), DispatchWorkClass::AdvanceQueues);
+  advance->destroy();
+
+  OpWorkItem* trim = OpWorkItem::create_trim();
+  EXPECT_EQ(classify_dispatch_work_class(*trim), DispatchWorkClass::TrimQuantum);
+  trim->destroy();
+
+  OpWorkItem* log_trim = OpWorkItem::create_log_trim();
+  EXPECT_EQ(classify_dispatch_work_class(*log_trim), DispatchWorkClass::LogTrim);
+  log_trim->destroy();
+
+  OpWorkItem* callable = OpWorkItem::create_callable(DispatchLane::Control, [] {
+  });
+  EXPECT_EQ(
+      classify_dispatch_work_class(*callable), DispatchWorkClass::Callable);
+  callable->destroy();
+}
+
 TEST(MDSDispatchClassify, UnclassifiedAborts)
 {
   auto m = ceph::make_ref<MGenericMessage>(MSG_NOP);

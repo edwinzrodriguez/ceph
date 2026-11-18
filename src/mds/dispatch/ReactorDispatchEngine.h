@@ -17,13 +17,22 @@
  * ReactorDispatchEngine.h
  *
  * Reactor-mode dispatch backend (mds_dispatch_engine=reactor). Producers enqueue
- * OpWorkItem instances; a single op thread drains MDSOpWorkQueue and executes
- * work under mds_lock without other threads contending for that lock.
+ * OpWorkItem instances; a single op thread drains MDSOpWorkQueue and executes.
+ *
+ * Lane order (high -> low): Control, IOComplete, Maintenance, Client.
+ * Each scheduling round visits lanes in that order and runs each lane until
+ * empty or its fixed wall-clock budget (mds_reactor_lane_slice_*) expires, so
+ * lower-priority work still runs under Maintenance pressure.
+ * TrimQuantum/LogTrim are single-flight and cooperatively time-sliced.
  */
 
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <set>
+#include <string>
 #include <thread>
 
 #include "MDSDispatchContext.h"
@@ -51,6 +60,7 @@ public:
   void submit_log_trim_tick() override;
   void submit_callable(DispatchLane lane, std::function<void()> fn) override;
   void note_finished_queued() override;
+  void handle_conf_change(const std::set<std::string>& changed) override;
 
 private:
   void op_thread_main();
@@ -59,16 +69,32 @@ private:
   void execute_io_completion(MDSIOContextBase* ioctx, int r);
   void record_wait_metrics(const OpWorkItem& item);
   void record_execute_metrics(
-      DispatchLane lane,
+      const OpWorkItem& item,
       ceph::coarse_mono_time exec_start);
   void note_enqueued();
+  void maybe_abort_on_queue_depth(size_t depth);
   void publish_queue_depth_metrics();
-
-  static constexpr unsigned dequeue_batch_size = 32;
+  void finish_trim_quantum(bool more);
+  void finish_log_trim(bool more);
+  void refresh_cached_conf();
+  int64_t lane_slice_ms(DispatchLane lane) const;
+  void advance_lane_slice(
+      size_t& lane_idx,
+      ceph::coarse_mono_time& slice_deadline);
 
   MDSDispatchContext ctx;
   MDSOpWorkQueue queue;
   std::thread op_thread;
   std::atomic<bool> stop{false};
   std::atomic<uint64_t> queue_len_max{0};
+  std::atomic<bool> queue_len_abort_armed{false};
+  /// Cached conf (avoid string-keyed get_val on enqueue/execute).
+  std::atomic<uint64_t> queue_len_abort_limit{0};
+  std::atomic<int64_t> cache_trim_max_duration_ms{0};
+  std::atomic<int64_t> log_trim_max_duration_ms{0};
+  std::array<std::atomic<int64_t>, static_cast<size_t>(DispatchLane::Count)>
+      lane_slice_ms_cached{};
+  /// At most one TrimQuantum / LogTrim outstanding (queued or running).
+  std::atomic<bool> trim_quantum_queued{false};
+  std::atomic<bool> log_trim_queued{false};
 };

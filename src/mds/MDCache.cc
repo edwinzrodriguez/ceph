@@ -182,6 +182,8 @@ MDCache::MDCache(MDSRank *m, PurgeQueue &purge_queue_) :
   cache_memory_limit = g_conf().get_val<Option::size_t>("mds_cache_memory_limit");
   cache_reservation = g_conf().get_val<double>("mds_cache_reservation");
   cache_health_threshold = g_conf().get_val<double>("mds_health_cache_threshold");
+  cache_trim_threshold =
+      g_conf().get_val<Option::size_t>("mds_cache_trim_threshold");
 
   export_ephemeral_distributed_config =  g_conf().get_val<bool>("mds_export_ephemeral_distributed");
   export_ephemeral_random_config =  g_conf().get_val<bool>("mds_export_ephemeral_random");
@@ -262,6 +264,10 @@ void MDCache::handle_conf_change(const std::set<std::string>& changed, const MDS
   }
   if (changed.count("mds_cache_trim_decay_rate")) {
     trim_counter = DecayCounter(g_conf().get_val<double>("mds_cache_trim_decay_rate"));
+  }
+  if (changed.count("mds_cache_trim_threshold")) {
+    cache_trim_threshold =
+        g_conf().get_val<Option::size_t>("mds_cache_trim_threshold");
   }
   if (changed.count("mds_symlink_recovery")) {
     symlink_recovery = g_conf().get_val<bool>("mds_symlink_recovery");
@@ -7170,13 +7176,17 @@ void MDCache::purge_inodes(const interval_set<inodeno_t>& inos, LogSegmentRef co
 // ================================================================================
 // cache trimming
 
-std::pair<bool, uint64_t> MDCache::trim_lru(uint64_t count, expiremap& expiremap)
+std::pair<bool, uint64_t>
+MDCache::trim_lru(
+    uint64_t count,
+    expiremap& expiremap,
+    std::chrono::milliseconds max_duration)
 {
   bool is_standby_replay = mds->is_standby_replay();
   std::vector<CDentry *> unexpirables;
   uint64_t trimmed = 0;
 
-  auto trim_threshold = g_conf().get_val<Option::size_t>("mds_cache_trim_threshold");
+  auto trim_threshold = cache_trim_threshold;
 
   dout(7) << "trim_lru trimming " << count
           << " items from LRU"
@@ -7194,9 +7204,25 @@ std::pair<bool, uint64_t> MDCache::trim_lru(uint64_t count, expiremap& expiremap
               << dendl;
 
   const uint64_t trim_counter_start = trim_counter.get();
+  const auto deadline = [&]() -> std::optional<ceph::coarse_mono_time> {
+    if (max_duration <= std::chrono::milliseconds::zero()) {
+      return std::nullopt;
+    }
+    return ceph::coarse_mono_clock::now() + max_duration;
+  }();
   bool throttled = false;
+
+  auto past_deadline = [&] {
+    return deadline && ceph::coarse_mono_clock::now() >= *deadline;
+  };
+
   while (1) {
     throttled |= trim_counter_start+trimmed >= trim_threshold;
+    if (!throttled && past_deadline()) {
+      dout(10) << __func__ << ": past deadline after " << trimmed
+               << " bottom_lru items" << dendl;
+      throttled = true;
+    }
     if (throttled) {
       logger->inc(l_mdc_cache_trim_throttle);
       break;
@@ -7226,6 +7252,11 @@ std::pair<bool, uint64_t> MDCache::trim_lru(uint64_t count, expiremap& expiremap
   // trim dentries from the LRU until count is reached
   while (!throttled && (cache_toofull() || count > 0)) {
     throttled |= trim_counter_start+trimmed >= trim_threshold;
+    if (!throttled && past_deadline()) {
+      dout(10) << __func__ << ": past deadline after " << trimmed << " items"
+               << dendl;
+      throttled = true;
+    }
     if (throttled) {
       logger->inc(l_mdc_cache_trim_throttle);
       break;
@@ -7262,7 +7293,8 @@ std::pair<bool, uint64_t> MDCache::trim_lru(uint64_t count, expiremap& expiremap
  *
  * @param count is number of dentries to try to expire
  */
-std::pair<bool, uint64_t> MDCache::trim(uint64_t count)
+std::pair<bool, uint64_t>
+MDCache::trim(uint64_t count, std::chrono::milliseconds max_duration)
 {
   uint64_t used = cache_size();
   uint64_t limit = cache_memory_limit;
@@ -7276,7 +7308,7 @@ std::pair<bool, uint64_t> MDCache::trim(uint64_t count)
   // process delayed eval_stray()
   stray_manager.advance_delayed();
 
-  auto result = trim_lru(count, expiremap);
+  auto result = trim_lru(count, expiremap, max_duration);
   auto& trimmed = result.second;
 
   // trim non-auth, non-bound subtrees
@@ -15017,8 +15049,8 @@ bool MDCache::is_ready_to_trim_cache(void)
   return is_open() && !rejoin_done;
 }
 
-bool
-MDCache::trim_quantum()
+std::optional<bool>
+MDCache::trim_quantum(std::chrono::milliseconds max_duration)
 {
   MDS_ASSERT_MDS_LOCK(mds->mds_lock);
 
@@ -15028,7 +15060,7 @@ MDCache::trim_quantum()
   }
   if (!mds->is_cache_trimmable()) {
     dout(10) << "cache not ready for trimming" << dendl;
-    return false;
+    return std::nullopt;
   }
 
   dout(20) << "trim_quantum trimming cache" << dendl;
@@ -15038,9 +15070,12 @@ MDCache::trim_quantum()
     MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_client_leases);
     trim_client_leases();
   }
+  bool more = false;
   if (is_ready_to_trim_cache() || mds->is_standby_replay()) {
     MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_cache_trim);
-    trim();
+    auto [throttled, trimmed] = trim(0, max_duration);
+    (void)trimmed;
+    more = throttled || cache_toofull();
   }
   if (active_with_clients) {
     MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_client_recall);
@@ -15051,7 +15086,7 @@ MDCache::trim_quantum()
     }
     mds->server->recall_client_state(nullptr, recall_flags);
   }
-  return true;
+  return more;
 }
 
 void MDCache::upkeep_main(void)

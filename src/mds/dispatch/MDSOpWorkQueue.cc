@@ -78,7 +78,7 @@ MDSOpWorkQueue::enqueue(OpWorkItem* item, DispatchLane lane)
 }
 
 OpWorkItem*
-MDSOpWorkQueue::dequeue_lane(LaneQueue& lane)
+MDSOpWorkQueue::try_pop_consumer(LaneQueue& lane)
 {
   LaneList& list = consumer_list(lane);
   if (list.empty()) {
@@ -109,18 +109,23 @@ MDSOpWorkQueue::maybe_swap_lane(LaneQueue& lane)
 }
 
 OpWorkItem*
+MDSOpWorkQueue::dequeue_lane(DispatchLane lane)
+{
+  ceph_assert(lane < DispatchLane::Count);
+  LaneQueue& q = lanes[static_cast<size_t>(lane)];
+
+  if (OpWorkItem* item = try_pop_consumer(q)) {
+    return item;
+  }
+  maybe_swap_lane(q);
+  return try_pop_consumer(q);
+}
+
+OpWorkItem*
 MDSOpWorkQueue::dequeue()
 {
   for (size_t li = 0; li < static_cast<size_t>(DispatchLane::Count); ++li) {
-    LaneQueue& q = lanes[li];
-
-    if (OpWorkItem* item = dequeue_lane(q)) {
-      return item;
-    }
-
-    maybe_swap_lane(q);
-
-    if (OpWorkItem* item = dequeue_lane(q)) {
+    if (OpWorkItem* item = dequeue_lane(static_cast<DispatchLane>(li))) {
       return item;
     }
   }

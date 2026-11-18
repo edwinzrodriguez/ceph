@@ -37,6 +37,7 @@
 #include "dispatch/MDSDispatchContext.h"
 #include "dispatch/MDSDispatchEngine.h"
 #include "dispatch/OpWorkItem.h"
+#include "dispatch/classify.h"
 #include "events/ELid.h"
 #include "events/ESubtreeMap.h"
 #include "log/Log.h"
@@ -1108,7 +1109,7 @@ bool MDSRankDispatcher::ms_dispatch(const cref_t<Message> &m)
     ceph_assert(op);
   }
   else if (m->get_source().is_client()) {
-    Session *session = static_cast<Session*>(m->get_connection()->get_priv().get());
+    Session* session = static_cast<Session*>(m->get_connection()->peek_priv());
     if (session)
       session->last_seen = Session::clock::now();
   }
@@ -1494,8 +1495,9 @@ bool MDSRank::is_stale_message(const cref_t<Message> &m) const
 
 Session *MDSRank::get_session(const cref_t<Message> &m)
 {
-  // do not carry ref
-  auto session = static_cast<Session *>(m->get_connection()->get_priv().get());
+  // Peek without RefCountedPtr bump; Session lifetime is owned by the
+  // Connection priv under mds_lock for the duration of this dispatch.
+  auto session = static_cast<Session*>(m->get_connection()->peek_priv());
   if (session) {
     dout(20) << "get_session have " << session << " " << session->info.inst
 	     << " state " << session->get_state_name() << dendl;
@@ -1616,8 +1618,8 @@ void MDSRank::send_message_client_counted(const ref_t<Message>& m, client_t clie
 
 void MDSRank::send_message_client_counted(const ref_t<Message>& m, const ConnectionRef& connection)
 {
-  // do not carry ref
-  auto session = static_cast<Session *>(connection->get_priv().get());
+  // Peek without RefCountedPtr bump; see get_session().
+  auto session = static_cast<Session*>(connection->peek_priv());
   if (session) {
     send_message_client_counted(m, session);
   } else {
@@ -4007,47 +4009,66 @@ void MDSRank::create_logger()
           "Inbound messages executed on reactor op thread", "dinb",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_enqueue_usec, "dispatch_enqueue_usec",
-          "Reactor dispatch queue wait time", "deq",
+          l_mds_dispatch_enqueue_latency, "dispatch_enqueue_latency",
+          "Reactor dispatch queue wait time (seconds)", "deq",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_execute_usec, "dispatch_execute_usec",
-          "Reactor dispatch op execution time", "dex",
+          l_mds_dispatch_execute_latency, "dispatch_execute_latency",
+          "Reactor dispatch op execution time (seconds)", "dex",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_enqueue_usec_control, "dispatch_enqueue_usec_control",
-          "Reactor dispatch queue wait (control lane)", "deqc",
+          l_mds_dispatch_enqueue_latency_control,
+          "dispatch_enqueue_latency_control",
+          "Reactor dispatch queue wait (control lane, seconds)", "deqc",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_enqueue_usec_io, "dispatch_enqueue_usec_io",
-          "Reactor dispatch queue wait (io lane)", "deqi",
+          l_mds_dispatch_enqueue_latency_io, "dispatch_enqueue_latency_io",
+          "Reactor dispatch queue wait (io lane, seconds)", "deqi",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_enqueue_usec_client, "dispatch_enqueue_usec_client",
-          "Reactor dispatch queue wait (client lane)", "deql",
+          l_mds_dispatch_enqueue_latency_client,
+          "dispatch_enqueue_latency_client",
+          "Reactor dispatch queue wait (client lane, seconds)", "deql",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_enqueue_usec_maintenance,
-          "dispatch_enqueue_usec_maintenance",
-          "Reactor dispatch queue wait (maintenance lane)", "deqm",
+          l_mds_dispatch_enqueue_latency_maintenance,
+          "dispatch_enqueue_latency_maintenance",
+          "Reactor dispatch queue wait (maintenance lane, seconds)", "deqm",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_execute_usec_control, "dispatch_execute_usec_control",
-          "Reactor dispatch execute time (control lane)", "dexc",
+          l_mds_dispatch_execute_latency_control,
+          "dispatch_execute_latency_control",
+          "Reactor dispatch execute time (control lane, seconds)", "dexc",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_execute_usec_io, "dispatch_execute_usec_io",
-          "Reactor dispatch execute time (io lane)", "dexi",
+          l_mds_dispatch_execute_latency_io, "dispatch_execute_latency_io",
+          "Reactor dispatch execute time (io lane, seconds)", "dexi",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_execute_usec_client, "dispatch_execute_usec_client",
-          "Reactor dispatch execute time (client lane)", "dexl",
+          l_mds_dispatch_execute_latency_client,
+          "dispatch_execute_latency_client",
+          "Reactor dispatch execute time (client lane, seconds)", "dexl",
           PerfCountersBuilder::PRIO_USEFUL);
       mds_plb.add_time_avg(
-          l_mds_dispatch_execute_usec_maintenance,
-          "dispatch_execute_usec_maintenance",
-          "Reactor dispatch execute time (maintenance lane)", "dexm",
+          l_mds_dispatch_execute_latency_maintenance,
+          "dispatch_execute_latency_maintenance",
+          "Reactor dispatch execute time (maintenance lane, seconds)", "dexm",
           PerfCountersBuilder::PRIO_USEFUL);
+      {
+        const size_t wc_count = static_cast<size_t>(DispatchWorkClass::Count);
+        static_assert(
+            wc_count == static_cast<size_t>(
+                            l_mds_dispatch_execute_latency_wc_last -
+                            l_mds_dispatch_execute_latency_wc_first + 1));
+        for (size_t i = 0; i < wc_count; ++i) {
+          const auto wc = static_cast<DispatchWorkClass>(i);
+          const auto& info = dispatch_work_class_info(wc);
+          mds_plb.add_time_avg(
+              l_mds_dispatch_execute_latency_wc_first + static_cast<int>(i),
+              info.counter_name, info.description, info.nick,
+              PerfCountersBuilder::PRIO_USEFUL);
+        }
+      }
       mds_plb.add_u64_counter_histogram(
           l_mds_dispatch_enqueue_hist, "dispatch_enqueue_hist",
           dispatch_latency_x, dispatch_lane_y,
@@ -4448,6 +4469,8 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_cache_quiesce_threshold",
     "mds_cache_reservation",
     "mds_cache_trim_decay_rate",
+    "mds_cache_trim_max_duration",
+    "mds_cache_trim_threshold",
     "mds_cap_acquisition_throttle_retry_request_time",
     "mds_cap_revoke_eviction_timeout",
     "mds_debug_subtrees",
@@ -4486,6 +4509,7 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_log_skip_corrupt_events",
     "mds_log_skip_unbounded_events",
     "mds_log_trim_decay_rate",
+    "mds_log_trim_max_duration",
     "mds_log_trim_threshold",
     "mds_max_caps_per_client",
     "mds_max_export_size",
@@ -4497,6 +4521,11 @@ std::vector<std::string> MDSRankDispatcher::get_tracked_keys()
     "mds_op_history_duration",
     "mds_op_history_size",
     "mds_op_log_threshold",
+    "mds_reactor_lane_slice_client",
+    "mds_reactor_lane_slice_control",
+    "mds_reactor_lane_slice_io",
+    "mds_reactor_lane_slice_maintenance",
+    "mds_reactor_queue_len_abort",
     "mds_recall_max_decay_rate",
     "mds_recall_warning_decay_rate",
     "mds_request_load_average_decay_rate",
@@ -4583,6 +4612,9 @@ void MDSRankDispatcher::handle_conf_change(const ConfigProxy& conf, const std::s
   }
   if (changed.count("mds_inject_journal_corrupt_dentry_first")) {
     inject_journal_corrupt_dentry_first = g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first");
+  }
+  if (dispatch_engine) {
+    dispatch_engine->handle_conf_change(changed);
   }
 
   finisher->queue(new LambdaContext([this, changed](int) {

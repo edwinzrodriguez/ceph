@@ -18,8 +18,12 @@
 #include "common/debug.h"
 #include "mds_lock_debug.h"
 
+#include "common/ceph_context.h"
+#include "common/config.h"
 #include "common/perf_counters.h"
+#include "include/ceph_assert.h"
 #include "include/compat.h"
+#include "log/Log.h"
 
 #include "MDCache.h"
 #include "MDLog.h"
@@ -44,25 +48,25 @@ dispatch_usec_since(ceph::coarse_mono_time t)
 }
 
 static int
-dispatch_enqueue_usec_lane_counter(DispatchLane lane)
+dispatch_enqueue_latency_lane_counter(DispatchLane lane)
 {
   static const int counters[] = {
-      l_mds_dispatch_enqueue_usec_control,
-      l_mds_dispatch_enqueue_usec_io,
-      l_mds_dispatch_enqueue_usec_client,
-      l_mds_dispatch_enqueue_usec_maintenance,
+      l_mds_dispatch_enqueue_latency_control,
+      l_mds_dispatch_enqueue_latency_io,
+      l_mds_dispatch_enqueue_latency_maintenance,
+      l_mds_dispatch_enqueue_latency_client,
   };
   return counters[static_cast<size_t>(lane)];
 }
 
 static int
-dispatch_execute_usec_lane_counter(DispatchLane lane)
+dispatch_execute_latency_lane_counter(DispatchLane lane)
 {
   static const int counters[] = {
-      l_mds_dispatch_execute_usec_control,
-      l_mds_dispatch_execute_usec_io,
-      l_mds_dispatch_execute_usec_client,
-      l_mds_dispatch_execute_usec_maintenance,
+      l_mds_dispatch_execute_latency_control,
+      l_mds_dispatch_execute_latency_io,
+      l_mds_dispatch_execute_latency_maintenance,
+      l_mds_dispatch_execute_latency_client,
   };
   return counters[static_cast<size_t>(lane)];
 }
@@ -75,6 +79,108 @@ ReactorDispatchEngine::note_enqueued()
   while (depth > max && !queue_len_max.compare_exchange_weak(
                             max, depth, std::memory_order_relaxed)) {
   }
+  maybe_abort_on_queue_depth(depth);
+}
+
+void
+ReactorDispatchEngine::refresh_cached_conf()
+{
+  queue_len_abort_limit.store(
+      g_conf().get_val<uint64_t>("mds_reactor_queue_len_abort"),
+      std::memory_order_relaxed);
+  cache_trim_max_duration_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_cache_trim_max_duration")
+          .count(),
+      std::memory_order_relaxed);
+  log_trim_max_duration_ms.store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_log_trim_max_duration")
+          .count(),
+      std::memory_order_relaxed);
+  lane_slice_ms_cached[static_cast<size_t>(DispatchLane::Control)].store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_reactor_lane_slice_control")
+          .count(),
+      std::memory_order_relaxed);
+  lane_slice_ms_cached[static_cast<size_t>(DispatchLane::IOComplete)].store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_reactor_lane_slice_io")
+          .count(),
+      std::memory_order_relaxed);
+  lane_slice_ms_cached[static_cast<size_t>(DispatchLane::Maintenance)].store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>(
+              "mds_reactor_lane_slice_maintenance")
+          .count(),
+      std::memory_order_relaxed);
+  lane_slice_ms_cached[static_cast<size_t>(DispatchLane::Client)].store(
+      g_conf()
+          .get_val<std::chrono::milliseconds>("mds_reactor_lane_slice_client")
+          .count(),
+      std::memory_order_relaxed);
+}
+
+void
+ReactorDispatchEngine::handle_conf_change(const std::set<std::string>& changed)
+{
+  if (changed.count("mds_reactor_queue_len_abort") ||
+      changed.count("mds_cache_trim_max_duration") ||
+      changed.count("mds_log_trim_max_duration") ||
+      changed.count("mds_reactor_lane_slice_control") ||
+      changed.count("mds_reactor_lane_slice_io") ||
+      changed.count("mds_reactor_lane_slice_maintenance") ||
+      changed.count("mds_reactor_lane_slice_client")) {
+    refresh_cached_conf();
+  }
+}
+
+int64_t
+ReactorDispatchEngine::lane_slice_ms(DispatchLane lane) const
+{
+  return lane_slice_ms_cached[static_cast<size_t>(lane)].load(
+      std::memory_order_relaxed);
+}
+
+void
+ReactorDispatchEngine::advance_lane_slice(
+    size_t& lane_idx,
+    ceph::coarse_mono_time& slice_deadline)
+{
+  lane_idx = (lane_idx + 1) % static_cast<size_t>(DispatchLane::Count);
+  const auto budget_ms = lane_slice_ms(static_cast<DispatchLane>(lane_idx));
+  if (budget_ms <= 0) {
+    // Zero means drain until empty this visit (no wall deadline).
+    slice_deadline = ceph::coarse_mono_time::max();
+  } else {
+    slice_deadline = ceph::coarse_mono_clock::now() +
+                     std::chrono::milliseconds(budget_ms);
+  }
+}
+
+void
+ReactorDispatchEngine::maybe_abort_on_queue_depth(size_t depth)
+{
+  const uint64_t limit = queue_len_abort_limit.load(std::memory_order_relaxed);
+  if (limit == 0 || depth < limit) {
+    return;
+  }
+  // Only one producer should dump+abort if many race past the threshold.
+  if (queue_len_abort_armed.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+
+  derr << "mds_reactor_queue_len_abort: dispatch queue depth " << depth
+       << " >= limit " << limit
+       << " (queue_len_max=" << queue_len_max.load(std::memory_order_relaxed)
+       << ")" << dendl;
+  publish_queue_depth_metrics();
+  if (g_ceph_context && g_ceph_context->_log) {
+    g_ceph_context->_log->dump_recent();
+  }
+  ceph_abort_msg(
+      "mds_reactor_queue_len_abort: reactor dispatch queue depth exceeded "
+      "mds_reactor_queue_len_abort");
 }
 
 void
@@ -109,15 +215,15 @@ ReactorDispatchEngine::record_wait_metrics(const OpWorkItem& item)
   const int64_t wait_usec = dispatch_usec_since(item.enqueued_at);
   const auto wait = std::chrono::microseconds(wait_usec);
 
-  logger->tinc(l_mds_dispatch_enqueue_usec, wait);
-  logger->tinc(dispatch_enqueue_usec_lane_counter(item.lane), wait);
+  logger->tinc(l_mds_dispatch_enqueue_latency, wait);
+  logger->tinc(dispatch_enqueue_latency_lane_counter(item.lane), wait);
   logger->hinc(
       l_mds_dispatch_enqueue_hist, wait_usec, static_cast<int64_t>(item.lane));
 }
 
 void
 ReactorDispatchEngine::record_execute_metrics(
-    DispatchLane lane,
+    const OpWorkItem& item,
     ceph::coarse_mono_time exec_start)
 {
   if (!ctx.rank || !ctx.rank->logger) {
@@ -128,15 +234,21 @@ ReactorDispatchEngine::record_execute_metrics(
   const int64_t exec_usec = dispatch_usec_since(exec_start);
   const auto exec = std::chrono::microseconds(exec_usec);
 
-  logger->tinc(l_mds_dispatch_execute_usec, exec);
-  logger->tinc(dispatch_execute_usec_lane_counter(lane), exec);
+  logger->tinc(l_mds_dispatch_execute_latency, exec);
+  logger->tinc(dispatch_execute_latency_lane_counter(item.lane), exec);
+  if (auto wc = classify_dispatch_work_class(item); wc) {
+    logger->tinc(
+        l_mds_dispatch_execute_latency_wc_first + static_cast<int>(*wc), exec);
+  }
   logger->hinc(
-      l_mds_dispatch_execute_hist, exec_usec, static_cast<int64_t>(lane));
+      l_mds_dispatch_execute_hist, exec_usec, static_cast<int64_t>(item.lane));
 }
 
 ReactorDispatchEngine::ReactorDispatchEngine(const MDSDispatchContext& ctx_) :
   ctx(ctx_)
-{}
+{
+  refresh_cached_conf();
+}
 
 ReactorDispatchEngine::~ReactorDispatchEngine() { shutdown(); }
 
@@ -163,6 +275,8 @@ ReactorDispatchEngine::shutdown()
   queue.flush_and_clear();
 
   queue_len_max.store(0, std::memory_order_relaxed);
+  trim_quantum_queued.store(false, std::memory_order_relaxed);
+  log_trim_queued.store(false, std::memory_order_relaxed);
   if (ctx.rank && ctx.rank->logger) {
     ctx.rank->logger->set(l_mds_reactor_dispatch_queue_len, 0);
     ctx.rank->logger->set(l_mds_dispatch_queue_len_max, 0);
@@ -201,6 +315,10 @@ ReactorDispatchEngine::submit_advance_queues()
 void
 ReactorDispatchEngine::submit_trim_tick()
 {
+  // Single-flight: at most one TrimQuantum queued or running.
+  if (trim_quantum_queued.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
   OpWorkItem* item = OpWorkItem::create_trim();
   enqueue_item(item, DispatchLane::Maintenance);
 }
@@ -208,8 +326,33 @@ ReactorDispatchEngine::submit_trim_tick()
 void
 ReactorDispatchEngine::submit_log_trim_tick()
 {
+  // Single-flight: at most one LogTrim queued or running.
+  if (log_trim_queued.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
   OpWorkItem* item = OpWorkItem::create_log_trim();
   enqueue_item(item, DispatchLane::Maintenance);
+}
+
+void
+ReactorDispatchEngine::finish_trim_quantum(bool more)
+{
+  if (more && !stop.load(std::memory_order_relaxed)) {
+    // Keep trim_quantum_queued set; continuation is the outstanding item.
+    enqueue_item(OpWorkItem::create_trim(), DispatchLane::Maintenance);
+    return;
+  }
+  trim_quantum_queued.store(false, std::memory_order_release);
+}
+
+void
+ReactorDispatchEngine::finish_log_trim(bool more)
+{
+  if (more && !stop.load(std::memory_order_relaxed)) {
+    enqueue_item(OpWorkItem::create_log_trim(), DispatchLane::Maintenance);
+    return;
+  }
+  log_trim_queued.store(false, std::memory_order_release);
 }
 
 void
@@ -261,7 +404,6 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
   record_wait_metrics(*item);
 
   const auto exec_start = ceph::coarse_mono_clock::now();
-  const DispatchLane lane = item->lane;
 
   mds::MdsLockGuard mds_lock_guard{
       *ctx.mds_lock, mds::work_kind_owner_token(item->kind)};
@@ -297,18 +439,27 @@ ReactorDispatchEngine::execute_item(OpWorkItem* item)
 
   case WorkKind::TrimQuantum:
     if (ctx.rank && ctx.rank->mdcache) {
-      ctx.rank->mdcache->trim_quantum();
+      const auto budget = std::chrono::milliseconds(
+          cache_trim_max_duration_ms.load(std::memory_order_relaxed));
+      const auto more = ctx.rank->mdcache->trim_quantum(budget);
+      finish_trim_quantum(more && *more);
+    } else {
+      finish_trim_quantum(false);
     }
     break;
 
   case WorkKind::LogTrim:
     if (ctx.rank && ctx.rank->mdlog) {
-      ctx.rank->mdlog->trim_tick();
+      const auto budget = std::chrono::milliseconds(
+          log_trim_max_duration_ms.load(std::memory_order_relaxed));
+      finish_log_trim(ctx.rank->mdlog->trim_tick(budget));
+    } else {
+      finish_log_trim(false);
     }
     break;
   }
 
-  record_execute_metrics(lane, exec_start);
+  record_execute_metrics(*item, exec_start);
   item->destroy();
 }
 
@@ -323,12 +474,41 @@ ReactorDispatchEngine::op_thread_main()
   mds::reactor_register_op_thread();
 #endif
 
+  size_t lane_idx = 0;
+  ceph::coarse_mono_time slice_deadline;
+  {
+    const auto budget_ms = lane_slice_ms(DispatchLane::Control);
+    if (budget_ms <= 0) {
+      slice_deadline = ceph::coarse_mono_time::max();
+    } else {
+      slice_deadline = ceph::coarse_mono_clock::now() +
+                       std::chrono::milliseconds(budget_ms);
+    }
+  }
+
   while (!stop.load()) {
     unsigned processed = 0;
-    while (processed < dequeue_batch_size) {
-      OpWorkItem* item = queue.dequeue();
+    // Bound work per wake so we still publish queue-depth metrics.
+    constexpr unsigned max_items_per_wake = 256;
+    while (processed < max_items_per_wake) {
+      OpWorkItem* item = nullptr;
+      size_t lanes_visited = 0;
+      while (lanes_visited < static_cast<size_t>(DispatchLane::Count)) {
+        if (ceph::coarse_mono_clock::now() >= slice_deadline) {
+          advance_lane_slice(lane_idx, slice_deadline);
+          ++lanes_visited;
+          continue;
+        }
+        item = queue.dequeue_lane(static_cast<DispatchLane>(lane_idx));
+        if (item) {
+          break;
+        }
+        // Lane empty before budget expired: yield to next priority.
+        advance_lane_slice(lane_idx, slice_deadline);
+        ++lanes_visited;
+      }
       if (!item) {
-        break;
+        break; // all lanes empty
       }
       execute_item(item);
       ++processed;
