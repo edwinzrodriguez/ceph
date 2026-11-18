@@ -15,6 +15,7 @@
 
 #include "CInode.h"
 
+#include <mutex>
 #include <string>
 
 #include "common/debug.h"
@@ -55,6 +56,61 @@
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
 #define dout_prefix *_dout << "mds." << mdcache->mds->get_nodeid() << ".cache.ino(" << ino() << ") "
+
+namespace {
+const bufferlist&
+empty_inodestat_optmetadata_encoded()
+{
+  static bufferlist bl;
+  static std::once_flag once;
+  std::call_once(once, []() {
+    decltype(InodeStat::optmetadata) optmetadata;
+    encode(optmetadata, bl);
+  });
+  return bl;
+}
+
+// Fixed-size portion of encode_inodestat (reply-encoding path); see the
+// full field-by-field sum in the getattr (!for_readdir) guard below.
+constexpr unsigned inodestat_readdir_fixed_encode_bound =
+    8 + 8 + 4 + 8 + 8 + sizeof(ceph_mds_reply_cap) + sizeof(ceph_file_layout) +
+    sizeof(ceph_timespec) * 3 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + 8 + 8 + 8 +
+    8 + 8 + sizeof(ceph_timespec) + sizeof(__u32) * 2 + sizeof(__u32) +
+    sizeof(ceph_dir_layout) + 4 + 4 + sizeof(version_t) + sizeof(__u32) + 1 +
+    1 + 8 + 8 + 4 + 4 + sizeof(ceph_timespec) + 8 + 8 + sizeof(ceph_timespec) +
+    8 + 4 + 1 + 8 + 64;
+
+bool
+inodestat_readdir_partial_fast(
+    bool for_readdir,
+    snapid_t snapid,
+    int getattr_caps,
+    Session* session,
+    bool valid,
+    bool no_caps,
+    Capability* cap,
+    const mempool_inode* file_i,
+    const mempool_inode* xattr_i)
+{
+  if (!for_readdir || snapid != CEPH_NOSNAP || getattr_caps != 0)
+    return false;
+  if (!session->info.has_feature(CEPHFS_FEATURE_REPLY_ENCODING))
+    return false;
+  if (!valid)
+    return false;
+  if (!no_caps && !cap)
+    return false;
+  if (file_i->inline_data.version != CEPH_INLINE_NONE) {
+    if (!cap && !no_caps)
+      return false;
+    if (cap && cap->client_inline_version < file_i->inline_data.version)
+      return false;
+  }
+  if (cap && cap->client_xattr_version < xattr_i->xattr_version)
+    return false;
+  return true;
+}
+} // anonymous namespace
 
 using namespace std;
 using ceph::encode_contiguous;
@@ -3364,6 +3420,16 @@ SnapRealm *CInode::find_snaprealm() const
   return cur->snaprealm;
 }
 
+SnapRealm*
+CInode::resolve_snaprealm(SnapRealm* dir_realm, bool under_dir_realm) const
+{
+  if (snaprealm)
+    return snaprealm;
+  if (dir_realm && under_dir_realm)
+    return dir_realm;
+  return find_snaprealm();
+}
+
 void CInode::encode_snap_blob(bufferlist &snapbl)
 {
   if (snaprealm) {
@@ -3971,7 +4037,8 @@ CInode::encode_inodestat(
     snapid_t snapid,
     unsigned max_bytes,
     int getattr_caps,
-    bool for_readdir)
+    bool for_readdir,
+    bool under_dir_realm)
 {
   client_t client = session->get_client();
   ceph_assert(snapid);
@@ -4025,7 +4092,7 @@ CInode::encode_inodestat(
 
   utime_t snap_btime;
   std::map<std::string, std::string> snap_metadata;
-  SnapRealm *realm = find_snaprealm();
+  SnapRealm* realm = resolve_snaprealm(dir_realm, under_dir_realm);
   if (snapid != CEPH_NOSNAP && realm) {
     // add snapshot timestamp vxattr
     map<snapid_t,const SnapInfo*> infomap;
@@ -4060,14 +4127,15 @@ CInode::encode_inodestat(
   version_t version = (oi->version * 2) + is_projected();
 
   Capability *cap = get_client_cap(client);
-  bool pfile = filelock.is_xlocked_by_client(client) || get_loner() == client;
+  client_t loner = get_loner();
+  bool pfile = filelock.is_xlocked_by_client(client) || loner == client;
   //(cap && (cap->issued() & CEPH_CAP_FILE_EXCL));
-  bool pauth = authlock.is_xlocked_by_client(client) || get_loner() == client;
-  bool plink = linklock.is_xlocked_by_client(client) || get_loner() == client;
-  bool pxattr = xattrlock.is_xlocked_by_client(client) || get_loner() == client;
+  bool pauth = authlock.is_xlocked_by_client(client) || loner == client;
+  bool plink = linklock.is_xlocked_by_client(client) || loner == client;
+  bool pxattr = xattrlock.is_xlocked_by_client(client) || loner == client;
 
   bool plocal = versionlock.get_last_wrlock_client() == client;
-  bool ppolicy = policylock.is_xlocked_by_client(client) || get_loner()==client;
+  bool ppolicy = policylock.is_xlocked_by_client(client) || loner == client;
 
   const mempool_inode *any_i = (pfile|pauth|plink|pxattr|plocal) ? pi : oi;
 
@@ -4091,38 +4159,46 @@ CInode::encode_inodestat(
     std::min(oi->get_client_range(client),
 	     pi->get_client_range(client));
 
+  const mempool_inode* auth_i = pauth ? pi : oi;
+  const mempool_inode* link_i = plink ? pi : oi;
+  const mempool_inode* xattr_i = pxattr ? pi : oi;
+
+  const bool readdir_partial_fast = inodestat_readdir_partial_fast(
+      for_readdir, snapid, getattr_caps, session, valid, no_caps, cap, file_i,
+      xattr_i);
+  if (readdir_partial_fast && mdcache->mds->logger)
+    mdcache->mds->logger->inc(l_mds_encode_inodestat_fast);
+
   // inline data
   version_t inline_version = 0;
   bufferlist inline_data;
-  if (file_i->inline_data.version == CEPH_INLINE_NONE) {
+  if (readdir_partial_fast) {
+    if (file_i->inline_data.version == CEPH_INLINE_NONE)
+      inline_version = CEPH_INLINE_NONE;
+  } else if (file_i->inline_data.version == CEPH_INLINE_NONE) {
     inline_version = CEPH_INLINE_NONE;
-  } else if ((!cap && !no_caps) ||
-	     (cap && cap->client_inline_version < file_i->inline_data.version) ||
-	     (getattr_caps & CEPH_CAP_FILE_RD)) { // client requests inline data
+  } else if (
+      (!cap && !no_caps) ||
+      (cap && cap->client_inline_version < file_i->inline_data.version) ||
+      (getattr_caps & CEPH_CAP_FILE_RD)) { // client requests inline data
     inline_version = file_i->inline_data.version;
     if (file_i->inline_data.length() > 0)
       file_i->inline_data.get_data(inline_data);
   }
 
   // nest (do same as file... :/)
-  if (cap) {
+  if (cap && !readdir_partial_fast) {
     cap->last_rbytes = file_i->rstat.rbytes;
     cap->last_rsize = file_i->rstat.rsize();
   }
 
-  // auth
-  const mempool_inode *auth_i = pauth ? pi:oi;
-
-  // link
-  const mempool_inode *link_i = plink ? pi:oi;
-  
-  // xattr
-  const mempool_inode *xattr_i = pxattr ? pi:oi;
-
   using ceph::encode;
   // xattr
   version_t xattr_version;
-  if ((!cap && !no_caps) ||
+  if (readdir_partial_fast) {
+    xattr_version = 0;
+  } else if (
+      (!cap && !no_caps) ||
       (cap && cap->client_xattr_version < xattr_i->xattr_version) ||
       (getattr_caps & CEPH_CAP_XATTR_SHARED)) { // client requests xattrs
     if (!pxattrs)
@@ -4132,46 +4208,56 @@ CInode::encode_inodestat(
     xattr_version = 0;
   }
 
-  bufferlist optmdbl;
-  {
+  bufferlist optmdbl_owned;
+  const bufferlist* optmdbl = &empty_inodestat_optmetadata_encoded();
+  if (auto* csp = get_charmap(); csp || has_quarantined()) {
     decltype(InodeStat::optmetadata) optmetadata;
     using kind_t = decltype(optmetadata)::optkind_t;
-
-    auto* csp = get_charmap();
     if (csp) {
       if (mdcache->mds->logger)
         mdcache->mds->logger->inc(l_mds_encode_inodestat_charmap);
       dout(25) << *csp << dendl;
       auto& opt = optmetadata.get_or_create_opt(kind_t::CHARMAP);
-      auto& cs = opt.template get_meta< charmap_md_t >();
+      auto& cs = opt.template get_meta<charmap_md_t>();
       cs = *csp;
       dout(25) << "cs now " << cs << dendl;
     }
-
     if (has_quarantined()) {
       auto& opt = optmetadata.get_or_create_opt(kind_t::QUARANTINE);
-      auto& qs = opt.template get_meta< quarantine_md_t >();
+      auto& qs = opt.template get_meta<quarantine_md_t>();
       dout(25) << "qtine now " << qs << dendl;
     }
-
-    encode(optmetadata, optmdbl);
+    encode(optmetadata, optmdbl_owned);
+    optmdbl = &optmdbl_owned;
   }
 
   // do we have room?
   if (max_bytes) {
-    unsigned bytes =
-      8 + 8 + 4 + 8 + 8 + sizeof(ceph_mds_reply_cap) +
-      sizeof(struct ceph_file_layout) +
-      sizeof(struct ceph_timespec) * 3 + 4 + // ctime ~ time_warp_seq
-      8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + // size ~ nlink
-      8 + 8 + 8 + 8 + 8 + sizeof(struct ceph_timespec) + // dirstat.nfiles ~ rstat.rctime
-      sizeof(__u32) + sizeof(__u32) * 2 * dirfragtree._splits.size() + // dirfragtree
-      sizeof(__u32) + symlink.length() + // symlink
-      sizeof(struct ceph_dir_layout) // dir_layout
-      + 4 + file_i->fscrypt_auth.size() // len + data
-      + 4 + file_i->fscrypt_file.size() // len + data
-      + optmdbl.length()
-      ;
+    unsigned bytes;
+    if (for_readdir) {
+      bytes = inodestat_readdir_fixed_encode_bound + optmdbl->length() +
+              inline_data.length() + symlink.length() + layout.pool_ns.size() +
+              file_i->fscrypt_auth.size() + file_i->fscrypt_file.size() +
+              sizeof(__u32) * 2 * dirfragtree._splits.size();
+      bytes += sizeof(__u32); // snap_metadata map len
+      for (const auto& p : snap_metadata) {
+        bytes += sizeof(__u32) * 2 + p.first.length() + p.second.length();
+      }
+    } else {
+      bytes = 8 + 8 + 4 + 8 + 8 + sizeof(ceph_mds_reply_cap) +
+              sizeof(struct ceph_file_layout) +
+              sizeof(struct ceph_timespec) * 3 + 4 + // ctime ~ time_warp_seq
+              8 + 8 + 8 + 4 + 4 + 4 + 4 + 4 + // size ~ nlink
+              8 + 8 + 8 + 8 + 8 +
+              sizeof(struct ceph_timespec) + // dirstat.nfiles ~ rstat.rctime
+              sizeof(__u32) +
+              sizeof(__u32) * 2 * dirfragtree._splits.size() + // dirfragtree
+              sizeof(__u32) + symlink.length() + // symlink
+              sizeof(struct ceph_dir_layout) // dir_layout
+              + 4 + file_i->fscrypt_auth.size() // len + data
+              + 4 + file_i->fscrypt_file.size() // len + data
+              + optmdbl->length();
+    }
 
     if (xattr_version) {
       bytes += sizeof(__u32) + sizeof(__u32); // xattr buffer len + number entries
@@ -4182,11 +4268,13 @@ CInode::encode_inodestat(
     } else {
       bytes += sizeof(__u32); // xattr buffer len
     }
-    bytes +=
-      sizeof(version_t) + sizeof(__u32) + inline_data.length() + // inline data
-      1 + 1 + 8 + 8 + 4 + // quota
-      4 + layout.pool_ns.size() + // pool ns
-      sizeof(struct ceph_timespec) + 8; // btime + change_attr
+    if (!for_readdir) {
+      bytes += sizeof(version_t) + sizeof(__u32) +
+               inline_data.length() + // inline data
+               1 + 1 + 8 + 8 + 4 + // quota
+               4 + layout.pool_ns.size() + // pool ns
+               sizeof(struct ceph_timespec) + 8; // btime + change_attr
+    }
 
     if (bytes > max_bytes)
       return -ENOSPC;
@@ -4222,38 +4310,45 @@ CInode::encode_inodestat(
     ecap.mseq = 0;
     ecap.realm = 0;
   } else {
+    bool cap_mutated = false;
     if (!no_caps && !cap) {
       // add a new cap
       cap = add_client_cap(client, session, realm);
       if (is_auth())
-	choose_ideal_loner();
+        choose_ideal_loner();
+      cap_mutated = true;
     }
 
     int issue = 0;
     if (!no_caps && cap) {
       int likes = get_caps_liked();
       int allowed = get_caps_allowed_for_client(session, cap, file_i);
-      issue = (cap->wanted() | likes) & allowed;
-      cap->issue_norevoke(issue, true);
+      int issue_desired = (cap->wanted() | likes) & allowed;
+      if (issue_desired & ~cap->pending()) {
+        cap->issue_norevoke(issue_desired, true);
+        cap_mutated = true;
+      }
       issue = cap->pending();
-      dout(10) << "encode_inodestat issuing " << ccap_string(issue)
-	       << " seq " << cap->get_last_seq() << dendl;
+      dout(10) << "encode_inodestat issuing " << ccap_string(issue) << " seq "
+               << cap->get_last_seq() << dendl;
     } else if (cap && cap->is_new() && !dir_realm) {
       // alway issue new caps to client, otherwise the caps get lost
       ceph_assert(cap->is_stale());
       ceph_assert(!cap->pending());
       issue = CEPH_CAP_PIN;
       cap->issue_norevoke(issue, true);
-      dout(10) << "encode_inodestat issuing " << ccap_string(issue)
-	       << " seq " << cap->get_last_seq()
-	       << "(stale&new caps)" << dendl;
+      cap_mutated = true;
+      dout(10) << "encode_inodestat issuing " << ccap_string(issue) << " seq "
+               << cap->get_last_seq() << "(stale&new caps)" << dendl;
     }
 
     if (issue) {
-      if (mdcache->mds->logger)
-        mdcache->mds->logger->inc(l_mds_encode_inodestat_cap_issue);
-      cap->set_last_issue();
-      cap->set_last_issue_stamp(ceph_clock_now());
+      if (cap_mutated) {
+        if (mdcache->mds->logger)
+          mdcache->mds->logger->inc(l_mds_encode_inodestat_cap_issue);
+        cap->set_last_issue();
+        cap->set_last_issue_stamp(ceph_clock_now());
+      }
       ecap.caps = issue;
       ecap.wanted = cap->wanted();
       ecap.cap_id = cap->get_cap_id();
@@ -4274,7 +4369,7 @@ CInode::encode_inodestat(
 	   << " seq " << ecap.seq << " mseq " << ecap.mseq
 	   << " xattrv " << xattr_version << dendl;
 
-  if (inline_data.length() && cap) {
+  if (!readdir_partial_fast && inline_data.length() && cap) {
     if ((cap->pending() | getattr_caps) & CEPH_CAP_FILE_SHARED) {
       dout(10) << "including inline version " << inline_version << dendl;
       cap->client_inline_version = inline_version;
@@ -4286,7 +4381,7 @@ CInode::encode_inodestat(
   }
 
   // include those xattrs?
-  if (xattr_version && cap) {
+  if (!readdir_partial_fast && xattr_version && cap) {
     if ((cap->pending() | getattr_caps) & CEPH_CAP_XATTR_SHARED) {
       dout(10) << "including xattrs version " << xattr_version << dendl;
       cap->client_xattr_version = xattr_version;
@@ -4386,7 +4481,7 @@ CInode::encode_inodestat(
       !file_i->fscrypt_auth.empty(),
       file_i->fscrypt_auth,
       file_i->fscrypt_file);
-    encode_nohead(optmdbl, bl);
+    encode_nohead(*optmdbl, bl);
     encode(get_subvolume_id(), bl);
     // encode inodestat
     ENCODE_FINISH(bl);
