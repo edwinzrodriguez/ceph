@@ -15,6 +15,17 @@
 #   ./mds-stall-debug.py --daemon mds.myfs-0.abc --grafana-url http://localhost:3000
 #   ./mds-stall-debug.py --daemon mds.myfs-0.abc --client-debugfs \
 #       --client-host client-000 --client-host client-001
+#   (also copies /var/log/ceph/ceph-fuse-<host>.log when present)
+#
+# For cluster-wide crash capture (MDS + all ceph-fuse), prefer
+# mds-crash-monitor.py — it watches every asok, dumps survivors, collects
+# logs, then invokes this script. Client-local fuse-only helpers remain:
+#   ./mds-stall-debug.py --watch-fuse-abort --output /shared/out \
+#       --client-host client-000 --client-host client-001 \
+#       --mds-asok /var/run/ceph/ceph-mds.foo.asok --mds-host mon-000
+#   ./mds-stall-debug.py --deploy-fuse-watch --output /shared/out \
+#       --client-host client-000 --client-host client-001 \
+#       --mds-asok /var/run/ceph/ceph-mds.foo.asok --mds-host mon-000
 #
 # Log extract uses stall dir timestamp (…-YYYYMMDD-HHMMSS), blocked/historic op event
 # times, and report events — not report.txt collection time for idle (0 blocked op) stalls.
@@ -33,6 +44,8 @@ import base64
 import json
 import os
 import re
+import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -946,6 +959,14 @@ PROMETHEUS_TIMESERIES_ARTIFACT = "prometheus_timeseries.json"
 CLIENT_DEBUGFS_DIR = "client_debugfs"
 CLIENT_DEBUGFS_SUMMARY = "client_debugfs_summary.json"
 CLIENT_DEBUGFS_DEFAULT_FILES = ("mdsc", "mds_sessions", "osdc", "caps")
+CLIENT_FUSE_LOG_DIR = "client_logs"
+CLIENT_FUSE_LOG_SUMMARY = "client_fuse_logs.json"
+CLIENT_FUSE_LOG_DEFAULT_DIR = "/var/log/ceph"
+CLIENT_FUSE_ASOK_DEFAULT_DIR = "/var/run/ceph"
+FUSE_ABORT_SUMMARY = "fuse_abort.json"
+FUSE_WATCH_INVENTORY = "fuse_watch_inventory.json"
+MDS_LOG_DIRNAME = "mds_logs"
+LOCAL_HOST_ALIASES = {"", "localhost", "127.0.0.1", "::1"}
 CLIENT_DEBUGFS_DIR_RE = re.compile(
     r"^(?P<fsid>[0-9a-fA-F-]{36})\.client(?P<client_id>\d+)$"
 )
@@ -2480,6 +2501,1119 @@ def append_client_debugfs_report_section(
         handle.write("\n")
 
 
+def client_fuse_host_label(host: str) -> str:
+    return sanitize_host_label(host.split(".")[0] if host else "host")
+
+
+def client_fuse_log_name(host: str) -> str:
+    return f"ceph-fuse-{client_fuse_host_label(host)}.log"
+
+
+def client_fuse_asok_name(host: str) -> str:
+    return f"ceph-fuse-{client_fuse_host_label(host)}.asok"
+
+
+def client_fuse_asok_path(
+    host: str,
+    asok_dir: str = CLIENT_FUSE_ASOK_DEFAULT_DIR,
+) -> str:
+    return f"{asok_dir.rstrip('/')}/{client_fuse_asok_name(host)}"
+
+
+def dump_client_fuse_log_local(
+    *,
+    asok_path: Path,
+    timeout: int,
+) -> Dict[str, Any]:
+    """
+    Best-effort: dump in-memory ceph-fuse log buffer via asok before copy.
+    """
+    info: Dict[str, Any] = {"asok": str(asok_path)}
+    try:
+        if not asok_path.exists():
+            info["status"] = "missing"
+            return info
+    except OSError as exc:
+        info["status"] = "error"
+        info["error"] = str(exc)
+        return info
+
+    cmd = ["ceph", "--admin-daemon", str(asok_path), "log", "dump"]
+    try:
+        proc = subprocess.run(
+            cmd, check=False, capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        info["status"] = "error"
+        info["error"] = str(exc)
+        return info
+    if proc.returncode != 0:
+        err = proc.stderr.strip() or proc.stdout.strip() or "log dump failed"
+        info["status"] = "error"
+        info["error"] = err
+        return info
+    info["status"] = "dumped"
+    return info
+
+
+def dump_client_fuse_log_remote(
+    *,
+    host: str,
+    asok_path: str,
+    timeout: int,
+    ssh_user: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Best-effort: dump in-memory ceph-fuse log buffer via asok before copy.
+    """
+    info: Dict[str, Any] = {"asok": asok_path}
+    quoted = asok_path.replace("'", "'\"'\"'")
+    script = (
+        f"if [ -S '{quoted}' ] || [ -e '{quoted}' ]; then "
+        f"ceph --admin-daemon '{quoted}' log dump; "
+        f"else echo '__ASOK_MISSING__'; exit 0; fi"
+    )
+    try:
+        out = ssh_run(
+            host,
+            script,
+            timeout=min(timeout, 30),
+            ssh_user=ssh_user,
+        )
+    except RuntimeError as exc:
+        info["status"] = "error"
+        info["error"] = str(exc)
+        return info
+    if "__ASOK_MISSING__" in out:
+        info["status"] = "missing"
+        return info
+    info["status"] = "dumped"
+    return info
+
+
+def copy_client_fuse_log_local(
+    *,
+    dest: Path,
+    remote_path: Path,
+    timeout: int,
+) -> Dict[str, Any]:
+    if not remote_path.is_file():
+        return {"status": "missing", "source": str(remote_path)}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.copy2(remote_path, dest)
+    except PermissionError:
+        text = read_text_file_local(remote_path, timeout)
+        dest.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return {"status": "error", "source": str(remote_path), "error": str(exc)}
+    return {
+        "status": "copied",
+        "source": str(remote_path),
+        "path": str(dest),
+        "bytes": dest.stat().st_size,
+    }
+
+
+def copy_client_fuse_log_remote(
+    *,
+    dest: Path,
+    host: str,
+    remote_path: str,
+    timeout: int,
+    ssh_user: Optional[str] = None,
+) -> Dict[str, Any]:
+    quoted = remote_path.replace("'", "'\"'\"'")
+    try:
+        exists = ssh_run(
+            host,
+            f"if [ -f '{quoted}' ]; then echo yes; fi",
+            timeout=min(timeout, 20),
+            ssh_user=ssh_user,
+        ).strip()
+    except RuntimeError as exc:
+        return {"status": "error", "source": remote_path, "error": str(exc)}
+    if exists != "yes":
+        return {"status": "missing", "source": remote_path}
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    target = f"{ssh_user}@{host}" if ssh_user else host
+    cmd = [
+        "scp",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ConnectTimeout=10",
+        f"{target}:{remote_path}",
+        str(dest),
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, check=False, capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {"status": "error", "source": remote_path, "error": str(exc)}
+    if proc.returncode != 0:
+        # scp may be blocked; fall back to ssh cat.
+        try:
+            text = read_text_file_remote(
+                host, remote_path, timeout=timeout, ssh_user=ssh_user,
+            )
+        except RuntimeError as exc:
+            err = proc.stderr.strip() or proc.stdout.strip() or str(exc)
+            return {"status": "error", "source": remote_path, "error": err}
+        dest.write_text(text, encoding="utf-8")
+    return {
+        "status": "copied",
+        "source": remote_path,
+        "path": str(dest),
+        "bytes": dest.stat().st_size if dest.exists() else 0,
+    }
+
+
+def collect_client_fuse_logs(
+    *,
+    output_dir: Path,
+    hosts: Optional[List[str]] = None,
+    log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
+    asok_dir: str = CLIENT_FUSE_ASOK_DEFAULT_DIR,
+    ssh_user: Optional[str] = None,
+    timeout: int = 60,
+    include_local: bool = True,
+) -> Dict[str, Any]:
+    """
+    Copy ceph-fuse-<host>.log from each client when the file exists.
+
+    Before copying, if /var/run/ceph/ceph-fuse-<host>.asok exists, run
+    `ceph --admin-daemon <asok> log dump` so recent in-memory log entries
+    are flushed into the log file first. Missing logs/asoks are skipped.
+    """
+    out_dir = output_dir / CLIENT_FUSE_LOG_DIR
+    host_list: List[str] = []
+    if include_local and not hosts:
+        host_list = ["localhost"]
+    for host in hosts or []:
+        host_list.append(host)
+
+    results: List[Dict[str, Any]] = []
+    for host in host_list:
+        name = client_fuse_log_name(host)
+        remote_path = f"{log_dir.rstrip('/')}/{name}"
+        dest = out_dir / name
+        entry: Dict[str, Any] = {"host": host, "filename": name}
+        if host in ("localhost", "127.0.0.1", "::1"):
+            # Also try the real short hostname used in ceph-fuse-<host>.log.
+            log_candidates = [Path(remote_path)]
+            asok_labels = [client_fuse_host_label(host)]
+            try:
+                short = socket.gethostname().split(".")[0]
+                alt = Path(log_dir) / client_fuse_log_name(short)
+                if alt not in log_candidates:
+                    log_candidates.append(alt)
+                short_label = client_fuse_host_label(short)
+                if short_label not in asok_labels:
+                    asok_labels.append(short_label)
+            except OSError:
+                pass
+
+            dump_info: Optional[Dict[str, Any]] = None
+            for label in asok_labels:
+                dump_info = dump_client_fuse_log_local(
+                    asok_path=Path(asok_dir) / f"ceph-fuse-{label}.asok",
+                    timeout=min(timeout, 30),
+                )
+                if dump_info.get("status") == "dumped":
+                    break
+            entry["log_dump"] = dump_info or {"status": "missing"}
+
+            copied: Optional[Dict[str, Any]] = None
+            for cand in log_candidates:
+                copied = copy_client_fuse_log_local(
+                    dest=out_dir / cand.name, remote_path=cand, timeout=timeout,
+                )
+                entry["filename"] = cand.name
+                if copied.get("status") == "copied":
+                    break
+            entry.update(copied or {"status": "missing", "source": remote_path})
+        else:
+            entry["log_dump"] = dump_client_fuse_log_remote(
+                host=host,
+                asok_path=client_fuse_asok_path(host, asok_dir),
+                timeout=timeout,
+                ssh_user=ssh_user,
+            )
+            entry.update(
+                copy_client_fuse_log_remote(
+                    dest=dest,
+                    host=host,
+                    remote_path=remote_path,
+                    timeout=timeout,
+                    ssh_user=ssh_user,
+                )
+            )
+        results.append(entry)
+
+    copied_n = sum(1 for r in results if r.get("status") == "copied")
+    dumped_n = sum(
+        1 for r in results
+        if (r.get("log_dump") or {}).get("status") == "dumped"
+    )
+    summary = {
+        "log_dir": log_dir,
+        "asok_dir": asok_dir,
+        "host_count": len(results),
+        "copied": copied_n,
+        "log_dumped": dumped_n,
+        "missing": sum(1 for r in results if r.get("status") == "missing"),
+        "errors": sum(1 for r in results if r.get("status") == "error"),
+        "hosts": results,
+        "collected_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    write_json_artifact(output_dir / CLIENT_FUSE_LOG_SUMMARY, summary)
+    return summary
+
+
+def format_client_fuse_log_report(summary: Dict[str, Any]) -> List[str]:
+    lines = ["== Client ceph-fuse logs =="]
+    lines.append(
+        "Hosts={hosts}, copied={copied}, log_dumped={dumped}, "
+        "missing={missing}, errors={errors} "
+        "(looked in {log_dir}/ceph-fuse-<host>.log; "
+        "asok log dump via {asok_dir}/ceph-fuse-<host>.asok)".format(
+            hosts=summary.get("host_count", 0),
+            copied=summary.get("copied", 0),
+            dumped=summary.get("log_dumped", 0),
+            missing=summary.get("missing", 0),
+            errors=summary.get("errors", 0),
+            log_dir=summary.get("log_dir", CLIENT_FUSE_LOG_DEFAULT_DIR),
+            asok_dir=summary.get("asok_dir", CLIENT_FUSE_ASOK_DEFAULT_DIR),
+        )
+    )
+    for host in summary.get("hosts") or []:
+        status = host.get("status") or "?"
+        extra = ""
+        if status == "copied":
+            extra = f" -> {host.get('path')} ({host.get('bytes', 0)} bytes)"
+        elif host.get("error"):
+            extra = f": {host.get('error')}"
+        elif host.get("source"):
+            extra = f" ({host.get('source')})"
+        dump = host.get("log_dump") or {}
+        dump_status = dump.get("status")
+        if dump_status and dump_status != "missing":
+            dump_extra = f", log_dump={dump_status}"
+            if dump_status == "error" and dump.get("error"):
+                dump_extra += f" ({dump.get('error')})"
+            extra += dump_extra
+        lines.append(f"- {host.get('host')}: {status}{extra}")
+    return lines
+
+
+def append_client_fuse_log_report_section(
+    report_path: Path,
+    summary: Dict[str, Any],
+) -> None:
+    if not report_path.exists():
+        return
+    section = format_client_fuse_log_report(summary)
+    with report_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+        handle.write("\n".join(section))
+        handle.write("\n")
+
+
+def _watch_log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+def local_short_hostname() -> str:
+    try:
+        return socket.gethostname().split(".")[0]
+    except OSError:
+        return "localhost"
+
+
+def host_is_local(host: Optional[str]) -> bool:
+    if host is None:
+        return True
+    if host in LOCAL_HOST_ALIASES:
+        return True
+    return client_fuse_host_label(host) == client_fuse_host_label(local_short_hostname())
+
+
+def resolve_local_fuse_asok(
+    asok: Optional[str] = None,
+    asok_dir: str = CLIENT_FUSE_ASOK_DEFAULT_DIR,
+) -> Path:
+    if asok:
+        return Path(asok).expanduser()
+    return Path(client_fuse_asok_path(local_short_hostname(), asok_dir))
+
+
+def parse_asok_config_get(stdout: str, var: str) -> Optional[str]:
+    text = (stdout or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+    if isinstance(data, dict):
+        if var in data and data[var] not in (None, ""):
+            return str(data[var])
+        if len(data) == 1:
+            value = next(iter(data.values()))
+            if value not in (None, ""):
+                return str(value)
+    return None
+
+
+def asok_config_get_local(
+    asok_path: Path,
+    var: str,
+    timeout: float,
+) -> Tuple[Optional[str], Optional[str]]:
+    cmd = ["ceph", "--admin-daemon", str(asok_path), "config", "get", var]
+    try:
+        proc = subprocess.run(
+            cmd, check=False, capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        err = proc.stderr.strip() or proc.stdout.strip() or "config get failed"
+        return None, err
+    value = parse_asok_config_get(proc.stdout, var)
+    if not value:
+        return None, f"empty {var} in: {proc.stdout.strip()[:200]}"
+    return value, None
+
+
+def asok_config_get_remote(
+    host: str,
+    asok_path: str,
+    var: str,
+    *,
+    timeout: float,
+    ssh_user: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    quoted_asok = asok_path.replace("'", "'\"'\"'")
+    quoted_var = var.replace("'", "'\"'\"'")
+    script = (
+        f"ceph --admin-daemon '{quoted_asok}' config get '{quoted_var}'"
+    )
+    try:
+        out = ssh_run(
+            host, script, timeout=min(int(timeout), 30), ssh_user=ssh_user,
+        )
+    except RuntimeError as exc:
+        return None, str(exc)
+    value = parse_asok_config_get(out, var)
+    if not value:
+        return None, f"empty {var} in: {out.strip()[:200]}"
+    return value, None
+
+
+def fuse_asok_alive(asok: Path, timeout: float) -> bool:
+    """True if the ceph-fuse admin socket exists and answers a cheap command."""
+    try:
+        proc = subprocess.run(
+            ["ceph", "--admin-daemon", str(asok), "status"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+    return proc.returncode == 0
+
+
+def wait_fuse_asok_alive(
+    asok: Path,
+    interval: float,
+    probe_timeout: float,
+) -> None:
+    _watch_log(f"waiting for ceph-fuse asok to become healthy: {asok}")
+    while True:
+        if fuse_asok_alive(asok, probe_timeout):
+            _watch_log("ceph-fuse asok is healthy")
+            return
+        time.sleep(interval)
+
+
+def watch_fuse_asok_until_dead(
+    asok: Path,
+    *,
+    interval: float,
+    probe_timeout: float,
+    fail_threshold: int,
+) -> Dict[str, Any]:
+    """Poll until the fuse asok fails ``fail_threshold`` times in a row."""
+    _watch_log(
+        f"watching {asok} (interval={interval}s, fail_threshold={fail_threshold})"
+    )
+    consecutive_fails = 0
+    first_fail_at: Optional[float] = None
+    while True:
+        if fuse_asok_alive(asok, probe_timeout):
+            if consecutive_fails:
+                _watch_log("ceph-fuse asok recovered; resetting failure streak")
+            consecutive_fails = 0
+            first_fail_at = None
+        else:
+            consecutive_fails += 1
+            if first_fail_at is None:
+                first_fail_at = time.monotonic()
+            _watch_log(
+                f"ceph-fuse asok probe failed ({consecutive_fails}/{fail_threshold})"
+            )
+            if consecutive_fails >= fail_threshold:
+                assert first_fail_at is not None
+                return {
+                    "first_fail_monotonic": first_fail_at,
+                    "detected_at": datetime.now(timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"
+                    ),
+                }
+        time.sleep(interval)
+
+
+def resolve_process_log_file(
+    proc: Dict[str, Any],
+    *,
+    timeout: float,
+    ssh_user: Optional[str] = None,
+    fallback: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Set log_file from `config get log_file` while the process is still up."""
+    asok = proc.get("asok")
+    if not asok:
+        proc["log_file"] = fallback
+        proc["log_file_source"] = "fallback" if fallback else "missing"
+        return proc
+    if proc.get("local"):
+        value, err = asok_config_get_local(Path(asok), "log_file", timeout)
+    else:
+        value, err = asok_config_get_remote(
+            proc["host"], asok, "log_file", timeout=timeout, ssh_user=ssh_user,
+        )
+    if value:
+        proc["log_file"] = value
+        proc["log_file_source"] = "config get"
+        return proc
+    proc["log_file"] = fallback
+    proc["log_file_source"] = "fallback" if fallback else "error"
+    if err:
+        proc["log_file_error"] = err
+    return proc
+
+
+def _inventory_add_proc(
+    inventory: List[Dict[str, Any]],
+    seen_asoks: Set[str],
+    *,
+    role: str,
+    host: str,
+    asok: Optional[str],
+    fallback_log: Optional[str],
+    local: bool,
+    ssh_user: Optional[str],
+    timeout: float,
+    log_file_override: Optional[str] = None,
+) -> None:
+    if asok and asok in seen_asoks:
+        return
+    if asok:
+        seen_asoks.add(asok)
+    proc: Dict[str, Any] = {
+        "id": f"{role}:{client_fuse_host_label(host)}",
+        "role": role,
+        "host": host,
+        "asok": asok,
+        "local": local,
+    }
+    resolve_process_log_file(
+        proc,
+        timeout=timeout,
+        ssh_user=ssh_user,
+        fallback=fallback_log,
+    )
+    if log_file_override:
+        proc["log_file"] = log_file_override
+        proc["log_file_source"] = "cli"
+    inventory.append(proc)
+
+
+def build_cluster_watch_inventory(
+    *,
+    mds_asok: Optional[str],
+    mds_host: Optional[str],
+    mds_log: Optional[str],
+    client_hosts: Optional[List[str]],
+    asok_dir: str = CLIENT_FUSE_ASOK_DEFAULT_DIR,
+    client_fuse_log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
+    ssh_user: Optional[str] = None,
+    timeout: float = 30,
+    include_local_fuse: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Snapshot asok + log_file for MDS and ceph-fuse clients.
+
+    Intended for a coordinator (mds-crash-monitor.py) that watches every
+    process and, on any crash, dumps survivors and copies logs. ``log_file``
+    is queried live via asok ``config get log_file`` while processes are up.
+    """
+    local_host = local_short_hostname()
+    inventory: List[Dict[str, Any]] = []
+    seen_asoks: Set[str] = set()
+
+    if mds_asok or mds_log:
+        host = mds_host or local_host
+        fallback = mds_log
+        if not fallback and mds_asok:
+            fallback = (
+                f"{client_fuse_log_dir.rstrip('/')}/"
+                f"{Path(mds_asok).name.removesuffix('.asok')}.log"
+            )
+        _inventory_add_proc(
+            inventory,
+            seen_asoks,
+            role="mds",
+            host=host,
+            asok=mds_asok,
+            fallback_log=fallback,
+            local=host_is_local(host),
+            ssh_user=ssh_user,
+            timeout=timeout,
+            log_file_override=mds_log,
+        )
+
+    if include_local_fuse:
+        _inventory_add_proc(
+            inventory,
+            seen_asoks,
+            role="fuse",
+            host=local_host,
+            asok=client_fuse_asok_path(local_host, asok_dir),
+            fallback_log=(
+                f"{client_fuse_log_dir.rstrip('/')}/"
+                f"{client_fuse_log_name(local_host)}"
+            ),
+            local=True,
+            ssh_user=ssh_user,
+            timeout=timeout,
+        )
+
+    for host in client_hosts or []:
+        if host_is_local(host):
+            if not include_local_fuse:
+                _inventory_add_proc(
+                    inventory,
+                    seen_asoks,
+                    role="fuse",
+                    host=local_host,
+                    asok=client_fuse_asok_path(local_host, asok_dir),
+                    fallback_log=(
+                        f"{client_fuse_log_dir.rstrip('/')}/"
+                        f"{client_fuse_log_name(local_host)}"
+                    ),
+                    local=True,
+                    ssh_user=ssh_user,
+                    timeout=timeout,
+                )
+            continue
+        _inventory_add_proc(
+            inventory,
+            seen_asoks,
+            role="fuse",
+            host=host,
+            asok=client_fuse_asok_path(host, asok_dir),
+            fallback_log=(
+                f"{client_fuse_log_dir.rstrip('/')}/{client_fuse_log_name(host)}"
+            ),
+            local=False,
+            ssh_user=ssh_user,
+            timeout=timeout,
+        )
+    return inventory
+
+
+def build_fuse_watch_inventory(
+    *,
+    local_asok: Path,
+    client_hosts: Optional[List[str]],
+    asok_dir: str,
+    client_fuse_log_dir: str,
+    mds_asok: Optional[str],
+    mds_host: Optional[str],
+    mds_log: Optional[str],
+    ssh_user: Optional[str],
+    timeout: float,
+) -> List[Dict[str, Any]]:
+    """
+    Client-local inventory: this host's fuse asok plus peer fuse/MDS targets.
+    """
+    local_host = local_short_hostname()
+    inventory: List[Dict[str, Any]] = []
+    seen_asoks: Set[str] = set()
+
+    _inventory_add_proc(
+        inventory,
+        seen_asoks,
+        role="fuse",
+        host=local_host,
+        asok=str(local_asok),
+        fallback_log=f"{client_fuse_log_dir.rstrip('/')}/{client_fuse_log_name(local_host)}",
+        local=True,
+        ssh_user=ssh_user,
+        timeout=timeout,
+    )
+    for host in client_hosts or []:
+        if host_is_local(host):
+            continue
+        _inventory_add_proc(
+            inventory,
+            seen_asoks,
+            role="fuse",
+            host=host,
+            asok=client_fuse_asok_path(host, asok_dir),
+            fallback_log=f"{client_fuse_log_dir.rstrip('/')}/{client_fuse_log_name(host)}",
+            local=False,
+            ssh_user=ssh_user,
+            timeout=timeout,
+        )
+    if mds_asok or mds_log:
+        host = mds_host or local_host
+        fallback = mds_log
+        if not fallback and mds_asok:
+            fallback = (
+                f"{client_fuse_log_dir.rstrip('/')}/"
+                f"{Path(mds_asok).name.removesuffix('.asok')}.log"
+            )
+        _inventory_add_proc(
+            inventory,
+            seen_asoks,
+            role="mds",
+            host=host,
+            asok=mds_asok,
+            fallback_log=fallback,
+            local=host_is_local(host),
+            ssh_user=ssh_user,
+            timeout=timeout,
+            log_file_override=mds_log,
+        )
+    return inventory
+
+
+def asok_alive_remote(
+    host: str,
+    asok_path: str,
+    timeout: float,
+    ssh_user: Optional[str] = None,
+) -> bool:
+    quoted = asok_path.replace("'", "'\"'\"'")
+    script = (
+        f"ceph --admin-daemon '{quoted}' status >/dev/null 2>&1 "
+        f"&& echo yes || echo no"
+    )
+    try:
+        out = ssh_run(
+            host, script, timeout=min(int(timeout) + 10, 40), ssh_user=ssh_user,
+        ).strip()
+    except RuntimeError:
+        return False
+    return out.splitlines()[-1] == "yes" if out else False
+
+
+def probe_monitored_process(
+    proc: Dict[str, Any],
+    timeout: float,
+    ssh_user: Optional[str] = None,
+) -> bool:
+    asok = proc.get("asok")
+    if not asok:
+        return False
+    if proc.get("local"):
+        return fuse_asok_alive(Path(asok), timeout)
+    return asok_alive_remote(proc["host"], asok, timeout, ssh_user=ssh_user)
+
+
+def dump_monitored_process(
+    proc: Dict[str, Any],
+    *,
+    timeout: int,
+    ssh_user: Optional[str] = None,
+) -> Dict[str, Any]:
+    asok = proc.get("asok")
+    if not asok:
+        return {"status": "skipped", "error": "no asok"}
+    if proc.get("local"):
+        return dump_client_fuse_log_local(asok_path=Path(asok), timeout=timeout)
+    return dump_client_fuse_log_remote(
+        host=proc["host"],
+        asok_path=asok,
+        timeout=timeout,
+        ssh_user=ssh_user,
+    )
+
+
+def copy_monitored_process_log(
+    proc: Dict[str, Any],
+    *,
+    output_dir: Path,
+    timeout: int,
+    ssh_user: Optional[str] = None,
+) -> Dict[str, Any]:
+    log_file = proc.get("log_file")
+    if not log_file:
+        return {"status": "missing", "error": "no log_file"}
+    dest_dir = output_dir / (
+        MDS_LOG_DIRNAME if proc.get("role") == "mds" else CLIENT_FUSE_LOG_DIR
+    )
+    dest_name = Path(log_file).name
+    dest = dest_dir / dest_name
+    if dest.exists():
+        dest = dest_dir / f"{client_fuse_host_label(proc.get('host', 'host'))}-{dest_name}"
+    if proc.get("local"):
+        copied = copy_client_fuse_log_local(
+            dest=dest, remote_path=Path(log_file), timeout=timeout,
+        )
+    else:
+        copied = copy_client_fuse_log_remote(
+            dest=dest,
+            host=proc["host"],
+            remote_path=log_file,
+            timeout=timeout,
+            ssh_user=ssh_user,
+        )
+    copied["role"] = proc.get("role")
+    copied["host"] = proc.get("host")
+    copied["log_file_source"] = proc.get("log_file_source")
+    return copied
+
+
+def collect_on_monitored_abort(
+    *,
+    output_dir: Path,
+    crashed_asok: str,
+    crashed_role: str,
+    inventory: List[Dict[str, Any]],
+    ssh_user: Optional[str] = None,
+    timeout: int = 120,
+    watch_meta: Optional[Dict[str, Any]] = None,
+    event: str = "monitored-process-abort",
+) -> Dict[str, Any]:
+    """
+    After any monitored process aborts: `log dump` survivors, then copy every
+    log_file captured when monitoring was established into ``output_dir``.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _watch_log(f"collecting abort artifacts into {output_dir}")
+
+    crashed = os.path.normpath(str(crashed_asok))
+    for proc in inventory:
+        raw_asok = proc.get("asok") or ""
+        if raw_asok and os.path.normpath(raw_asok) == crashed:
+            proc["log_dump"] = {
+                "status": "skipped",
+                "reason": "target aborted",
+                "asok": proc.get("asok"),
+            }
+        else:
+            dump_info = dump_monitored_process(
+                proc, timeout=min(timeout, 30), ssh_user=ssh_user,
+            )
+            proc["log_dump"] = dump_info
+            _watch_log(
+                f"log dump {proc.get('role')} {proc.get('host')}: "
+                f"{dump_info.get('status')}"
+            )
+        copied = copy_monitored_process_log(
+            proc, output_dir=output_dir, timeout=timeout, ssh_user=ssh_user,
+        )
+        proc["copy"] = copied
+        _watch_log(
+            f"copy {proc.get('role')} {proc.get('host')} "
+            f"{proc.get('log_file')}: {copied.get('status')}"
+        )
+
+    fuse_procs = [p for p in inventory if p.get("role") != "mds"]
+    mds_copies = [(p.get("copy") or {}) for p in inventory if p.get("role") == "mds"]
+    fuse_summary = {
+        "host_count": len(fuse_procs),
+        "copied": sum(
+            1 for p in fuse_procs if (p.get("copy") or {}).get("status") == "copied"
+        ),
+        "log_dumped": sum(
+            1 for p in fuse_procs
+            if (p.get("log_dump") or {}).get("status") == "dumped"
+        ),
+        "missing": sum(
+            1 for p in fuse_procs if (p.get("copy") or {}).get("status") == "missing"
+        ),
+        "errors": sum(
+            1 for p in fuse_procs if (p.get("copy") or {}).get("status") == "error"
+        ),
+        "hosts": [
+            {
+                "host": p.get("host"),
+                "status": (p.get("copy") or {}).get("status"),
+                "path": (p.get("copy") or {}).get("path"),
+                "bytes": (p.get("copy") or {}).get("bytes"),
+                "error": (p.get("copy") or {}).get("error"),
+                "source": p.get("log_file"),
+                "log_dump": p.get("log_dump"),
+            }
+            for p in fuse_procs
+        ],
+        "log_dir": "(from asok config get log_file)",
+        "asok_dir": "",
+    }
+
+    write_json_artifact(output_dir / CLIENT_FUSE_LOG_SUMMARY, fuse_summary)
+
+    summary: Dict[str, Any] = {
+        "event": event,
+        "detector_host": local_short_hostname(),
+        "crashed_role": crashed_role,
+        "crashed_asok": crashed,
+        "detected_at": (watch_meta or {}).get("detected_at")
+        or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "inventory": inventory,
+        "mds_logs": mds_copies,
+        "output_dir": str(output_dir),
+    }
+    write_json_artifact(output_dir / FUSE_ABORT_SUMMARY, summary)
+    write_json_artifact(output_dir / FUSE_WATCH_INVENTORY, inventory)
+
+    report_lines = [
+        "== monitored process abort collection ==",
+        f"Detector host: {summary['detector_host']}",
+        f"Crashed: {crashed_role} {crashed}",
+        f"Detected at: {summary['detected_at']}",
+        "On abort: log dump surviving monitored processes, then copy all "
+        "log files resolved at watch start via `config get log_file`.",
+    ]
+    for proc in inventory:
+        dump = proc.get("log_dump") or {}
+        copied = proc.get("copy") or {}
+        report_lines.append(
+            "- {role} {host}: dump={dump}, copy={copy} ({source}; {path})".format(
+                role=proc.get("role"),
+                host=proc.get("host"),
+                dump=dump.get("status"),
+                copy=copied.get("status"),
+                source=proc.get("log_file_source"),
+                path=copied.get("path") or proc.get("log_file") or "?",
+            )
+        )
+        if dump.get("error"):
+            report_lines.append(f"    dump error: {dump.get('error')}")
+        if copied.get("error"):
+            report_lines.append(f"    copy error: {copied.get('error')}")
+    report_path = output_dir / "cluster_abort_report.txt"
+    report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+    _watch_log(f"wrote {report_path}")
+    return summary
+
+
+def collect_on_fuse_abort(
+    *,
+    output_root: Path,
+    crashed_asok: Path,
+    inventory: List[Dict[str, Any]],
+    ssh_user: Optional[str] = None,
+    timeout: int = 120,
+    watch_meta: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """Client-local fuse abort capture (used by --watch-fuse-abort)."""
+    host_label = local_short_hostname()
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    out_dir = output_root / f"fuse-abort-{host_label}-{ts}"
+    collect_on_monitored_abort(
+        output_dir=out_dir,
+        crashed_asok=str(crashed_asok),
+        crashed_role="fuse",
+        inventory=inventory,
+        ssh_user=ssh_user,
+        timeout=timeout,
+        watch_meta=watch_meta,
+        event="ceph-fuse-abort",
+    )
+    # Keep a report.txt alias for the older fuse-abort layout.
+    cluster_report = out_dir / "cluster_abort_report.txt"
+    report = out_dir / "report.txt"
+    if cluster_report.exists() and not report.exists():
+        report.write_text(cluster_report.read_text(encoding="utf-8"), encoding="utf-8")
+    return out_dir
+
+
+def run_watch_fuse_abort(
+    *,
+    output_root: Path,
+    fuse_asok: Optional[str] = None,
+    asok_dir: str = CLIENT_FUSE_ASOK_DEFAULT_DIR,
+    client_hosts: Optional[List[str]] = None,
+    client_fuse_log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
+    mds_log: Optional[str] = None,
+    mds_host: Optional[str] = None,
+    mds_asok: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    interval: float = 2.0,
+    probe_timeout: float = 5.0,
+    fail_threshold: int = 2,
+    wait_alive: bool = True,
+    timeout: int = 120,
+) -> Path:
+    output_root.mkdir(parents=True, exist_ok=True)
+    asok = resolve_local_fuse_asok(fuse_asok, asok_dir)
+    if wait_alive:
+        wait_fuse_asok_alive(asok, interval, probe_timeout)
+    inventory = build_fuse_watch_inventory(
+        local_asok=asok,
+        client_hosts=client_hosts,
+        asok_dir=asok_dir,
+        client_fuse_log_dir=client_fuse_log_dir,
+        mds_asok=mds_asok,
+        mds_host=mds_host,
+        mds_log=mds_log,
+        ssh_user=ssh_user,
+        timeout=min(timeout, 30),
+    )
+    inv_path = (
+        output_root / f"fuse-watch-inventory-{client_fuse_host_label(local_short_hostname())}.json"
+    )
+    write_json_artifact(inv_path, inventory)
+    for proc in inventory:
+        _watch_log(
+            "monitor {role} {host} asok={asok} log_file={log} ({src})".format(
+                role=proc.get("role"),
+                host=proc.get("host"),
+                asok=proc.get("asok"),
+                log=proc.get("log_file"),
+                src=proc.get("log_file_source"),
+            )
+        )
+    meta = watch_fuse_asok_until_dead(
+        asok,
+        interval=interval,
+        probe_timeout=probe_timeout,
+        fail_threshold=max(1, fail_threshold),
+    )
+    _watch_log("ceph-fuse appears down; dumping peers and collecting logs")
+    return collect_on_fuse_abort(
+        output_root=output_root,
+        crashed_asok=asok,
+        inventory=inventory,
+        ssh_user=ssh_user,
+        timeout=timeout,
+        watch_meta=meta,
+    )
+
+
+def deploy_fuse_abort_watchers(
+    *,
+    client_hosts: List[str],
+    output_root: Path,
+    script_path: Path,
+    client_fuse_log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
+    asok_dir: str = CLIENT_FUSE_ASOK_DEFAULT_DIR,
+    mds_log: Optional[str] = None,
+    mds_host: Optional[str] = None,
+    mds_asok: Optional[str] = None,
+    ssh_user: Optional[str] = None,
+    interval: float = 2.0,
+    probe_timeout: float = 5.0,
+    fail_threshold: int = 2,
+    wait_alive: bool = True,
+    timeout: int = 120,
+    python: str = "python3",
+) -> Dict[str, Any]:
+    """
+    SSH to each client and start ``--watch-fuse-abort`` in the background.
+
+    Assumes ``script_path`` exists at the same absolute path on every host.
+    """
+    if not client_hosts:
+        raise RuntimeError("--deploy-fuse-watch requires at least one --client-host")
+    if not script_path.is_file():
+        raise RuntimeError(f"script not found locally (must exist on remotes too): {script_path}")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    results: List[Dict[str, Any]] = []
+
+    def q(s: str) -> str:
+        return "'" + s.replace("'", "'\"'\"'") + "'"
+
+    for host in client_hosts:
+        watch_log = str(output_root / f"fuse-watch-{client_fuse_host_label(host)}.log")
+        pid_file = str(output_root / f"fuse-watch-{client_fuse_host_label(host)}.pid")
+        cmd_parts = [
+            python,
+            str(script_path),
+            "--watch-fuse-abort",
+            "--output",
+            str(output_root),
+            "--client-fuse-log-dir",
+            client_fuse_log_dir,
+            "--fuse-asok-dir",
+            asok_dir,
+            "--fuse-watch-interval",
+            str(interval),
+            "--fuse-probe-timeout",
+            str(probe_timeout),
+            "--fuse-fail-threshold",
+            str(fail_threshold),
+            "--timeout",
+            str(timeout),
+        ]
+        if not wait_alive:
+            cmd_parts.append("--fuse-no-wait-alive")
+        if mds_log:
+            cmd_parts.extend(["--mds-log", mds_log])
+        if mds_host:
+            cmd_parts.extend(["--mds-host", mds_host])
+        if mds_asok:
+            cmd_parts.extend(["--mds-asok", mds_asok])
+        if ssh_user:
+            cmd_parts.extend(["--client-ssh-user", ssh_user])
+        for peer in client_hosts:
+            cmd_parts.extend(["--client-host", peer])
+
+        remote_cmd = " ".join(q(p) for p in cmd_parts)
+        # Kill any prior watcher for this script path, then start a new one.
+        script = (
+            f"pkill -f {q(str(script_path) + ' --watch-fuse-abort')} 2>/dev/null || true; "
+            f"mkdir -p {q(str(output_root))}; "
+            f"nohup {remote_cmd} > {q(watch_log)} 2>&1 & echo $! > {q(pid_file)}; "
+            f"cat {q(pid_file)}"
+        )
+        entry: Dict[str, Any] = {"host": host, "watch_log": watch_log, "pid_file": pid_file}
+        try:
+            out = ssh_run(host, script, timeout=60, ssh_user=ssh_user).strip()
+            entry["status"] = "started"
+            entry["pid"] = out.splitlines()[-1] if out else None
+            _watch_log(f"started fuse watcher on {host} pid={entry['pid']}")
+        except RuntimeError as exc:
+            entry["status"] = "error"
+            entry["error"] = str(exc)
+            _watch_log(f"failed to start fuse watcher on {host}: {exc}")
+        results.append(entry)
+
+    summary = {
+        "deployed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "script_path": str(script_path),
+        "output_root": str(output_root),
+        "hosts": results,
+    }
+    write_json_artifact(output_root / "fuse_watch_deploy.json", summary)
+    return summary
+
+
 def build_log_tail_fallback_window(
     window: LogExtractWindow,
     *,
@@ -2911,6 +4045,7 @@ def collect_from_dir(
     client_hosts: Optional[List[str]] = None,
     client_debugfs_files: Optional[List[str]] = None,
     client_ssh_user: Optional[str] = None,
+    client_fuse_log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
 ) -> None:
     blocked_path = input_dir / "blocked_ops.json"
     locks_path = input_dir / "ops_locks.json"
@@ -3056,6 +4191,18 @@ def collect_from_dir(
         append_client_debugfs_report_section(
             output_dir / "report.txt", debugfs_summary,
         )
+    if client_debugfs or client_hosts:
+        fuse_summary = collect_client_fuse_logs(
+            output_dir=output_dir,
+            hosts=client_hosts,
+            log_dir=client_fuse_log_dir,
+            ssh_user=client_ssh_user,
+            timeout=metrics_timeout,
+            include_local=not client_hosts,
+        )
+        append_client_fuse_log_report_section(
+            output_dir / "report.txt", fuse_summary,
+        )
 
 
 def collect(
@@ -3082,10 +4229,13 @@ def collect(
     client_hosts: Optional[List[str]] = None,
     client_debugfs_files: Optional[List[str]] = None,
     client_ssh_user: Optional[str] = None,
+    client_fuse_log_dir: str = CLIENT_FUSE_LOG_DEFAULT_DIR,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     collection_errors: Dict[str, str] = {}
-    allow_partial = bool(client_debugfs or grafana_url or prometheus_url)
+    allow_partial = bool(
+        client_debugfs or client_hosts or grafana_url or prometheus_url
+    )
 
     blocked, err = invoke_optional(invoke, ["dump_blocked_ops"])
     if err:
@@ -3272,6 +4422,18 @@ def collect(
         )
         append_client_debugfs_report_section(
             output_dir / "report.txt", debugfs_summary,
+        )
+    if client_debugfs or client_hosts:
+        fuse_summary = collect_client_fuse_logs(
+            output_dir=output_dir,
+            hosts=client_hosts,
+            log_dir=client_fuse_log_dir,
+            ssh_user=client_ssh_user,
+            timeout=metrics_timeout,
+            include_local=not client_hosts,
+        )
+        append_client_fuse_log_report_section(
+            output_dir / "report.txt", fuse_summary,
         )
 
     if collection_errors:
@@ -3464,8 +4626,8 @@ def main() -> int:
         default=[],
         dest="client_hosts",
         help=(
-            "SSH host to scrape client debugfs from (repeatable). "
-            "If omitted with --client-debugfs, scrapes localhost"
+            "SSH host to scrape client debugfs and ceph-fuse-<host>.log from "
+            "(repeatable). If omitted with --client-debugfs, scrapes localhost"
         ),
     )
     parser.add_argument(
@@ -3480,6 +4642,97 @@ def main() -> int:
             f"(default: {','.join(CLIENT_DEBUGFS_DEFAULT_FILES)})"
         ),
     )
+    parser.add_argument(
+        "--client-fuse-log-dir",
+        default=CLIENT_FUSE_LOG_DEFAULT_DIR,
+        help=(
+            "Directory on each client for ceph-fuse-<host>.log "
+            f"(default: {CLIENT_FUSE_LOG_DEFAULT_DIR}). Copied when present."
+        ),
+    )
+    parser.add_argument(
+        "--watch-fuse-abort",
+        action="store_true",
+        help=(
+            "Watch the local ceph-fuse asok. At start, query each monitored "
+            "asok with `config get log_file`. On abort, run `log dump` on the "
+            "other still-alive processes, then copy all known logs. Intended "
+            "to run on each fuse client (same script path on every host)."
+        ),
+    )
+    parser.add_argument(
+        "--deploy-fuse-watch",
+        action="store_true",
+        help=(
+            "SSH to each --client-host and start --watch-fuse-abort in the "
+            "background (assumes this script exists at --script-path on remotes)"
+        ),
+    )
+    parser.add_argument(
+        "--fuse-asok",
+        help=(
+            "ceph-fuse admin socket to watch "
+            f"(default: {CLIENT_FUSE_ASOK_DEFAULT_DIR}/ceph-fuse-<hostname>.asok)"
+        ),
+    )
+    parser.add_argument(
+        "--fuse-asok-dir",
+        default=CLIENT_FUSE_ASOK_DEFAULT_DIR,
+        help=f"Directory for ceph-fuse-*.asok (default: {CLIENT_FUSE_ASOK_DEFAULT_DIR})",
+    )
+    parser.add_argument(
+        "--fuse-watch-interval",
+        type=float,
+        default=2.0,
+        help="Seconds between fuse asok probes (default: 2)",
+    )
+    parser.add_argument(
+        "--fuse-probe-timeout",
+        type=float,
+        default=5.0,
+        help="Timeout for each fuse asok probe (default: 5)",
+    )
+    parser.add_argument(
+        "--fuse-fail-threshold",
+        type=int,
+        default=2,
+        help="Consecutive failed probes before treating fuse as aborted (default: 2)",
+    )
+    parser.add_argument(
+        "--fuse-no-wait-alive",
+        action="store_true",
+        help="Do not wait for the fuse asok to be healthy before watching",
+    )
+    parser.add_argument(
+        "--mds-log",
+        help=(
+            "Optional MDS log path override. Default is discovered at watch "
+            "start via `--mds-asok` `config get log_file`"
+        ),
+    )
+    parser.add_argument(
+        "--mds-host",
+        help=(
+            "Host that has --mds-asok / --mds-log (default: local). "
+            "Used by client-side watchers to dump and copy the MDS log"
+        ),
+    )
+    parser.add_argument(
+        "--mds-asok",
+        help=(
+            "MDS admin socket. Queried at watch start for log_file; "
+            "on fuse abort, receives `log dump` with the other survivors"
+        ),
+    )
+    parser.add_argument(
+        "--script-path",
+        type=Path,
+        default=None,
+        help=(
+            "Absolute path to this script on remote hosts for --deploy-fuse-watch "
+            "(default: path of the running script)"
+        ),
+    )
     args = parser.parse_args()
     grafana_auth = None
     if args.grafana_user:
@@ -3488,6 +4741,80 @@ def main() -> int:
         if args.daemon and args.daemon != args.asok:
             parser.error("use only one of --daemon and --asok")
         args.daemon = args.asok
+
+    if args.watch_fuse_abort and args.deploy_fuse_watch:
+        parser.error("use only one of --watch-fuse-abort and --deploy-fuse-watch")
+
+    if args.deploy_fuse_watch:
+        if not args.client_hosts:
+            parser.error("--deploy-fuse-watch requires at least one --client-host")
+        if args.output is None:
+            parser.error("--deploy-fuse-watch requires --output")
+        script_path = (
+            args.script_path.expanduser().resolve()
+            if args.script_path is not None
+            else Path(__file__).resolve()
+        )
+        try:
+            summary = deploy_fuse_abort_watchers(
+                client_hosts=args.client_hosts,
+                output_root=args.output.expanduser(),
+                script_path=script_path,
+                client_fuse_log_dir=args.client_fuse_log_dir,
+                asok_dir=args.fuse_asok_dir,
+                mds_log=args.mds_log,
+                mds_host=args.mds_host,
+                mds_asok=args.mds_asok,
+                ssh_user=args.client_ssh_user,
+                interval=args.fuse_watch_interval,
+                probe_timeout=args.fuse_probe_timeout,
+                fail_threshold=args.fuse_fail_threshold,
+                wait_alive=not args.fuse_no_wait_alive,
+                timeout=args.timeout,
+            )
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        started = sum(1 for h in summary["hosts"] if h.get("status") == "started")
+        print(f"Deployed fuse abort watchers: {started}/{len(summary['hosts'])}")
+        print(f"  summary: {args.output / 'fuse_watch_deploy.json'}")
+        for host in summary["hosts"]:
+            extra = (
+                f" pid={host.get('pid')}"
+                if host.get("status") == "started"
+                else f" error={host.get('error')}"
+            )
+            print(f"  {host['host']}: {host.get('status')}{extra}")
+        return 0 if started == len(summary["hosts"]) else 1
+
+    if args.watch_fuse_abort:
+        if args.output is None:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            args.output = Path.cwd() / f"fuse-abort-watch-{ts}"
+        try:
+            out_dir = run_watch_fuse_abort(
+                output_root=args.output.expanduser(),
+                fuse_asok=args.fuse_asok,
+                asok_dir=args.fuse_asok_dir,
+                client_hosts=args.client_hosts or None,
+                client_fuse_log_dir=args.client_fuse_log_dir,
+                mds_log=args.mds_log,
+                mds_host=args.mds_host,
+                mds_asok=args.mds_asok,
+                ssh_user=args.client_ssh_user,
+                interval=args.fuse_watch_interval,
+                probe_timeout=args.fuse_probe_timeout,
+                fail_threshold=args.fuse_fail_threshold,
+                wait_alive=not args.fuse_no_wait_alive,
+                timeout=args.timeout,
+            )
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(f"Fuse abort artifacts: {out_dir}")
+        print(f"  report: {out_dir / 'report.txt'}")
+        print(f"  summary:{out_dir / FUSE_ABORT_SUMMARY}")
+        return 0
 
     def maybe_extract_log(stall_dir: Path) -> Optional[Dict[str, Any]]:
         if not args.extract_log:
@@ -3545,6 +4872,7 @@ def main() -> int:
             "client_hosts": args.client_hosts or None,
             "client_debugfs_files": files or list(CLIENT_DEBUGFS_DEFAULT_FILES),
             "client_ssh_user": args.client_ssh_user,
+            "client_fuse_log_dir": args.client_fuse_log_dir,
         }
 
     if args.from_dir and not (args.mds or args.daemon):
@@ -3571,6 +4899,8 @@ def main() -> int:
         print(f"  revokes:{args.output / 'cap_revokes.json'}")
         if (args.output / CLIENT_DEBUGFS_SUMMARY).exists():
             print(f"  debugfs:{args.output / CLIENT_DEBUGFS_SUMMARY}")
+        if (args.output / CLIENT_FUSE_LOG_SUMMARY).exists():
+            print(f"  fuse logs:{args.output / CLIENT_FUSE_LOG_SUMMARY}")
         maybe_extract_log(args.stall_dir or args.from_dir or args.output)
         return 0
 
@@ -3618,6 +4948,8 @@ def main() -> int:
         print(f"  metrics:{args.output / PROMETHEUS_TIMESERIES_ARTIFACT}")
     if (args.output / CLIENT_DEBUGFS_SUMMARY).exists():
         print(f"  debugfs:{args.output / CLIENT_DEBUGFS_SUMMARY}")
+    if (args.output / CLIENT_FUSE_LOG_SUMMARY).exists():
+        print(f"  fuse logs:{args.output / CLIENT_FUSE_LOG_SUMMARY}")
     maybe_extract_log(args.stall_dir or args.output)
     return 0
 
