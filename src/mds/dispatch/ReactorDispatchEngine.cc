@@ -67,29 +67,34 @@ dispatch_execute_usec_lane_counter(DispatchLane lane)
 }
 
 void
-ReactorDispatchEngine::update_queue_depth_metrics()
+ReactorDispatchEngine::note_enqueued()
+{
+  const size_t depth = queue.count();
+  uint64_t max = queue_len_max.load(std::memory_order_relaxed);
+  while (depth > max && !queue_len_max.compare_exchange_weak(
+                            max, depth, std::memory_order_relaxed)) {
+  }
+}
+
+void
+ReactorDispatchEngine::publish_queue_depth_metrics()
 {
   if (!ctx.rank || !ctx.rank->logger) {
     return;
   }
 
-  const size_t depth = queue.count();
   PerfCounters* logger = ctx.rank->logger;
-
-  logger->set(l_mds_reactor_dispatch_queue_len, depth);
-
-  uint64_t max = queue_len_max.load(std::memory_order_relaxed);
-  while (depth > max && !queue_len_max.compare_exchange_weak(
-                            max, depth, std::memory_order_relaxed)) {
-  }
-  logger->set(l_mds_dispatch_queue_len_max, queue_len_max.load());
+  logger->set(l_mds_reactor_dispatch_queue_len, queue.count());
+  logger->set(
+      l_mds_dispatch_queue_len_max,
+      queue_len_max.load(std::memory_order_relaxed));
 }
 
 void
 ReactorDispatchEngine::enqueue_item(OpWorkItem* item, DispatchLane lane)
 {
   queue.enqueue(item, lane);
-  update_queue_depth_metrics();
+  note_enqueued();
 }
 
 void
@@ -305,9 +310,18 @@ ReactorDispatchEngine::op_thread_main()
 #endif
 
   while (!stop.load()) {
-    if (OpWorkItem* item = queue.dequeue()) {
-      update_queue_depth_metrics();
+    unsigned processed = 0;
+    while (processed < dequeue_batch_size) {
+      OpWorkItem* item = queue.dequeue();
+      if (!item) {
+        break;
+      }
       execute_item(item);
+      ++processed;
+    }
+
+    if (processed > 0) {
+      publish_queue_depth_metrics();
       continue;
     }
 

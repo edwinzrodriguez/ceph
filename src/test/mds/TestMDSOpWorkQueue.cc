@@ -189,4 +189,37 @@ TEST(MDSOpWorkQueue, ShutdownDropsNewWork)
 
   EXPECT_EQ(queue.dequeue(), nullptr);
   EXPECT_FALSE(queue.has_work_for_consumer());
+  EXPECT_EQ(queue.count(), 0u);
+}
+
+TEST(MDSOpWorkQueue, DepthCounterTracksEnqueueDequeue)
+{
+  MDSOpWorkQueue queue;
+
+  EXPECT_EQ(queue.count(), 0u);
+
+  queue.enqueue(
+      OpWorkItem::create_inbound(
+          make_message(CEPH_MSG_CLIENT_REQUEST), DispatchLane::Client),
+      DispatchLane::Client);
+  queue.enqueue(
+      OpWorkItem::create_inbound(
+          make_message(CEPH_MSG_MDS_MAP), DispatchLane::Control),
+      DispatchLane::Control);
+  EXPECT_EQ(queue.count(), 2u);
+
+  OpWorkItem* item = queue.dequeue();
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(queue.count(), 1u);
+  item->destroy();
+
+  item = queue.dequeue();
+  ASSERT_NE(item, nullptr);
+  EXPECT_EQ(queue.count(), 0u);
+  item->destroy();
+
+  queue.enqueue(OpWorkItem::create_trim(), DispatchLane::Maintenance);
+  EXPECT_EQ(queue.count(), 1u);
+  queue.flush_and_clear();
+  EXPECT_EQ(queue.count(), 0u);
 }

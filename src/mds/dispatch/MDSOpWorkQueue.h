@@ -56,8 +56,8 @@ public:
 
   bool has_work_for_consumer();
 
-  /// Items waiting in all lane banks (producer and consumer sides).
-  size_t count();
+  /// Items waiting in all lane banks (O(1); maintained by depth counter).
+  size_t count() const;
 
   void wake();
   void shutdown();
@@ -96,6 +96,7 @@ private:
   ceph::mutex queue_lock;
   ceph::condition_variable queue_cond;
   std::atomic<bool> stopping{false};
+  std::atomic<size_t> depth{0};
 
   static LaneList& consumer_list(LaneQueue& lane);
   OpWorkItem* dequeue_lane(LaneQueue& lane);

@@ -60,7 +60,10 @@ private:
   void record_execute_metrics(
       DispatchLane lane,
       ceph::coarse_mono_time exec_start);
-  void update_queue_depth_metrics();
+  void note_enqueued();
+  void publish_queue_depth_metrics();
+
+  static constexpr unsigned dequeue_batch_size = 32;
 
   MDSDispatchContext ctx;
   MDSOpWorkQueue queue;
