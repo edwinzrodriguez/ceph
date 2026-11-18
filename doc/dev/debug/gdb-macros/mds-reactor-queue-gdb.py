@@ -1029,6 +1029,10 @@ class MdsReactorQueue(gdb.Command):
     When ReactorDispatchEngine adaptive-slice fields exist, also prints
     Client avg_exec / backlog and effective Client/Maintenance slice ms
     (no list walk — O(1) atomics + ExecWindow).
+
+    Empty lanes with log_trim_queued/trim_quantum_queued set usually means
+    that single-flight item is already dequeued and running on mds-rank-op
+    (not a failed list walk). Blocked client ops live on lock waiters.
     """
 
     def __init__(self):
@@ -1174,6 +1178,28 @@ class MdsReactorQueue(gdb.Command):
                 "(race during live attach, or concurrent mutate)"
                 % (walked, depth)
             )
+        # Single-flight LogTrim/TrimQuantum are dequeued before execute_item.
+        # On a core taken mid-trim, depth==0 with log_trim_queued=1 is expected
+        # (item is in-flight on mds-rank-op, not sitting in a lane bank).
+        if engine is not None and walked == 0:
+            try:
+                trim_q = _atomic_load_opt(engine["trim_quantum_queued"])
+                log_trim_q = _atomic_load_opt(engine["log_trim_queued"])
+            except (gdb.error, KeyError, TypeError, ValueError):
+                trim_q = log_trim_q = None
+            hints = []
+            if log_trim_q:
+                hints.append("log_trim_queued=1 (LogTrim likely in execute_item)")
+            if trim_q:
+                hints.append(
+                    "trim_quantum_queued=1 (TrimQuantum likely in execute_item)"
+                )
+            if hints:
+                print(
+                    "  note: queues empty but %s — check mds-rank-op stack; "
+                    "blocked MDRequests wait on locks, not in these lanes"
+                    % "; ".join(hints)
+                )
         if collect_ages and all_ages:
             print("  overall age:")
             _print_age_stats("all lanes", all_ages, now_ns)

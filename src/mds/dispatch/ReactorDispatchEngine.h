@@ -52,6 +52,7 @@
 #include "MDSDispatchContext.h"
 #include "MDSDispatchEngine.h"
 #include "MDSOpWorkQueue.h"
+#include "dispatch_perf.h"
 
 class ReactorDispatchEngine : public MDSDispatchEngine {
 public:
@@ -109,6 +110,7 @@ private:
   void note_enqueued();
   void maybe_abort_on_queue_depth(size_t depth);
   void publish_queue_depth_metrics();
+  void flush_logger_metrics();
   void finish_trim_quantum(bool more);
   void finish_log_trim(bool more);
   void refresh_cached_conf();
@@ -145,4 +147,6 @@ private:
 
   /// Written only by the op thread.
   std::array<ExecWindow, static_cast<size_t>(DispatchLane::Count)> exec_windows{};
+  /// Op-thread local PerfCounters staging (flushed in publish_queue_depth_metrics).
+  mds::dispatch_perf::LocalDispatchMetrics local_metrics{};
 };

@@ -74,11 +74,15 @@ class LogSegment {
            !dirty_dirfrag_dirfragtree.empty();
   }
 
+  /// Dump dirty elists if any.  Returns true when all dirty elists are empty.
+  bool check_elists_empty(const char* where);
   void assert_elists_empty(const char* where);
 
   const seq_t seq;
   uint64_t offset, end;
   uint64_t num_events = 0;
+  /// True while this segment is in MDLog::expired_segments (submit_mutex).
+  bool expired = false;
 
   // dirty items
   elist<CDir*>    dirty_dirfrags, new_dirfrags;
