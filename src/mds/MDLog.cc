@@ -193,7 +193,7 @@ protected:
 
 void MDLog::finish_head_waiters()
 {
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
 
   auto&& last_committed = journaler->get_last_committed();
   auto& expire_pos = last_committed.expire_pos;
@@ -211,7 +211,7 @@ void MDLog::finish_head_waiters()
 
 void MDLog::write_head(MDSContext *c) 
 {
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
 
   auto&& last_written = journaler->get_last_written();
   auto expire_pos = journaler->get_expire_pos();
@@ -290,7 +290,7 @@ EstimatedReplayTime MDLog::get_estimated_replay_finish_time() {
 
 void MDLog::create(MDSContext *c)
 {
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
 
   dout(5) << "create empty log" << dendl;
 
@@ -398,7 +398,7 @@ void MDLog::append()
 
 LogSegmentRef const& MDLog::_start_new_segment(SegmentBoundary* sb)
 {
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
 
   auto ls = std::make_shared<LogSegment>(event_seq);
   segments[event_seq] = ls;
@@ -418,7 +418,7 @@ LogSegmentRef const& MDLog::_start_new_segment(SegmentBoundary* sb)
 LogSegment::seq_t MDLog::_submit_entry(LogEvent *le, MDSLogContextBase* c)
 {
   dout(20) << __func__ << " " << *le << dendl;
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
   ceph_assert(ceph_mutex_is_locked_by_me(submit_mutex));
   ceph_assert(!mds->is_any_replay());
   ceph_assert(!mds_is_shutting_down);
@@ -467,7 +467,7 @@ LogSegment::seq_t MDLog::_submit_entry(LogEvent *le, MDSLogContextBase* c)
 
 void MDLog::_segment_upkeep()
 {
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
   ceph_assert(ceph_mutex_is_locked_by_me(submit_mutex));
   uint64_t period = journaler->get_layout_period();
   auto ls = get_current_segment();
@@ -750,12 +750,44 @@ past_trim_deadline(const std::optional<ceph::fast_mono_time>& deadline)
   return ceph::past_fast_mono_deadline(deadline);
 }
 
+/**
+ * Amortize past_trim_deadline() in tight segment walks.
+ *
+ * Checking the clock every iteration showed up under SPECStorage inside
+ * _trim_expired_segments.  Sample every INTERVAL steps; overshoot is bounded
+ * and the next cooperative tick continues the work.
+ */
+class TrimDeadlineChecker {
+  const std::optional<ceph::fast_mono_time>& m_deadline;
+  unsigned m_since = 0;
+  static constexpr unsigned INTERVAL = 32;
+
+public:
+  explicit TrimDeadlineChecker(
+      const std::optional<ceph::fast_mono_time>& deadline) :
+    m_deadline(deadline)
+  {}
+
+  bool
+  should_yield()
+  {
+    if (!m_deadline) {
+      return false;
+    }
+    if (++m_since < INTERVAL) {
+      return false;
+    }
+    m_since = 0;
+    return past_trim_deadline(m_deadline);
+  }
+};
+
 } // namespace
 
 bool
 MDLog::trim_tick(std::chrono::milliseconds max_duration)
 {
-  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
 
   MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_log_trim);
   const auto trim_start = ceph::fast_mono_clock::now();
@@ -851,6 +883,7 @@ MDLog::trim(std::chrono::milliseconds max_duration)
 
   const auto trim_start = ceph::fast_mono_clock::now();
   const auto deadline = make_trim_deadline(max_duration);
+  TrimDeadlineChecker expire_deadline(deadline);
   std::optional<ceph::fast_mono_time> trim_end;
 
   auto log_trim_counter_start = log_trim_counter.get();
@@ -913,7 +946,7 @@ MDLog::trim(std::chrono::milliseconds max_duration)
         break;
       }
 
-      if (past_trim_deadline(deadline)) {
+      if (expire_deadline.should_yield()) {
         dout(10) << __func__
                  << ": breaking out of trim loop - past deadline after "
                  << new_expiring_segments
@@ -958,7 +991,7 @@ MDLog::trim(std::chrono::milliseconds max_duration)
 
       if (expiring_segments.count(ls)) {
         dout(20) << "trim already expiring " << *ls << dendl;
-      } else if (expired_segments.count(ls)) {
+      } else if (ls->expired) {
         dout(20) << "trim already expired " << *ls << dendl;
       } else {
         ceph_assert(expiring_segments.count(ls) == 0);
@@ -1066,7 +1099,7 @@ int MDLog::trim_to(SegmentBoundary::seq_t seq)
 
     if (expiring_segments.count(ls)) {
       dout(5) << "trim already expiring " << *ls << dendl;
-    } else if (expired_segments.count(ls)) {
+    } else if (ls->expired) {
       dout(5) << "trim already expired " << *ls << dendl;
     } else {
       ceph_assert(expiring_segments.count(ls) == 0);
@@ -1090,7 +1123,7 @@ int MDLog::trim_to(SegmentBoundary::seq_t seq)
 
 void MDLog::try_expire(LogSegmentRef const& ls, int op_prio)
 {
-  ceph_assert(ceph_mutex_is_locked(mds->mds_lock));
+  MDS_ASSERT_RANK_EXCLUSIVE(mds->mds_lock);
   MDSGatherBuilder gather_bld(g_ceph_context);
   ls->try_to_expire(mds, gather_bld, op_prio);
 
@@ -1136,10 +1169,35 @@ MDLog::_trim_expired_segments(
   // trim expired segments?
   uint64_t end = 0;
   bool deferred = false;
-  for (auto it = segments.begin(); it != segments.end(); ++it) {
-    if (past_trim_deadline(deadline)) {
+  // Both segments and major_segments are ordered by seq.  Co-iterate so each
+  // major check is amortized O(1) instead of major_segments.find() per segment
+  // (hot under time-sliced trim that restarts from begin each tick).
+  auto it = segments.begin();
+  if (trim_expired_resume_seq != 0) {
+    it = segments.lower_bound(trim_expired_resume_seq);
+    dout(10) << __func__ << ": resuming at seq=" << trim_expired_resume_seq
+             << (it == segments.end() ? " (past end)" : "") << dendl;
+    // Predecessors were already walked as expired; seed end so the next major
+    // can still batch-expire that prefix.
+    if (it != segments.begin() && it != segments.end()) {
+      auto prev = std::prev(it);
+      if (prev->second->expired) {
+        end = prev->first;
+      }
+    }
+  }
+  auto msit = major_segments.begin();
+  if (it != segments.end()) {
+    while (msit != major_segments.end() && *msit < it->first) {
+      ++msit;
+    }
+  }
+  TrimDeadlineChecker trim_deadline(deadline);
+  for (; it != segments.end(); ++it) {
+    if (trim_deadline.should_yield()) {
       dout(10) << __func__ << ": past deadline, deferring remaining expired "
-               << "segment trim" << dendl;
+               << "segment trim at seq=" << it->first << dendl;
+      trim_expired_resume_seq = it->first;
       deferred = true;
       break;
     }
@@ -1147,21 +1205,38 @@ MDLog::_trim_expired_segments(
     auto& [seq, ls] = *it;
     dout(20) << __func__ << ": examining " << *ls << dendl;
 
-    if (auto msit = major_segments.find(seq); msit != major_segments.end() && end > 0) {
+    while (msit != major_segments.end() && *msit < seq) {
+      ++msit;
+    }
+    // Batch-expire only once we have at least one expired predecessor
+    // (end > 0).  Matching major: msit points at seq.
+    if (end > 0 && msit != major_segments.end() && *msit == seq) {
       dout(10) << __func__ << ": expiring up to this major segment seq=" << seq << dendl;
       uint64_t expire_pos = 0;
       auto erase_it = segments.begin();
       for (auto eit = segments.begin(); eit != it; ++eit) {
         auto& ls2 = eit->second;
-        if (!expired_segments.count(ls2)) {
+        if (!ls2->expired) {
           dout(10) << __func__ << ": stopping batch trim at non-expired "
                    << *ls2 << dendl;
           break;
         }
-        ls2->assert_elists_empty("_trim_expired_segments");
+        // A segment can be re-dirtied after try_expire (e.g. an MDRequest
+        // still holding this LogSegmentRef calls mark_dirty).  Do not erase
+        // it — un-expire so a later trim tick can try_expire again.
+        if (!ls2->check_elists_empty("_trim_expired_segments")) {
+          dout(0) << __func__ << ": un-expiring re-dirtied " << *ls2 << dendl;
+          expired_events -= ls2->num_events;
+          expired_segments.erase(ls2);
+          ls2->expired = false;
+          logger->set(l_mdl_evexd, expired_events);
+          logger->set(l_mdl_segexd, expired_segments.size());
+          break;
+        }
         dout(20) << __func__ << ": expiring " << *ls2 << dendl;
         expired_events -= ls2->num_events;
         expired_segments.erase(ls2);
+        ls2->expired = false;
         if (pre_segments_size > 0)
           pre_segments_size--;
         num_events -= ls2->num_events;
@@ -1174,6 +1249,7 @@ MDLog::_trim_expired_segments(
       if (erase_it != segments.begin()) {
         segments.erase(segments.begin(), erase_it);
         logger->set(l_mdl_seg, segments.size());
+        // erase [begin, msit) leaves msit valid at the current major.
         major_segments.erase(major_segments.begin(), msit);
         logger->set(l_mdl_segmjr, major_segments.size());
 
@@ -1187,7 +1263,7 @@ MDLog::_trim_expired_segments(
       }
     }
 
-    if (!expired_segments.count(ls)) {
+    if (!ls->expired) {
       dout(10) << __func__ << " waiting for expiry " << *ls << dendl;
       break;
     }
@@ -1196,7 +1272,16 @@ MDLog::_trim_expired_segments(
     dout(10) << __func__ << ": maybe expiring " << *ls << dendl;
   }
 
-  const bool more_expired = deferred || !expired_segments.empty();
+  if (!deferred) {
+    trim_expired_resume_seq = 0;
+  }
+
+  // Requeue only when we yielded on the time budget.  Remaining
+  // expired_segments that cannot be trimmed yet (blocked on a non-expired
+  // predecessor, or waiting for a major-segment boundary) must not return
+  // true: that busy-loops ReactorDispatchEngine::finish_log_trim on the op
+  // thread.  log_trim_upkeep will try again on its interval.
+  const bool more_expired = deferred;
   locker.unlock();
 
   write_head(ctx);
@@ -1213,6 +1298,8 @@ void MDLog::_expired(LogSegmentRef const& ls)
     dout(5) << "_expired not expiring current segment, and !mds_is_shutting_down" << dendl;
   } else {
     // expired.
+    ceph_assert(!ls->expired);
+    ls->expired = true;
     expired_segments.insert(ls);
     expired_events += ls->num_events;
 
@@ -1620,8 +1707,9 @@ void MDLog::_reformat_journal(JournalPointer const &jp_in, Journaler *old_journa
   }
 }
 
-
-// i am a separate thread
+// boot exclusivity: this thread takes mds_lock per event.
+// ReactorDispatchEngine holds Client/Maintenance drain while is_any_replay()
+// (etc.) so unlocked execute_item cannot race these lock acquisitions.
 void MDLog::_replay_thread()
 {
   dout(10) << __func__ << ": start time: " << replay_start_time << ", now: "

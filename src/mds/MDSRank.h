@@ -138,10 +138,24 @@ enum {
   l_mds_dispatch_execute_hist,
   l_mds_dispatch_queue_len_max,
   l_mds_reactor_dispatch_queue_len_client,
+  l_mds_reactor_dispatch_queue_len_io,
+  l_mds_reactor_dispatch_queue_len_maintenance,
   l_mds_reactor_client_avg_exec_us,
+  l_mds_reactor_io_avg_exec_us,
+  l_mds_reactor_maintenance_avg_exec_us,
   l_mds_reactor_client_backlog_us,
+  l_mds_reactor_io_backlog_us,
+  l_mds_reactor_maintenance_backlog_us,
+  l_mds_reactor_dominant_backlog_us,
+  l_mds_reactor_adapt_t_milli,
+  l_mds_reactor_dominant_lane,
   l_mds_reactor_slice_client_effective_ms,
+  l_mds_reactor_slice_io_effective_ms,
   l_mds_reactor_slice_maintenance_effective_ms,
+  l_mds_reactor_client_enqueue_throttle_waiters,
+  l_mds_reactor_client_enqueue_throttle_waits,
+  l_mds_reactor_io_enqueue_throttle_waiters,
+  l_mds_reactor_io_enqueue_throttle_waits,
   l_mds_dispatch_enqueue_latency_control,
   l_mds_dispatch_enqueue_latency_io,
   l_mds_dispatch_enqueue_latency_client,
@@ -314,6 +328,8 @@ class MDSRank {
     }
 
     void handle_write_error(int err);
+    /// Off-thread entry: takes mds_lock (classic) or submit_callable(Control)
+    /// (reactor). Prefer handle_write_error when already rank-exclusive.
     void handle_write_error_with_lock(int err);
 
     void update_mlogger();
@@ -470,6 +486,8 @@ class MDSRank {
       return inject_journal_corrupt_dentry_first;
     }
 
+    /// Sync cache lookups for MetricsHandler.  Under reactor these hop to
+    /// the Control lane (caller blocks); classic takes mds_lock inline.
     std::string get_path(inodeno_t ino);
     uint64_t get_inode_rbytes(inodeno_t ino);
 
@@ -660,6 +678,9 @@ class MDSRank {
     void active_start();
     void stopping_start();
     void stopping_done();
+
+    /// Phase 2 Option A: gate Client/Maintenance drain during boot/replay.
+    void update_reactor_boot_policy();
 
     void validate_sessions();
 

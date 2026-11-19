@@ -21,10 +21,34 @@
  * Lane order (high -> low): Control, IOComplete, Maintenance, Client.
  * Each scheduling round visits lanes in that order and runs each lane until
  * empty or its wall-clock budget expires. Base budgets come from
- * mds_reactor_lane_slice_*; Client/Maintenance may adapt from estimated Client
- * backlog (depth * rolling avg execute time) once backlog exceeds
- * mds_reactor_slice_backlog_target.
+ * mds_reactor_lane_slice_*. Among IOComplete/Maintenance/Client, the lane
+ * with the highest estimated backlog (depth * rolling avg execute time) is
+ * boosted toward its *_max once backlog exceeds
+ * mds_reactor_slice_backlog_target; the other adaptable lanes are cut toward
+ * their *_min so each still gets time. Control keeps its base slice.
  * TrimQuantum/LogTrim are single-flight and cooperatively time-sliced.
+ *
+ * Client/IOComplete enqueue backpressure: when lane depth reaches the
+ * configured high watermark, producers stall in enqueue_item until the op
+ * thread drains to the low watermark. While any producer is waiting for that
+ * drain, new producers join the wait (they must not refill the mid band
+ * between low and high). Control is never stalled. Disabled when high is 0;
+ * Client throttle is skipped during boot exclusivity. IO completions that
+ * arise on the op thread during execute_item (e.g. Journaler::_finish_flush
+ * → finish_contexts under Journaler::lock) are deferred and drained after
+ * the current item returns — not executed inline (lock re-entry) and not
+ * re-enqueued (throttle bypass / queue-depth abort).
+ *
+ * Rank exclusivity: after boot, execute_item does not take mds_lock; the
+ * registered op thread owns exclusivity (MDS_ASSERT_RANK_EXCLUSIVE /
+ * ReactorOwnerToken). Classic mode, SafeTimer, and lifecycle paths still use
+ * the real mutex.
+ *
+ * Boot exclusivity: while MDSRank is creating, starting,
+ * or in any replay state, drain only Control and IOComplete, and take a real
+ * MdsLockGuard so those items serialize with MDLog::_replay_thread /
+ * _recovery_thread (which still hold mds_lock). Client and Maintenance remain
+ * queued until set_boot_exclusive(false).
  */
 
 #pragma once
@@ -37,10 +61,15 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
+
+#include "common/ceph_mutex.h"
 
 #include "MDSDispatchContext.h"
 #include "MDSDispatchEngine.h"
 #include "MDSOpWorkQueue.h"
+#include "dispatch_perf.h"
 
 class ReactorDispatchEngine : public MDSDispatchEngine {
 public:
@@ -63,6 +92,7 @@ public:
   void submit_log_trim_tick() override;
   void submit_callable(DispatchLane lane, std::function<void()> fn) override;
   void note_finished_queued() override;
+  void set_boot_exclusive(bool exclusive) override;
   void handle_conf_change(const std::set<std::string>& changed) override;
 
 private:
@@ -90,13 +120,21 @@ private:
   void enqueue_item(OpWorkItem* item, DispatchLane lane);
   void execute_item(OpWorkItem* item);
   void execute_io_completion(MDSIOContextBase* ioctx, int r);
+  void drain_deferred_io_completions();
   void record_wait_metrics(const OpWorkItem& item);
   void record_execute_metrics(
       const OpWorkItem& item,
       ceph::fast_mono_time exec_start);
   void note_enqueued();
   void maybe_abort_on_queue_depth(size_t depth);
+  void maybe_throttle_client_enqueue();
+  void maybe_notify_client_enqueue_throttle();
+  uint64_t client_enqueue_low_watermark(uint64_t high) const;
+  void maybe_throttle_io_enqueue();
+  void maybe_notify_io_enqueue_throttle();
+  uint64_t io_enqueue_low_watermark(uint64_t high) const;
   void publish_queue_depth_metrics();
+  void flush_logger_metrics();
   void finish_trim_quantum(bool more);
   void finish_log_trim(bool more);
   void refresh_cached_conf();
@@ -105,28 +143,65 @@ private:
   uint64_t avg_exec_us(DispatchLane lane) const;
   uint64_t estimated_backlog_us(DispatchLane lane) const;
   uint64_t client_backlog_us() const;
-  double client_adapt_t() const;
+  double backlog_adapt_t(uint64_t backlog_us) const;
+  /// Dominant adaptable lane (IO/Maint/Client) and its backlog; for metrics.
+  std::pair<DispatchLane, uint64_t> dominant_adaptable_backlog() const;
+  int64_t lane_slice_max_ms(DispatchLane lane) const;
+  int64_t lane_slice_min_ms(DispatchLane lane) const;
+  static int64_t lerp_slice_ms(int64_t base, int64_t bound, double t);
+  bool lane_drain_allowed(DispatchLane lane) const;
+  bool has_drainable_work() const;
 
   MDSDispatchContext ctx;
   MDSOpWorkQueue queue;
   std::thread op_thread;
   std::atomic<bool> stop{false};
+  /// True while creating/starting/replay: skip Client + Maintenance drain.
+  std::atomic<bool> boot_exclusive{true};
   std::atomic<uint64_t> queue_len_max{0};
   std::atomic<bool> queue_len_abort_armed{false};
   /// Cached conf (avoid string-keyed get_val on enqueue/execute).
   std::atomic<uint64_t> queue_len_abort_limit{0};
+  std::atomic<uint64_t> client_enqueue_high{0};
+  std::atomic<uint64_t> client_enqueue_low{0};
+  std::atomic<uint64_t> io_enqueue_high{0};
+  std::atomic<uint64_t> io_enqueue_low{0};
   std::atomic<int64_t> cache_trim_max_duration_ms{0};
   std::atomic<int64_t> log_trim_max_duration_ms{0};
   std::array<std::atomic<int64_t>, static_cast<size_t>(DispatchLane::Count)>
       lane_slice_ms_cached{};
   std::atomic<uint64_t> slice_backlog_target_us{500'000};
   std::atomic<int64_t> client_slice_max_ms{20};
+  std::atomic<int64_t> client_slice_min_ms{1};
+  std::atomic<int64_t> io_slice_max_ms{20};
+  std::atomic<int64_t> io_slice_min_ms{2};
+  std::atomic<int64_t> maintenance_slice_max_ms{5};
   std::atomic<int64_t> maintenance_slice_min_ms{1};
   std::atomic<uint32_t> exec_window_n{256};
   /// At most one TrimQuantum / LogTrim outstanding (queued or running).
   std::atomic<bool> trim_quantum_queued{false};
   std::atomic<bool> log_trim_queued{false};
 
+  /// Client enqueue backpressure (producers wait; op thread notifies).
+  ceph::mutex client_enqueue_throttle_lock{
+      ceph::make_mutex("ReactorDispatchEngine::client_enqueue_throttle")};
+  ceph::condition_variable client_enqueue_throttle_cond;
+  std::atomic<uint64_t> client_enqueue_throttle_waiters{0};
+  std::atomic<uint64_t> client_enqueue_throttle_waits{0};
+
+  /// IOComplete enqueue backpressure (Objecter/io pool wait; op thread notifies).
+  ceph::mutex io_enqueue_throttle_lock{
+      ceph::make_mutex("ReactorDispatchEngine::io_enqueue_throttle")};
+  ceph::condition_variable io_enqueue_throttle_cond;
+  std::atomic<uint64_t> io_enqueue_throttle_waiters{0};
+  std::atomic<uint64_t> io_enqueue_throttle_waits{0};
+
   /// Written only by the op thread.
   std::array<ExecWindow, static_cast<size_t>(DispatchLane::Count)> exec_windows{};
+  /// Op-thread local PerfCounters staging (flushed in publish_queue_depth_metrics).
+  mds::dispatch_perf::LocalDispatchMetrics local_metrics{};
+  /// Nesting depth of execute_item on the op thread (0 outside).
+  unsigned execute_depth{0};
+  /// IO completions deferred from submit_io_completion while execute_depth > 0.
+  std::vector<std::pair<MDSIOContextBase*, int>> deferred_io_completions;
 };
