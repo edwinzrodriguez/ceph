@@ -84,3 +84,28 @@ feature and a worked example.
 .. confval:: mds_dmclock_reservation
 .. confval:: mds_dmclock_weight
 .. confval:: mds_dmclock_limit
+
+The following options select and tune reactor dispatch mode. See
+:ref:`mds-reactor` for an explanation of lanes, scheduling, and how
+to classify new inbound message types.
+
+.. confval:: mds_dispatch_engine
+.. confval:: mds_reactor_queue_len_abort
+.. confval:: mds_reactor_client_enqueue_high
+.. confval:: mds_reactor_client_enqueue_low
+.. confval:: mds_reactor_io_enqueue_high
+.. confval:: mds_reactor_io_enqueue_low
+.. confval:: mds_reactor_lane_slice_control
+.. confval:: mds_reactor_lane_slice_io
+.. confval:: mds_reactor_lane_slice_maintenance
+.. confval:: mds_reactor_lane_slice_client
+.. confval:: mds_reactor_slice_exec_window
+.. confval:: mds_reactor_slice_backlog_target
+.. confval:: mds_reactor_lane_slice_client_max
+.. confval:: mds_reactor_lane_slice_client_min
+.. confval:: mds_reactor_lane_slice_io_max
+.. confval:: mds_reactor_lane_slice_io_min
+.. confval:: mds_reactor_lane_slice_maintenance_max
+.. confval:: mds_reactor_lane_slice_maintenance_min
+.. confval:: mds_cache_trim_max_duration
+.. confval:: mds_log_trim_max_duration

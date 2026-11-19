@@ -67,6 +67,8 @@ class MDSDaemon : public Dispatcher {
    */
   bool is_clean_shutdown();
 
+  Dispatcher::dispatch_result_t dispatch_inbound_locked(const ref_t<Message>& m);
+
   /* Global MDS lock: every time someone takes this, they must
    * also check the `stopping` flag.  If stopping is true, you
    * must either do nothing and immediately drop the lock, or
@@ -100,6 +102,14 @@ class MDSDaemon : public Dispatcher {
     Formatter *f,
     const bufferlist &inbl,
     asok_finisher on_finish);
+
+  bool use_reactor_dispatch() const;
+  void do_asok_command(
+      std::string_view command,
+      const cmdmap_t& cmdmap,
+      Formatter* f,
+      const bufferlist& inbl,
+      asok_finisher on_finish);
 
   void dump_status(Formatter *f);
 

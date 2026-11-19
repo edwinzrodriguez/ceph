@@ -14,17 +14,21 @@
  */
 
 #include "MDSContext.h"
-#include "MDSRank.h"
-#include "MDLog.h"
 
 #include "common/debug.h"
+#include "mds_lock_debug.h"
+
+#include "dispatch/MDSDispatchEngine.h"
+
+#include "MDLog.h"
+#include "MDSRank.h"
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
 
 void MDSContext::complete(int r) {
   MDSRank *mds = get_mds();
   ceph_assert(mds != nullptr);
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
   dout(10) << "MDSContext::complete: " << typeid(*this).name() << dendl;
   mds->heartbeat_reset();
   return Context::complete(r);
@@ -97,6 +101,13 @@ void MDSIOContextBase::complete(int r) {
 
   dout(10) << "MDSIOContextBase::complete: " << typeid(*this).name() << dendl;
   ceph_assert(mds != NULL);
+
+  if (auto* engine = mds->get_dispatch_engine();
+      engine && engine->is_reactor()) {
+    engine->submit_io_completion(this, r);
+    return;
+  }
+
   // Note, MDSIOContext is passed outside the MDS and, strangely, we grab the
   // lock here when MDSContext::complete would otherwise assume the lock is
   // already acquired.
@@ -144,7 +155,14 @@ void C_IO_Wrapper::complete(int r)
   if (async) {
     dout(20) << "C_IO_Wrapper::complete " << r << " async" << dendl;
     async = false;
-    get_mds()->finisher->queue(this, r);
+    MDSRank* mds = get_mds();
+    if (auto* engine = mds->get_dispatch_engine();
+        engine && engine->is_reactor()) {
+      // Reactor: enqueue for the op thread; do not use the finisher.
+      MDSIOContextBase::complete(r);
+      return;
+    }
+    mds->finisher->queue(this, r);
   } else {
     dout(20) << "C_IO_Wrapper::complete " << r << " sync" << dendl;
     MDSIOContext::complete(r);

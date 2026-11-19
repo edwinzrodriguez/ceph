@@ -43,6 +43,9 @@
 #include <boost/intrusive_ptr.hpp>
 
 class DecayCounter;
+class MDSDaemon;
+class MDSDispatchEngine;
+class ReactorDispatchEngine;
 class MDSContext;
 class MDSMetaRequest;
 class MMDSMap;
@@ -109,6 +112,22 @@ enum {
   l_mdss_handle_client_caps_dirty,
   l_mdss_handle_client_cap_release,
   l_mdss_process_request_cap_release,
+  l_mds_reactor_dispatch_queue_len,
+  l_mds_dispatch_enqueue_usec,
+  l_mds_dispatch_execute_usec,
+  l_mds_dispatch_enqueue_hist,
+  l_mds_dispatch_execute_hist,
+  l_mds_dispatch_queue_len_max,
+  l_mds_dispatch_enqueue_usec_control,
+  l_mds_dispatch_enqueue_usec_io,
+  l_mds_dispatch_enqueue_usec_client,
+  l_mds_dispatch_enqueue_usec_maintenance,
+  l_mds_dispatch_execute_usec_control,
+  l_mds_dispatch_execute_usec_io,
+  l_mds_dispatch_execute_usec_client,
+  l_mds_dispatch_execute_usec_maintenance,
+  l_mds_dispatch_io_completions,
+  l_mds_dispatch_inbound,
   l_mds_last,
 };
 
@@ -183,17 +202,18 @@ class MDSRank {
 
     MDSRank(
         mds_rank_t whoami_,
-        ceph::fair_mutex &mds_lock_,
-        LogChannelRef &clog_,
-        CommonSafeTimer<ceph::fair_mutex> &timer_,
-        Beacon &beacon_,
-        std::unique_ptr<MDSMap> & mdsmap_,
-        Messenger *msgr,
-        MonClient *monc_,
-        MgrClient *mgrc,
-        Context *respawn_hook_,
-        Context *suicide_hook_,
-	boost::asio::io_context& ioc);
+        MDSDaemon* daemon_,
+        ceph::fair_mutex& mds_lock_,
+        LogChannelRef& clog_,
+        CommonSafeTimer<ceph::fair_mutex>& timer_,
+        Beacon& beacon_,
+        std::unique_ptr<MDSMap>& mdsmap_,
+        Messenger* msgr,
+        MonClient* monc_,
+        MgrClient* mgrc,
+        Context* respawn_hook_,
+        Context* suicide_hook_,
+        boost::asio::io_context& ioc);
 
     mds_rank_t get_nodeid() const { return whoami; }
     int64_t get_metadata_pool() const
@@ -210,6 +230,21 @@ class MDSRank {
     }
 
     bool is_daemon_stopping() const;
+
+    MDSDispatchEngine*
+    get_dispatch_engine()
+    {
+      return dispatch_engine.get();
+    }
+
+    const MDSDispatchEngine*
+    get_dispatch_engine() const
+    {
+      return dispatch_engine.get();
+    }
+
+    // Reference to outer daemon for dispatch engine and lifecycle hooks.
+    MDSDaemon* const daemon;
 
     MDSTableClient *get_table_client(int t);
     MDSTableServer *get_table_server(int t);
@@ -251,23 +286,23 @@ class MDSRank {
 
     void queue_waiter(MDSContext *c) {
       finished_queue.push_back(c);
-      progress_thread.signal();
+      notify_finished_queue();
     }
     void queue_waiter_front(MDSContext *c) {
       finished_queue.push_front(c);
-      progress_thread.signal();
+      notify_finished_queue();
     }
     void queue_waiters(std::vector<MDSContext*>& ls) {
       std::vector<MDSContext*> v;
       v.swap(ls);
       std::copy(v.begin(), v.end(), std::back_inserter(finished_queue));
-      progress_thread.signal();
+      notify_finished_queue();
     }
     void queue_waiters_front(std::vector<MDSContext*>& ls) {
       std::vector<MDSContext*> v;
       v.swap(ls);
       std::copy(v.rbegin(), v.rend(), std::front_inserter(finished_queue));
-      progress_thread.signal();
+      notify_finished_queue();
     }
 
     uint64_t get_global_id() const;
@@ -464,6 +499,8 @@ class MDSRank {
     std::shared_ptr<QuiesceAgent> quiesce_agent;
 
     Finisher *finisher;
+    std::unique_ptr<MDSDispatchEngine> dispatch_engine;
+
   protected:
     typedef enum {
       // The MDSMap is available, configure default layouts and structures
@@ -494,6 +531,7 @@ class MDSRank {
     friend class C_MDS_BootStart;
     friend class C_MDS_InternalBootStart;
     friend class C_MDS_MonCommand;
+    friend class ReactorDispatchEngine;
 
     const mds_rank_t whoami;
 
@@ -504,6 +542,7 @@ class MDSRank {
     void retry_dispatch(const cref_t<Message> &m);
     bool is_valid_message(const cref_t<Message> &m);
     void handle_message(const cref_t<Message> &m);
+    void notify_finished_queue();
     void _advance_queues();
     bool _dispatch(const cref_t<Message> &m, bool new_msg);
     bool is_stale_message(const cref_t<Message> &m) const;
@@ -709,16 +748,17 @@ class MDSRankDispatcher : public MDSRank, public md_config_obs_t
 public:
   MDSRankDispatcher(
       mds_rank_t whoami_,
-      ceph::fair_mutex &mds_lock_,
-      LogChannelRef &clog_,
-      CommonSafeTimer<ceph::fair_mutex> &timer_,
-      Beacon &beacon_,
-      std::unique_ptr<MDSMap> &mdsmap_,
-      Messenger *msgr,
-      MonClient *monc_,
-      MgrClient *mgrc,
-      Context *respawn_hook_,
-      Context *suicide_hook_,
+      MDSDaemon* daemon_,
+      ceph::fair_mutex& mds_lock_,
+      LogChannelRef& clog_,
+      CommonSafeTimer<ceph::fair_mutex>& timer_,
+      Beacon& beacon_,
+      std::unique_ptr<MDSMap>& mdsmap_,
+      Messenger* msgr,
+      MonClient* monc_,
+      MgrClient* mgrc,
+      Context* respawn_hook_,
+      Context* suicide_hook_,
       boost::asio::io_context& ioc);
 
   void init();

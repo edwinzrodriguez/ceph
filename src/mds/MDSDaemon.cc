@@ -17,59 +17,51 @@
 
 #include <unistd.h>
 
-#include "include/compat.h"
-#include "include/Context.h"
-#include "include/types.h"
-#include "include/str_list.h"
-#include "include/util.h"
+#include "common/debug.h"
+#include "mds_lock_debug.h"
 
+#include "auth/AuthAuthorizeHandler.h"
+#include "auth/KeyRing.h"
+#include "auth/RotatingKeyRing.h"
 #include "common/Clock.h"
 #include "common/HeartbeatMap.h"
 #include "common/Timer.h"
 #include "common/ceph_argparse.h"
 #include "common/config.h"
-#include "common/debug.h"
 #include "common/entity_name.h"
 #include "common/errno.h"
 #include "common/perf_counters.h"
 #include "common/signal.h"
 #include "common/version.h"
-
+#include "dispatch/MDSDispatchEngine.h"
+#include "dispatch/OpWorkItem.h"
+#include "events/ESession.h"
+#include "events/ESubtreeMap.h"
 #include "global/signal_handler.h"
+#include "include/Context.h"
+#include "include/compat.h"
+#include "include/str_list.h"
+#include "include/types.h"
+#include "include/util.h"
 #include "log/Log.h"
-
 #include "messages/MCommand.h"
 #include "messages/MCommandReply.h"
 #include "messages/MGenericMessage.h"
 #include "messages/MMDSMap.h"
 #include "messages/MMonCommand.h"
 #include "messages/MRemoveSnaps.h"
-
-#include "msg/Messenger.h"
 #include "mon/MonClient.h"
-
+#include "msg/Messenger.h"
 #include "osdc/Objecter.h"
-
-#include "MDSMap.h"
-#include "MDSRank.h"
-
-#include "Server.h"
-#include "Locker.h"
-
-#include "SnapServer.h"
-#include "SnapClient.h"
-
-#include "events/ESession.h"
-#include "events/ESubtreeMap.h"
-
-#include "auth/AuthAuthorizeHandler.h"
-#include "auth/RotatingKeyRing.h"
-#include "auth/KeyRing.h"
-
-#include "messages/MRemoveSnaps.h"
-
 #include "perfglue/cpu_profiler.h"
 #include "perfglue/heap_profiler.h"
+
+#include "Locker.h"
+#include "MDSMap.h"
+#include "MDSRank.h"
+#include "Server.h"
+#include "SnapClient.h"
+#include "SnapServer.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -79,6 +71,25 @@
 using std::string;
 using std::vector;
 using TOPNSPC::common::cmd_getval;
+
+static bool
+mds_asok_command_mutates(std::string_view command)
+{
+  return command == "lockup" || command == "exit" || command == "respawn" ||
+         command == "op kill" || command == "osdmap barrier" ||
+         command == "session evict" || command == "client evict" ||
+         command == "session kill" || command == "session config" ||
+         command == "client config" || command == "scrub start" ||
+         command == "scrub_start" || command == "scrub abort" ||
+         command == "scrub pause" || command == "scrub resume" ||
+         command == "tag path" || command == "flush_path" ||
+         command == "flush journal" || command == "export dir" ||
+         command == "cache drop" || command == "quiesce path" ||
+         command == "lock path" || command == "force_readonly" ||
+         command == "dirfrag split" || command == "dirfrag merge" ||
+         command == "damage rm" || command == "quiesce db" ||
+         command == "qos set" || command == "qos rm";
+}
 
 // cons/des
 MDSDaemon::MDSDaemon(std::string_view n, Messenger *m, MonClient *mc,
@@ -154,6 +165,27 @@ void MDSDaemon::asok_command(
   Formatter *f,
   const bufferlist& inbl,
   asok_finisher on_finish)
+{
+  if (use_reactor_dispatch() && mds_asok_command_mutates(command)) {
+    MDSDispatchEngine* engine = mds_rank->get_dispatch_engine();
+    engine->submit_callable(
+        DispatchLane::Control,
+        [this, command = std::string(command), cmdmap, f, inbl, on_finish]() {
+          do_asok_command(command, cmdmap, f, inbl, on_finish);
+        });
+    return;
+  }
+
+  do_asok_command(command, cmdmap, f, inbl, on_finish);
+}
+
+void
+MDSDaemon::do_asok_command(
+    std::string_view command,
+    const cmdmap_t& cmdmap,
+    Formatter* f,
+    const bufferlist& inbl,
+    asok_finisher on_finish)
 {
   dout(1) << "asok_command: " << command << " " << cmdmap
 	  << " (starting...)" << dendl;
@@ -239,6 +271,13 @@ void MDSDaemon::asok_command(
     }
   }
   on_finish(r, ss.str(), outbl);
+}
+
+bool
+MDSDaemon::use_reactor_dispatch() const
+{
+  return mds_rank && mds_rank->get_dispatch_engine() &&
+         mds_rank->get_dispatch_engine()->is_reactor();
 }
 
 void MDSDaemon::dump_status(Formatter *f)
@@ -759,10 +798,14 @@ void MDSDaemon::reset_tick()
 
   // schedule
   tick_event = timer.add_event_after(
-    g_conf()->mds_tick_interval,
-    new LambdaContext([this](int) {
-	ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
-	tick();
+      g_conf()->mds_tick_interval, new LambdaContext([this](int) {
+        if (use_reactor_dispatch()) {
+          mds_rank->get_dispatch_engine()->submit_callable(
+              DispatchLane::Control, [this]() { tick(); });
+          return;
+        }
+        MDS_ASSERT_MDS_LOCK(mds_lock);
+        tick();
       }));
 }
 
@@ -948,11 +991,10 @@ void MDSDaemon::handle_mds_map(const cref_t<MMDSMap> &m)
 
     // Did I previously not hold a rank?  Initialize!
     if (mds_rank == NULL) {
-      mds_rank = new MDSRankDispatcher(whoami, mds_lock, clog,
-          timer, beacon, mdsmap, messenger, monc, &mgrc,
-          new LambdaContext([this](int r){respawn();}),
-          new LambdaContext([this](int r){suicide();}),
-	  ioctx);
+      mds_rank = new MDSRankDispatcher(
+          whoami, this, mds_lock, clog, timer, beacon, mdsmap, messenger, monc,
+          &mgrc, new LambdaContext([this](int r) { respawn(); }),
+          new LambdaContext([this](int r) { suicide(); }), ioctx);
       dout(10) <<  __func__ << ": initializing MDS rank "
                << mds_rank->get_nodeid() << dendl;
       mds_rank->init();
@@ -1091,7 +1133,18 @@ void MDSDaemon::respawn()
 Dispatcher::dispatch_result_t MDSDaemon::ms_dispatch2(const ref_t<Message> &m)
 {
   dout(25) << __func__ << ": processing " << m << dendl;
+
+  if (mds_rank && mds_rank->get_dispatch_engine()) {
+    return mds_rank->get_dispatch_engine()->submit_inbound(m);
+  }
+
   std::lock_guard l(mds_lock);
+  return dispatch_inbound_locked(m);
+}
+
+Dispatcher::dispatch_result_t
+MDSDaemon::dispatch_inbound_locked(const ref_t<Message>& m)
+{
   if (stopping) {
     return false;
   }

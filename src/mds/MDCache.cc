@@ -14,47 +14,31 @@
  */
 
 #include "MDCache.h"
-#include "Mutation.h"
-#include "RetryMessage.h"
-#include "RetryRequest.h"
 
 #include <errno.h>
 
 #include <deque>
-#include <ostream>
-#include <string>
-#include <string_view>
 #include <map>
 #include <memory>
 #include <optional>
+#include <ostream>
 #include <queue>
+#include <string>
+#include <string_view>
 
-#include "MDSRank.h"
-#include "Server.h"
-#include "cephfs_features.h" // for CEPHFS_FEATURE_QUARANTINE
-#include "Locker.h"
-#include "MDLog.h"
-#include "MDBalancer.h"
-#include "Migrator.h"
-#include "ScrubStack.h"
-#include "BatchOp.h"
+#include "common/debug.h"
+#include "mds_lock_debug.h"
 
-#include "SnapClient.h"
-#include "SnapRealm.h"
-
-#include "MDSMap.h"
-
-#include "CInode.h"
-#include "CDir.h"
-
-#include "Mutation.h"
-
-#include "QuarantineManager.h"
-
+#include "common/Timer.h"
+#include "common/config.h"
+#include "common/errno.h"
+#include "common/likely.h"
+#include "common/perf_counters.h"
+#include "common/safe_io.h"
+#include "dispatch/MDSDispatchEngine.h"
 #include "include/ceph_fs.h"
 #include "common/filepath.h"
 #include "include/util.h"
-
 #include "messages/MCacheExpire.h"
 #include "messages/MClientCaps.h"
 #include "messages/MClientQuota.h"
@@ -78,42 +62,34 @@
 #include "messages/MMDSResolve.h"
 #include "messages/MMDSResolveAck.h"
 #include "messages/MMDSSnapUpdate.h"
-
 #include "msg/Message.h"
 #include "msg/Messenger.h"
-
-#include "common/debug.h"
-#include "common/errno.h"
-#include "common/likely.h"
-#include "common/perf_counters.h"
-#include "common/safe_io.h"
-
-#include "osdc/Journaler.h"
 #include "osdc/Filer.h"
+#include "osdc/Journaler.h"
 #include "osdc/Objecter.h"
 #include "osdc/Striper.h"
-
-#include "events/EMetaBlob.h"
-#include "events/ESubtreeMap.h"
-#include "events/ELid.h"
-#include "events/EUpdate.h"
-#include "events/EPeerUpdate.h"
-#include "events/EImportFinish.h"
-#include "events/EFragment.h"
-#include "events/ECommitted.h"
-#include "events/EPurged.h"
-#include "events/ESessions.h"
-
-#include "InoTable.h"
-#include "fscrypt.h"
-
-#include "common/Timer.h"
-
 #include "perfglue/heap_profiler.h"
 
-
-#include "common/config.h"
-#include "include/ceph_assert.h"
+#include "BatchOp.h"
+#include "CDir.h"
+#include "CInode.h"
+#include "InoTable.h"
+#include "Locker.h"
+#include "MDBalancer.h"
+#include "MDLog.h"
+#include "MDSMap.h"
+#include "MDSRank.h"
+#include "Migrator.h"
+#include "Mutation.h"
+#include "QuarantineManager.h"
+#include "RetryMessage.h"
+#include "RetryRequest.h"
+#include "ScrubStack.h"
+#include "Server.h"
+#include "SnapClient.h"
+#include "SnapRealm.h"
+#include "cephfs_features.h" // for CEPHFS_FEATURE_QUARANTINE
+#include "fscrypt.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -14888,6 +14864,43 @@ bool MDCache::is_ready_to_trim_cache(void)
   return is_open() && !rejoin_done;
 }
 
+bool
+MDCache::trim_quantum()
+{
+  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
+
+  {
+    MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_cache_memory);
+    check_memory_usage();
+  }
+  if (!mds->is_cache_trimmable()) {
+    dout(10) << "cache not ready for trimming" << dendl;
+    return false;
+  }
+
+  dout(20) << "trim_quantum trimming cache" << dendl;
+  const bool active_with_clients = mds->is_active() || mds->is_clientreplay() ||
+                                   mds->is_stopping();
+  if (active_with_clients) {
+    MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_client_leases);
+    trim_client_leases();
+  }
+  if (is_ready_to_trim_cache() || mds->is_standby_replay()) {
+    MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_cache_trim);
+    trim();
+  }
+  if (active_with_clients) {
+    MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_client_recall);
+    auto recall_flags = Server::RecallFlags::ENFORCE_MAX |
+                        Server::RecallFlags::ENFORCE_LIVENESS;
+    if (cache_toofull()) {
+      recall_flags = recall_flags | Server::RecallFlags::TRIM;
+    }
+    mds->server->recall_client_state(nullptr, recall_flags);
+  }
+  return true;
+}
+
 void MDCache::upkeep_main(void)
 {
   ceph_pthread_setname("mds-cache-trim");
@@ -14918,37 +14931,20 @@ void MDCache::upkeep_main(void)
     auto since = now-upkeep_last_trim;
     auto trim_interval = clock::duration(g_conf().get_val<std::chrono::seconds>("mds_cache_trim_interval"));
     if (since >= trim_interval*.90) {
-      lock.unlock(); /* mds_lock -> upkeep_mutex */
-      std::scoped_lock mds_lock(mds->mds_lock);
-      lock.lock();
-      if (upkeep_trim_shutdown.load())
-        return;
-      {
-        MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_cache_memory);
-        check_memory_usage();
-      }
-      if (mds->is_cache_trimmable()) {
-        dout(20) << "upkeep thread trimming cache; last trim " << since << " ago" << dendl;
-        bool active_with_clients = mds->is_active() || mds->is_clientreplay() || mds->is_stopping();
-        if (active_with_clients) {
-          MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_client_leases);
-          trim_client_leases();
-        }
-        if (is_ready_to_trim_cache() || mds->is_standby_replay()) {
-          MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_cache_trim);
-          trim();
-        }
-        if (active_with_clients) {
-          MDSPhaseTracker::Timer phase_timer(&mds->phase_tracker, l_mdsp_client_recall);
-          auto recall_flags = Server::RecallFlags::ENFORCE_MAX|Server::RecallFlags::ENFORCE_LIVENESS;
-          if (cache_toofull()) {
-            recall_flags = recall_flags|Server::RecallFlags::TRIM;
-          }
-          mds->server->recall_client_state(nullptr, recall_flags);
-        }
+      if (auto* engine = mds->get_dispatch_engine();
+          engine && engine->is_reactor()) {
+        dout(20) << "upkeep thread posting trim tick" << dendl;
+        engine->submit_trim_tick();
         upkeep_last_trim = now = clock::now();
       } else {
-        dout(10) << "cache not ready for trimming" << dendl;
+        lock.unlock(); /* mds_lock -> upkeep_mutex */
+        std::scoped_lock mds_lock(mds->mds_lock);
+        lock.lock();
+        if (upkeep_trim_shutdown.load())
+          return;
+        if (trim_quantum()) {
+          upkeep_last_trim = now = clock::now();
+        }
       }
     } else {
       trim_interval -= since;

@@ -14,63 +14,65 @@
  */
 
 #include "MDSRank.h"
-#include "osdc/Journaler.h"
 
-#include <typeinfo>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <typeinfo>
 #include <vector>
-#include <cstdlib>
+
+#include "common/debug.h"
+#include "mds_lock_debug.h"
+
 #include "common/Cond.h"
 #include "common/DecayCounter.h"
-#include "common/debug.h"
-#include "common/errno.h"
-#include "common/fair_mutex.h"
+#include "common/HeartbeatMap.h"
 #include "common/JSONFormatterFile.h"
-#include "common/likely.h"
 #include "common/Timer.h"
 #include "common/async/blocked_completion.h"
 #include "common/cmdparse.h"
+#include "common/errno.h"
+#include "common/fair_mutex.h"
+#include "common/likely.h"
+#include "dispatch/MDSDispatchContext.h"
+#include "dispatch/MDSDispatchEngine.h"
+#include "dispatch/OpWorkItem.h"
+#include "events/ELid.h"
+#include "events/ESubtreeMap.h"
 #include "log/Log.h"
-
-#include "msg/Messenger.h"
 #include "messages/MClientRequest.h"
 #include "messages/MClientRequestForward.h"
 #include "messages/MMDSLoadTargets.h"
 #include "messages/MMDSMap.h"
-#include "messages/MMDSTableRequest.h"
 #include "messages/MMDSMetrics.h"
-#include "msg/Messenger.h"
-
+#include "messages/MMDSTableRequest.h"
 #include "mgr/MgrClient.h"
+#include "mon/MonClient.h"
+#include "msg/Messenger.h"
+#include "osdc/Journaler.h"
+#include "osdc/Objecter.h"
 
 #include "Beacon.h"
+#include "InoTable.h"
+#include "Locker.h"
+#include "MDBalancer.h"
 #include "MDCache.h"
 #include "MDLog.h"
 #include "MDSDaemon.h"
 #include "MDSMap.h"
 #include "MetricAggregator.h"
+#include "Migrator.h"
+#include "Mutation.h"
+#include "QuiesceAgent.h"
+#include "QuiesceDbManager.h"
+#include "ScrubStack.h"
 #include "Server.h"
 #include "SnapClient.h"
 #include "SnapServer.h"
-#include "MDBalancer.h"
-#include "Migrator.h"
-#include "Locker.h"
-#include "InoTable.h"
-#include "mon/MonClient.h"
-#include "osdc/Objecter.h"
-#include "common/HeartbeatMap.h"
-#include "ScrubStack.h"
 
 #ifdef CEPH_LOCKSTAT
 #include "common/lockstat.h"
 #endif
-#include "events/ESubtreeMap.h"
-#include "events/ELid.h"
-#include "Mutation.h"
-
-#include "QuiesceDbManager.h"
-#include "QuiesceAgent.h"
 
 #define dout_context g_ceph_context
 #define dout_subsys ceph_subsys_mds
@@ -94,7 +96,7 @@ public:
   }
 
   void send() {
-    ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+    MDS_ASSERT_MDS_LOCK(mds->mds_lock);
 
     dout(20) << __func__ << dendl;
 
@@ -134,7 +136,7 @@ private:
   }
 
   void handle_clear_mdlog(int r) {
-    ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+    MDS_ASSERT_MDS_LOCK(mds->mds_lock);
     dout(20) << __func__ << ": r=" << r << dendl;
 
     if (r != 0) {
@@ -192,7 +194,7 @@ private:
   }
 
   void trim_expired_segments() {
-    ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+    MDS_ASSERT_MDS_LOCK(mds->mds_lock);
     dout(5) << __func__ << ": expiry complete, expire_pos/trim_pos is now "
             << std::hex << mdlog->get_journaler()->get_expire_pos() << "/"
             << mdlog->get_journaler()->get_trimmed_pos() << dendl;
@@ -218,7 +220,7 @@ private:
     /* We don't need the mds_lock but MDLog::write_head takes an MDSContext so
      * we are expected to have it.
      */
-    ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+    MDS_ASSERT_MDS_LOCK(mds->mds_lock);
     dout(20) << __func__ << ": r=" << r << dendl;
 
     dout(5) << __func__ << ": trimming is complete; wait for journal head write. Journal expire_pos/trim_pos is now "
@@ -472,41 +474,54 @@ private:
 
 MDSRank::MDSRank(
     mds_rank_t whoami_,
-    ceph::fair_mutex &mds_lock_,
-    LogChannelRef &clog_,
-    CommonSafeTimer<ceph::fair_mutex> &timer_,
-    Beacon &beacon_,
+    MDSDaemon* daemon_,
+    ceph::fair_mutex& mds_lock_,
+    LogChannelRef& clog_,
+    CommonSafeTimer<ceph::fair_mutex>& timer_,
+    Beacon& beacon_,
     std::unique_ptr<MDSMap>& mdsmap_,
-    Messenger *msgr,
-    MonClient *monc_,
-    MgrClient *mgrc,
-    Context *respawn_hook_,
-    Context *suicide_hook_,
+    Messenger* msgr,
+    MonClient* monc_,
+    MgrClient* mgrc,
+    Context* respawn_hook_,
+    Context* suicide_hook_,
     boost::asio::io_context& ioc) :
-    cct(msgr->cct), mds_lock(mds_lock_), clog(clog_),
-    timer(timer_), mdsmap(mdsmap_),
-    objecter(new Objecter(g_ceph_context, msgr, monc_, ioc)),
-    damage_table(whoami_), sessionmap(this),
-    op_tracker(g_ceph_context, g_conf()->mds_enable_op_tracker,
-               g_conf()->osd_num_op_tracker_shard),
-    phase_tracker(msgr->cct, mds_lock_),
-    progress_thread(this), whoami(whoami_),
-    purge_queue(g_ceph_context, whoami_,
-      mdsmap_->get_metadata_pool(), objecter,
+  cct(msgr->cct),
+  daemon(daemon_),
+  mds_lock(mds_lock_),
+  clog(clog_),
+  timer(timer_),
+  mdsmap(mdsmap_),
+  objecter(new Objecter(g_ceph_context, msgr, monc_, ioc)),
+  damage_table(whoami_),
+  sessionmap(this),
+  op_tracker(
+      g_ceph_context,
+      g_conf()->mds_enable_op_tracker,
+      g_conf()->osd_num_op_tracker_shard),
+  phase_tracker(msgr->cct, mds_lock_),
+  progress_thread(this),
+  whoami(whoami_),
+  purge_queue(
+      g_ceph_context,
+      whoami_,
+      mdsmap_->get_metadata_pool(),
+      objecter,
       new LambdaContext([this](int r) {
-	  std::lock_guard l(mds_lock);
-	  handle_write_error(r);
-	}
-      )
-    ),
-    metrics_handler(cct, this),
-    beacon(beacon_),
-    messenger(msgr), monc(monc_), mgrc(mgrc),
-    respawn_hook(respawn_hook_),
-    suicide_hook(suicide_hook_),
-    inject_journal_corrupt_dentry_first(g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first")),
-    starttime(mono_clock::now()),
-    ioc(ioc)
+        std::lock_guard l(mds_lock);
+        handle_write_error(r);
+      })),
+  metrics_handler(cct, this),
+  beacon(beacon_),
+  messenger(msgr),
+  monc(monc_),
+  mgrc(mgrc),
+  respawn_hook(respawn_hook_),
+  suicide_hook(suicide_hook_),
+  inject_journal_corrupt_dentry_first(
+      g_conf().get_val<double>("mds_inject_journal_corrupt_dentry_first")),
+  starttime(mono_clock::now()),
+  ioc(ioc)
 {
   hb = g_ceph_context->get_heartbeat_map()->add_worker("MDSRank", pthread_self());
 
@@ -551,11 +566,16 @@ MDSRank::MDSRank(
 
   phase_tracker.set_enabled(cct->_conf.get_val<bool>("mds_enable_phase_tracker"));
 
+  MDSDispatchContext dispatch_ctx{daemon, this, &mds_lock, cct};
+  dispatch_engine = MDSDispatchEngine::create(dispatch_ctx);
+
   schedule_update_timer_task();
 }
 
 MDSRank::~MDSRank()
 {
+  dispatch_engine.reset();
+
   if (hb) {
     g_ceph_context->get_heartbeat_map()->remove_worker(hb);
     hb = nullptr;
@@ -599,6 +619,10 @@ MDSRank::~MDSRank()
 
 void MDSRankDispatcher::init()
 {
+  if (dispatch_engine) {
+    dispatch_engine->start();
+  }
+
   objecter->init();
   messenger->add_dispatcher_tail(objecter); // the default priority
 
@@ -611,7 +635,9 @@ void MDSRankDispatcher::init()
   // who is interested in it.
   handle_osd_map();
 
-  progress_thread.create("mds-rank-progr");
+  if (!dispatch_engine || !dispatch_engine->is_reactor()) {
+    progress_thread.create("mds-rank-progr");
+  }
 
   purge_queue.init();
 
@@ -734,9 +760,13 @@ void MDSRankDispatcher::tick()
 
   check_ops_in_flight();
 
-  // Wake up thread in case we use to be laggy and have waiting_for_nolaggy
+  // Wake up progress in case we used to be laggy and have waiting_for_nolaggy
   // messages to progress.
-  progress_thread.signal();
+  if (auto* engine = get_dispatch_engine(); engine && engine->is_reactor()) {
+    engine->submit_advance_queues();
+  } else {
+    progress_thread.signal();
+  }
 
   // make sure mds log flushes, trims periodically
   mdlog->flush();
@@ -853,6 +883,10 @@ void MDSRankDispatcher::shutdown()
     metric_aggregator->shutdown();
   }
 
+  if (dispatch_engine) {
+    dispatch_engine->shutdown();
+  }
+
   mds_lock.unlock();
   finisher->stop(); // no flushing
   mds_lock.lock();
@@ -864,7 +898,9 @@ void MDSRankDispatcher::shutdown()
 
   op_tracker.on_shutdown();
 
-  progress_thread.shutdown();
+  if (progress_thread.is_started()) {
+    progress_thread.shutdown();
+  }
 
   // release mds_lock for finisher/messenger threads (e.g.
   // MDSDaemon::ms_handle_reset called from Messenger).
@@ -965,7 +1001,7 @@ void MDSRank::abort(std::string_view msg)
 void MDSRank::damaged()
 {
   ceph_assert(whoami != MDS_RANK_NONE);
-  ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  MDS_ASSERT_MDS_LOCK(mds_lock);
 
   beacon.set_want_state(*mdsmap, MDSMap::STATE_DAMAGED);
   monc->flush_log();  // Flush any clog error from before we were called
@@ -1033,6 +1069,9 @@ void *MDSRank::ProgressThread::entry()
       break;
     }
 
+#ifdef CEPH_DEBUG_MUTEX
+    mds::MdsLockToken lock_token{mds->mds_lock, "classic:progress"};
+#endif
     mds->_advance_queues();
   }
 
@@ -1042,7 +1081,7 @@ void *MDSRank::ProgressThread::entry()
 
 void MDSRank::ProgressThread::shutdown()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds->mds_lock));
+  MDS_ASSERT_MDS_LOCK(mds->mds_lock);
   ceph_assert(mds->stopping);
 
   if (am_self()) {
@@ -1337,6 +1376,16 @@ void MDSRank::handle_message(const cref_t<Message> &m)
   }
 }
 
+void
+MDSRank::notify_finished_queue()
+{
+  if (auto* engine = dispatch_engine.get(); engine && engine->is_reactor()) {
+    engine->note_finished_queued();
+  } else {
+    progress_thread.signal();
+  }
+}
+
 /**
  * Advance finished_queue and waiting_for_nolaggy.
  *
@@ -1345,7 +1394,7 @@ void MDSRank::handle_message(const cref_t<Message> &m)
  */
 void MDSRank::_advance_queues()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  MDS_ASSERT_MDS_LOCK(mds_lock);
 
   if (!finished_queue.empty()) {
     MDSPhaseTracker::Timer phase_timer(&phase_tracker, l_mdsp_finished_contexts);
@@ -1770,7 +1819,7 @@ void MDSRank::boot_start(BootStep step, int r)
 
 void MDSRank::validate_sessions()
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  MDS_ASSERT_MDS_LOCK(mds_lock);
   bool valid = true;
 
   // Identify any sessions which have state inconsistent with other,
@@ -3829,6 +3878,88 @@ void MDSRank::create_logger()
                     "Inodes with capabilities");
     mds_plb.add_u64(l_mds_subtrees, "subtrees", "Subtrees");
     mds_plb.add_u64(l_mds_load_cent, "load_cent", "Load per cent");
+    {
+      PerfHistogramCommon::axis_config_d dispatch_latency_x{
+          "Latency (usec)", PerfHistogramCommon::SCALE_LOG2, 0, 100, 32,
+      };
+      PerfHistogramCommon::axis_config_d dispatch_lane_y{
+          "Dispatch lane",
+          PerfHistogramCommon::SCALE_LINEAR,
+          0,
+          1,
+          static_cast<int32_t>(DispatchLane::Count),
+      };
+      mds_plb.add_u64(
+          l_mds_reactor_dispatch_queue_len, "dispatch_queue_len",
+          "Reactor dispatch op queue depth", "rdql",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64(
+          l_mds_dispatch_queue_len_max, "dispatch_queue_len_max",
+          "Reactor dispatch op queue high water mark", "rdqm",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64_counter(
+          l_mds_dispatch_io_completions, "dispatch_io_completions",
+          "IO completions executed on reactor op thread", "dioc",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64_counter(
+          l_mds_dispatch_inbound, "dispatch_inbound",
+          "Inbound messages executed on reactor op thread", "dinb",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_enqueue_usec, "dispatch_enqueue_usec",
+          "Reactor dispatch queue wait time", "deq",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_execute_usec, "dispatch_execute_usec",
+          "Reactor dispatch op execution time", "dex",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_enqueue_usec_control, "dispatch_enqueue_usec_control",
+          "Reactor dispatch queue wait (control lane)", "deqc",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_enqueue_usec_io, "dispatch_enqueue_usec_io",
+          "Reactor dispatch queue wait (io lane)", "deqi",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_enqueue_usec_client, "dispatch_enqueue_usec_client",
+          "Reactor dispatch queue wait (client lane)", "deql",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_enqueue_usec_maintenance,
+          "dispatch_enqueue_usec_maintenance",
+          "Reactor dispatch queue wait (maintenance lane)", "deqm",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_execute_usec_control, "dispatch_execute_usec_control",
+          "Reactor dispatch execute time (control lane)", "dexc",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_execute_usec_io, "dispatch_execute_usec_io",
+          "Reactor dispatch execute time (io lane)", "dexi",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_execute_usec_client, "dispatch_execute_usec_client",
+          "Reactor dispatch execute time (client lane)", "dexl",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_time_avg(
+          l_mds_dispatch_execute_usec_maintenance,
+          "dispatch_execute_usec_maintenance",
+          "Reactor dispatch execute time (maintenance lane)", "dexm",
+          PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64_counter_histogram(
+          l_mds_dispatch_enqueue_hist, "dispatch_enqueue_hist",
+          dispatch_latency_x, dispatch_lane_y,
+          "Reactor dispatch queue wait histogram by lane (use perf histogram "
+          "dump)",
+          "deqh", PerfCountersBuilder::PRIO_USEFUL);
+      mds_plb.add_u64_counter_histogram(
+          l_mds_dispatch_execute_hist, "dispatch_execute_hist",
+          dispatch_latency_x, dispatch_lane_y,
+          "Reactor dispatch execute histogram by lane (use perf histogram "
+          "dump)",
+          "dexh", PerfCountersBuilder::PRIO_USEFUL);
+    }
     mds_plb.add_u64_counter(l_mds_openino_dir_fetch, "openino_dir_fetch",
                             "OpenIno incomplete directory fetchings");
 
@@ -4000,7 +4131,7 @@ bool MDSRank::evict_client(int64_t session_id,
     bool wait, bool blocklist, std::ostream& err_ss,
     Context *on_killed)
 {
-  ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  MDS_ASSERT_MDS_LOCK(mds_lock);
 
   // Mutually exclusive args
   ceph_assert(!(wait && on_killed != nullptr));
@@ -4034,8 +4165,8 @@ bool MDSRank::evict_client(int64_t session_id,
   *css << "\"}";
   std::vector<std::string> cmd = {css->str()};
 
-  auto kill_client_session = [this, session_id, wait, on_killed](){
-    ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  auto kill_client_session = [this, session_id, wait, on_killed]() {
+    MDS_ASSERT_MDS_LOCK(mds_lock);
     Session *session = sessionmap.get_session(
         entity_name_t(CEPH_ENTITY_TYPE_CLIENT, session_id));
     if (session) {
@@ -4061,8 +4192,8 @@ bool MDSRank::evict_client(int64_t session_id,
     }
   };
 
-  auto apply_blocklist = [this, &cmd](std::function<void ()> fn){
-    ceph_assert(ceph_mutex_is_locked_by_me(mds_lock));
+  auto apply_blocklist = [this, &cmd](std::function<void()> fn) {
+    MDS_ASSERT_MDS_LOCK(mds_lock);
 
     Context *on_blocklist_done = new LambdaContext([this, fn](int r) {
       objecter->wait_for_latest_osdmap(
@@ -4117,19 +4248,32 @@ bool MDSRank::evict_client(int64_t session_id,
 
 MDSRankDispatcher::MDSRankDispatcher(
     mds_rank_t whoami_,
-    ceph::fair_mutex &mds_lock_,
-    LogChannelRef &clog_,
-    CommonSafeTimer<ceph::fair_mutex> &timer_,
-    Beacon &beacon_,
-    std::unique_ptr<MDSMap> &mdsmap_,
-    Messenger *msgr,
-    MonClient *monc_,
-    MgrClient *mgrc,
-    Context *respawn_hook_,
-    Context *suicide_hook_,
-    boost::asio::io_context& ioc)
-  : MDSRank(whoami_, mds_lock_, clog_, timer_, beacon_, mdsmap_,
-            msgr, monc_, mgrc, respawn_hook_, suicide_hook_, ioc)
+    MDSDaemon* daemon_,
+    ceph::fair_mutex& mds_lock_,
+    LogChannelRef& clog_,
+    CommonSafeTimer<ceph::fair_mutex>& timer_,
+    Beacon& beacon_,
+    std::unique_ptr<MDSMap>& mdsmap_,
+    Messenger* msgr,
+    MonClient* monc_,
+    MgrClient* mgrc,
+    Context* respawn_hook_,
+    Context* suicide_hook_,
+    boost::asio::io_context& ioc) :
+  MDSRank(
+      whoami_,
+      daemon_,
+      mds_lock_,
+      clog_,
+      timer_,
+      beacon_,
+      mdsmap_,
+      msgr,
+      monc_,
+      mgrc,
+      respawn_hook_,
+      suicide_hook_,
+      ioc)
 {
     g_conf().add_observer(this);
 }
