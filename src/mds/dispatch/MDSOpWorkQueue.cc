@@ -45,6 +45,7 @@ MDSOpWorkQueue::clear_lane(LaneQueue& lane)
       OpWorkItem& item = list.front();
       list.pop_front();
       depth.fetch_sub(1, std::memory_order_relaxed);
+      lane.depth.fetch_sub(1, std::memory_order_relaxed);
       item.destroy();
     }
   }
@@ -69,6 +70,7 @@ MDSOpWorkQueue::enqueue(OpWorkItem* item, DispatchLane lane)
     item->note_enqueued();
     q.lists[producer].push_back(*item);
     depth.fetch_add(1, std::memory_order_relaxed);
+    q.depth.fetch_add(1, std::memory_order_relaxed);
   }
 
   {
@@ -78,7 +80,7 @@ MDSOpWorkQueue::enqueue(OpWorkItem* item, DispatchLane lane)
 }
 
 OpWorkItem*
-MDSOpWorkQueue::dequeue_lane(LaneQueue& lane)
+MDSOpWorkQueue::try_pop_consumer(LaneQueue& lane)
 {
   LaneList& list = consumer_list(lane);
   if (list.empty()) {
@@ -87,6 +89,7 @@ MDSOpWorkQueue::dequeue_lane(LaneQueue& lane)
   OpWorkItem& item = list.front();
   list.pop_front();
   depth.fetch_sub(1, std::memory_order_relaxed);
+  lane.depth.fetch_sub(1, std::memory_order_relaxed);
   return &item;
 }
 
@@ -109,18 +112,23 @@ MDSOpWorkQueue::maybe_swap_lane(LaneQueue& lane)
 }
 
 OpWorkItem*
+MDSOpWorkQueue::dequeue_lane(DispatchLane lane)
+{
+  ceph_assert(lane < DispatchLane::Count);
+  LaneQueue& q = lanes[static_cast<size_t>(lane)];
+
+  if (OpWorkItem* item = try_pop_consumer(q)) {
+    return item;
+  }
+  maybe_swap_lane(q);
+  return try_pop_consumer(q);
+}
+
+OpWorkItem*
 MDSOpWorkQueue::dequeue()
 {
   for (size_t li = 0; li < static_cast<size_t>(DispatchLane::Count); ++li) {
-    LaneQueue& q = lanes[li];
-
-    if (OpWorkItem* item = dequeue_lane(q)) {
-      return item;
-    }
-
-    maybe_swap_lane(q);
-
-    if (OpWorkItem* item = dequeue_lane(q)) {
+    if (OpWorkItem* item = dequeue_lane(static_cast<DispatchLane>(li))) {
       return item;
     }
   }
@@ -150,6 +158,13 @@ size_t
 MDSOpWorkQueue::count() const
 {
   return depth.load(std::memory_order_relaxed);
+}
+
+size_t
+MDSOpWorkQueue::count(DispatchLane lane) const
+{
+  ceph_assert(lane < DispatchLane::Count);
+  return lanes[static_cast<size_t>(lane)].depth.load(std::memory_order_relaxed);
 }
 
 void

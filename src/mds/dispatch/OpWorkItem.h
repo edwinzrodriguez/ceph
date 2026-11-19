@@ -32,12 +32,13 @@
 
 class MDSIOContextBase;
 
-/// Priority lane for reactor-mode scheduling (high -> low).
+/// Priority lane for reactor-mode scheduling (high -> low within a round;
+/// each lane also has a wall-clock slice budget — see mds_reactor_lane_slice_*).
 enum class DispatchLane : uint8_t {
   Control = 0,
   IOComplete = 1,
-  Client = 2,
-  Maintenance = 3,
+  Maintenance = 2,
+  Client = 3,
 
   Count
 };
@@ -64,7 +65,7 @@ struct OpWorkItem
   std::function<void()>* callable = nullptr;
 
   /// Set when the item enters MDSOpWorkQueue (reactor perf counters).
-  ceph::coarse_mono_time enqueued_at{};
+  ceph::fast_mono_time enqueued_at{};
 
   static OpWorkItem* create_inbound(const ref_t<Message>& m, DispatchLane lane);
   static OpWorkItem* create_io(MDSIOContextBase* ctx, int r);

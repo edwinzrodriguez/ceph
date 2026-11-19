@@ -28,9 +28,16 @@
  * consumer bank run while higher-priority work sat on the producer side of
  * other lanes waiting for all lanes to drain.
  *
+ * Scheduling: ReactorDispatchEngine walks lanes Control -> IOComplete ->
+ * Maintenance -> Client in rounds, giving each lane a wall-clock budget
+ * (see mds_reactor_lane_slice_*). Client/Maintenance budgets may adapt from
+ * estimated Client backlog. dequeue() is strict priority; dequeue_lane()
+ * is used for the time-sliced drain.
+ *
  * Usage:
- *   queue.enqueue(item, lane);   // any producer thread
- *   item = queue.dequeue();      // op thread; walks lanes by priority
+ *   queue.enqueue(item, lane);          // any producer thread
+ *   item = queue.dequeue_lane(lane);    // op thread; one lane (+ bank swap)
+ *   item = queue.dequeue();             // op thread; highest-priority non-empty
  */
 
 #pragma once
@@ -54,10 +61,16 @@ public:
   /// Pop highest-priority item across lanes. Op thread only.
   OpWorkItem* dequeue();
 
+  /// Pop next item from a single lane (consumer bank, then swap). Op thread only.
+  OpWorkItem* dequeue_lane(DispatchLane lane);
+
   bool has_work_for_consumer();
 
   /// Items waiting in all lane banks (O(1); maintained by depth counter).
   size_t count() const;
+
+  /// Items waiting in one lane's banks (O(1)).
+  size_t count(DispatchLane lane) const;
 
   void wake();
   void shutdown();
@@ -86,6 +99,8 @@ private:
     std::array<LaneList, NUM_BANKS> lists;
     /// Producer bank index; consumer bank is always producer_bank ^ 1.
     std::atomic<uint8_t> producer_bank{0};
+    /// Items in this lane across both banks.
+    std::atomic<size_t> depth{0};
     ceph::mutex lock;
 
     LaneQueue();
@@ -99,7 +114,7 @@ private:
   std::atomic<size_t> depth{0};
 
   static LaneList& consumer_list(LaneQueue& lane);
-  OpWorkItem* dequeue_lane(LaneQueue& lane);
+  OpWorkItem* try_pop_consumer(LaneQueue& lane);
   void maybe_swap_lane(LaneQueue& lane);
   void clear_lane(LaneQueue& lane);
 };

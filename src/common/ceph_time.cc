@@ -165,6 +165,8 @@ operator<< <coarse_real_clock>(std::ostream& m, const coarse_real_time& t);
 template std::ostream&
 operator<< <tsc_clock>(std::ostream& m, const tsc_clock::time_point& t);
 #endif
+template std::ostream&
+operator<< <fast_mono_clock>(std::ostream& m, const fast_mono_time& t);
 
 std::string timespan_str(timespan t)
 {

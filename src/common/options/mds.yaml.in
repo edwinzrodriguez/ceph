@@ -89,6 +89,145 @@ options:
   - reactor
   flags:
   - startup
+- name: mds_reactor_queue_len_abort
+  type: uint
+  level: dev
+  desc: Abort the MDS when the reactor dispatch queue depth reaches this value
+  long_desc: Debugging aid for reactor dispatch backlog stalls. When
+    ``mds_dispatch_engine=reactor`` and this value is non-zero, the MDS dumps
+    the recent in-memory log (see ``log_max_recent`` / ``debug_mds`` gather
+    level) and aborts as soon as ``MDSOpWorkQueue`` depth reaches the limit.
+    Use together with a large ``log_max_recent`` and ``debug_mds=N/M``
+    (``N`` low, ``M`` high) so the abort captures recent detail without writing
+    a full high-verbosity log to disk. ``0`` disables (default).
+  default: 0
+  services:
+  - mds
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_control
+  type: millisecs
+  level: advanced
+  desc: Max wall time per Control lane visit in a reactor scheduling round
+  long_desc: When ``mds_dispatch_engine=reactor``, the op thread visits lanes
+    Control, IOComplete, Maintenance, then Client each round. This option is
+    the wall-clock budget for the Control lane before advancing. ``0`` drains
+    Control until empty (no wall deadline).
+  default: 10
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_lane_slice_io
+  - mds_reactor_lane_slice_maintenance
+  - mds_reactor_lane_slice_client
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_io
+  type: millisecs
+  level: advanced
+  desc: Max wall time per IOComplete lane visit in a reactor scheduling round
+  long_desc: See ``mds_reactor_lane_slice_control``. ``0`` drains IOComplete
+    until empty.
+  default: 10
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_lane_slice_control
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_maintenance
+  type: millisecs
+  level: advanced
+  desc: Max wall time per Maintenance lane visit in a reactor scheduling round
+  long_desc: Caps how long LogTrim/TrimQuantum (and other Maintenance work) may
+    run before Client gets a turn. See ``mds_reactor_lane_slice_control``.
+  default: 2
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_lane_slice_client
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_client
+  type: millisecs
+  level: advanced
+  desc: Max wall time per Client lane visit in a reactor scheduling round
+  long_desc: See ``mds_reactor_lane_slice_control``.
+  default: 2
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_lane_slice_maintenance
+  flags:
+  - runtime
+- name: mds_reactor_slice_exec_window
+  type: uint
+  level: advanced
+  desc: Rolling window size for per-lane reactor execute-time average
+  long_desc: Number of recent completed ops per dispatch lane used to estimate
+    average execute time for backlog-adaptive lane slices
+    (``depth * avg_exec``). Clamped to ``[1, 1024]``.
+  default: 256
+  services:
+  - mds
+  see_also:
+  - mds_dispatch_engine
+  - mds_reactor_slice_backlog_target
+  flags:
+  - runtime
+- name: mds_reactor_slice_backlog_target
+  type: millisecs
+  level: advanced
+  desc: Soft Client backlog that starts adapting reactor lane slices
+  long_desc: When estimated Client backlog (lane depth times rolling average
+    execute time) reaches this target, the scheduler begins boosting the
+    Client lane slice toward ``mds_reactor_lane_slice_client_max`` and cutting
+    Maintenance toward ``mds_reactor_lane_slice_maintenance_min``. Full
+    adaptation is reached at four times this target. ``0`` disables adaptation.
+  default: 500
+  services:
+  - mds
+  see_also:
+  - mds_reactor_slice_exec_window
+  - mds_reactor_lane_slice_client
+  - mds_reactor_lane_slice_client_max
+  - mds_reactor_lane_slice_maintenance_min
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_client_max
+  type: millisecs
+  level: advanced
+  desc: Maximum Client lane slice under backlog adaptation
+  long_desc: Upper bound for the Client lane wall-clock budget when estimated
+    Client backlog is high. The configured ``mds_reactor_lane_slice_client``
+    remains the idle/base budget.
+  default: 20
+  services:
+  - mds
+  see_also:
+  - mds_reactor_lane_slice_client
+  - mds_reactor_slice_backlog_target
+  flags:
+  - runtime
+- name: mds_reactor_lane_slice_maintenance_min
+  type: millisecs
+  level: advanced
+  desc: Minimum Maintenance lane slice under Client backlog pressure
+  long_desc: Floor for the Maintenance lane wall-clock budget when estimated
+    Client backlog is high. The configured
+    ``mds_reactor_lane_slice_maintenance`` remains the idle/base budget.
+  default: 1
+  services:
+  - mds
+  see_also:
+  - mds_reactor_lane_slice_maintenance
+  - mds_reactor_slice_backlog_target
+  flags:
+  - runtime
 - name: mds_cache_quiesce_delay
   type: millisecs
   level: dev
@@ -177,6 +316,23 @@ options:
   default: 256_K
   services:
   - mds
+  flags:
+  - runtime
+- name: mds_cache_trim_max_duration
+  type: millisecs
+  level: advanced
+  desc: Max wall time for one reactor cache trim quantum
+  long_desc: When ``mds_dispatch_engine=reactor``, each TrimQuantum work item
+    stops after this duration and re-enqueues another quantum if more cache
+    trim work remains. ``0`` disables the time budget (segment/dentry
+    thresholds still apply). Classic mode ignores this and trims under
+    ``mds_lock`` as before.
+  default: 10
+  services:
+  - mds
+  see_also:
+  - mds_cache_trim_threshold
+  - mds_dispatch_engine
   flags:
   - runtime
 - name: mds_cache_quiesce_decay_rate
@@ -1830,6 +1986,24 @@ options:
   see_also:
   - mds_log_max_events
   - mds_log_max_segments
+  flags:
+  - runtime
+- name: mds_log_trim_max_duration
+  type: millisecs
+  level: advanced
+  desc: Max wall time for one reactor log trim tick
+  long_desc: When ``mds_dispatch_engine=reactor``, each LogTrim work item
+    computes a deadline of now + this duration and stops as soon as that
+    deadline is reached — including during the expire loop and the follow-on
+    open-file-table commit / expired-segment cleanup. Another tick is
+    re-enqueued if more journal trim work remains. ``0`` disables the time
+    budget (``mds_log_trim_threshold`` still applies). Classic mode ignores this.
+  default: 10
+  services:
+  - mds
+  see_also:
+  - mds_log_trim_threshold
+  - mds_dispatch_engine
   flags:
   - runtime
 - name: mds_log_trim_decay_rate

@@ -39,6 +39,8 @@
 
 #include <functional>
 #include <memory>
+#include <set>
+#include <string>
 
 #include "include/common_fwd.h"
 #include "msg/Dispatcher.h"
@@ -72,6 +74,11 @@ public:
   virtual void submit_callable(DispatchLane lane, std::function<void()> fn) = 0;
   /// Hint that finished_queue has new continuations (reactor).
   virtual void note_finished_queued() = 0;
+
+  /// Refresh cached runtime options used on enqueue/execute hot paths.
+  virtual void
+  handle_conf_change(const std::set<std::string>& changed)
+  {}
 
   /// Factory: reads mds_dispatch_engine (classic | reactor).
   static std::unique_ptr<MDSDispatchEngine> create(
