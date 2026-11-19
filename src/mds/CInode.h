@@ -181,6 +181,7 @@ public:
   /* For use by offline tools */
   __u32 hash_dentry_name(std::string_view dn);
   frag_t pick_dirfrag(std::string_view dn);
+  frag_t pick_dirfrag(std::string_view dn, __u32 hash);
 
   mempool::mds_co::string	symlink;      // symlink dest, if symlink
   fragtree_t			dirfragtree;  // dir frag tree, if any.  always consistent with our dirfrag map.
@@ -842,9 +843,15 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   void decode_import(ceph::buffer::list::const_iterator& p, LogSegmentRef const& ls);
   
   // for giving to clients
-  int encode_inodestat(ceph::buffer::list& bl, Session *session, SnapRealm *realm,
-		       snapid_t snapid=CEPH_NOSNAP, unsigned max_bytes=0,
-		       int getattr_wants=0);
+  int encode_inodestat(
+      ceph::buffer::list& bl,
+      Session* session,
+      SnapRealm* realm,
+      snapid_t snapid = CEPH_NOSNAP,
+      unsigned max_bytes = 0,
+      int getattr_wants = 0,
+      bool for_readdir = false,
+      bool under_dir_realm = false);
   void encode_cap_message(const ceph::ref_t<MClientCaps> &m, Capability *cap);
 
   SimpleLock* get_lock(int type) override;
@@ -888,6 +895,7 @@ class CInode : public MDSCacheObject, public InodeStoreBase, public Counter<CIno
   void open_snaprealm(bool no_split=false);
   void close_snaprealm(bool no_join=false);
   SnapRealm *find_snaprealm() const;
+  SnapRealm* resolve_snaprealm(SnapRealm* dir_realm, bool under_dir_realm) const;
   void encode_snap(ceph::buffer::list& bl);
   void decode_snap(ceph::buffer::list::const_iterator& p);
 

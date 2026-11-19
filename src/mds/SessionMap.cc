@@ -15,6 +15,8 @@
 
 #include "SessionMap.h"
 
+#include <algorithm>
+
 #include "common/debug.h"
 
 #include "common/DecayCounter.h"
@@ -63,6 +65,22 @@ Session::Session(ConnectionRef con) :
   set_connection(std::move(con));
 }
 
+void
+Session::link_cap(Capability* cap)
+{
+  session_cache_liveness.hit(1.0);
+  auto [it, inserted] = caps_by_ino.emplace(cap->get_inode()->ino(), cap);
+  ceph_assert(inserted);
+  caps.push_back(&cap->item_session_caps);
+}
+
+void
+Session::unlink_cap(Capability* cap)
+{
+  caps_by_ino.erase(cap->get_inode()->ino());
+  cap->item_session_caps.remove_myself();
+}
+
 void Session::touch_cap(Capability *cap) {
   session_cache_liveness.hit(1.0);
   caps.push_front(&cap->item_session_caps);
@@ -71,6 +89,13 @@ void Session::touch_cap(Capability *cap) {
 void Session::touch_cap_bottom(Capability *cap) {
   session_cache_liveness.hit(1.0);
   caps.push_back(&cap->item_session_caps);
+}
+
+Capability*
+Session::find_cap(inodeno_t ino) const
+{
+  auto it = caps_by_ino.find(ino);
+  return it != caps_by_ino.end() ? it->second : nullptr;
 }
 
 void Session::touch_lease(ClientLease *r) {
