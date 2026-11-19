@@ -204,6 +204,7 @@ Developer Guides
     Java and Python bindings <api/index>
     Mantle <mantle>
     Metrics <metrics>
+    MDS Reactor Dispatch Mode <mds-reactor>
 
 
 .. raw:: html
