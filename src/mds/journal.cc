@@ -368,6 +368,45 @@ void LogSegment::try_to_expire(MDSRank *mds, MDSGatherBuilder &gather_bld, int o
   }
 }
 
+void
+LogSegment::assert_elists_empty(const char* where)
+{
+  if (!has_dirty_elists()) {
+    return;
+  }
+
+  generic_derr << where << ": " << *this << " has dirty elists" << dendl;
+  for (elist<CDir*>::iterator p = new_dirfrags.begin(); !p.end(); ++p) {
+    generic_derr << "  new_dirfrag " << **p << dendl;
+  }
+  for (elist<CDir*>::iterator p = dirty_dirfrags.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_dirfrag " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = dirty_inodes.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_inode " << **p << dendl;
+  }
+  for (elist<CDentry*>::iterator p = dirty_dentries.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_dentry " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = open_files.begin(); !p.end(); ++p) {
+    generic_derr << "  open_file " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = dirty_parent_inodes.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_parent_inode " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = dirty_dirfrag_dir.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_dirfrag_dir " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = dirty_dirfrag_nest.begin(); !p.end(); ++p) {
+    generic_derr << "  dirty_dirfrag_nest " << **p << dendl;
+  }
+  for (elist<CInode*>::iterator p = dirty_dirfrag_dirfragtree.begin(); !p.end();
+       ++p) {
+    generic_derr << "  dirty_dirfrag_dirfragtree " << **p << dendl;
+  }
+  ceph_assert(!has_dirty_elists());
+}
+
 void LogSegment::purge_inodes_finish(interval_set<inodeno_t>& inos){
   purging_inodes.subtract(inos);
   if (NULL != purged_cb &&
@@ -1689,12 +1728,23 @@ void EMetaBlob::replay(MDSRank *mds, LogSegmentRef const& logseg, int type, MDPe
       if (session) {
 	dout(20) << " (session prealloc " << session->info.prealloc_inos << ")" << dendl;
 	if (used_preallocated_ino) {
-	  if (!session->info.prealloc_inos.empty()) {
-	    inodeno_t ino = session->take_ino(used_preallocated_ino);
-            dout(5) "received ino " << ino << " from the session" << dendl;
-	    ceph_assert(ino == used_preallocated_ino);
-	    session->info.prealloc_inos.erase(ino);
-	  }
+          if (session->info.prealloc_inos.contains(used_preallocated_ino)) {
+            inodeno_t ino = session->take_ino(used_preallocated_ino);
+            if (ino == used_preallocated_ino) {
+              dout(5) << "received ino " << ino << " from the session" << dendl;
+              session->info.prealloc_inos.erase(ino);
+            } else {
+              dout(5) << "EMetaBlob.replay used_prealloc "
+                      << used_preallocated_ino
+                      << " not available in session, marking taken" << dendl;
+              mds->mdcache->insert_taken_inos(used_preallocated_ino);
+            }
+          } else {
+            dout(5) << "EMetaBlob.replay used_prealloc "
+                    << used_preallocated_ino
+                    << " not in session prealloc, marking taken" << dendl;
+            mds->mdcache->insert_taken_inos(used_preallocated_ino);
+          }
           mds->sessionmap.replay_dirty_session(session);
 	}
 	if (!preallocated_inos.empty()) {

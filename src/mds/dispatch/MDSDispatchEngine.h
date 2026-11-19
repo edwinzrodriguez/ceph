@@ -28,6 +28,7 @@
  *   - MDSIOContextBase::complete     -> submit_io_completion() (reactor only)
  *   - C_IO_Wrapper::complete         -> finisher (classic) or submit_io (reactor)
  *   - MDCache upkeep                  -> submit_trim_tick() (reactor)
+ *   - MDLog log_trim_upkeep           -> submit_log_trim_tick() (reactor)
  *   - MDSRank finished_queue           -> note_finished_queued() (reactor)
  *   - MDSDaemon timer / mutating asok -> submit_callable(Control) (reactor)
  *
@@ -65,6 +66,8 @@ public:
   virtual void submit_advance_queues() = 0;
   /// Bounded cache trim slice (reactor).
   virtual void submit_trim_tick() = 0;
+  /// Journal segment trim slice (reactor).
+  virtual void submit_log_trim_tick() = 0;
   /// Timer, asok, or other callbacks that need mds_lock (reactor).
   virtual void submit_callable(DispatchLane lane, std::function<void()> fn) = 0;
   /// Hint that finished_queue has new continuations (reactor).

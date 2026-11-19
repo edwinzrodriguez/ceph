@@ -3518,6 +3518,17 @@ bool Server::check_access(const MDRequestRef& mdr, CInode *in, unsigned mask)
   return true;
 }
 
+bool
+Server::ensure_parent_dir_wrlocks(const MDRequestRef& mdr, CInode* diri)
+{
+  if (mdr->is_wrlocked(&diri->filelock) && mdr->is_wrlocked(&diri->nestlock))
+    return true;
+  MutationImpl::LockOpVec parent_lov;
+  parent_lov.add_wrlock(&diri->filelock);
+  parent_lov.add_wrlock(&diri->nestlock);
+  return mds->locker->acquire_locks(mdr, parent_lov);
+}
+
 /**
  * Block client requests from non-quarantine-aware clients when the target
  * inode is under quarantine. Drops the request's locks and adds a waiter on
@@ -3595,6 +3606,15 @@ bool Server::check_dir_max_entries(const MDRequestRef& mdr, CDir *in)
   return true;
 }
 
+static bool
+stray_linkage_matches_inode(CDentry::linkage_t* l, CInode* in)
+{
+  if (l->is_null())
+    return false;
+  if (l->is_primary())
+    return l->get_inode()->ino() == in->ino();
+  return l->is_remote() && l->get_remote_ino() == in->ino();
+}
 
 CDentry* Server::prepare_stray_dentry(const MDRequestRef& mdr, CInode *in)
 {
@@ -3603,8 +3623,12 @@ CDentry* Server::prepare_stray_dentry(const MDRequestRef& mdr, CInode *in)
 
   CDentry *straydn = mdr->straydn;
   if (straydn) {
-    if (straydn->get_name() == straydname)
+    if (straydn->get_name() == straydname) {
+      CDentry::linkage_t* strayl = straydn->get_projected_linkage();
+      if (!strayl->is_null())
+        ceph_assert(stray_linkage_matches_inode(strayl, in));
       return straydn;
+    }
 
     /*
      * The victim inode changed since the stray dentry was prepared
@@ -3636,7 +3660,13 @@ CDentry* Server::prepare_stray_dentry(const MDRequestRef& mdr, CInode *in)
     straydn = straydir->add_null_dentry(straydname);
     straydn->mark_new();
   } else {
-    ceph_assert(straydn->get_projected_linkage()->is_null());
+    CDentry::linkage_t* strayl = straydn->get_projected_linkage();
+    if (!strayl->is_null()) {
+      // e.g. retry after _unlink_local() already projected this inode into stray
+      // but mdr->straydn was not preserved across the retry.
+      ceph_assert(stray_linkage_matches_inode(strayl, in));
+      dout(10) << __func__ << ": reusing stray dn " << *straydn << dendl;
+    }
   }
 
   straydn->state_set(CDentry::STATE_STRAY);
@@ -3667,11 +3697,18 @@ CInode* Server::prepare_new_inode(const MDRequestRef& mdr, CDir *dir, inodeno_t 
   // assign ino
   do {
     if (allow_prealloc_inos && (mdr->used_prealloc_ino = _inode->ino = mdr->session->take_ino(_useino))) {
+      if (g_conf()->mds_inject_prealloc_taken_retry) {
+        mdcache->insert_taken_inos(mdr->used_prealloc_ino);
+      }
       if (mdcache->test_and_clear_taken_inos(_inode->ino)) {
+        inodeno_t taken = mdr->used_prealloc_ino;
         _inode->ino = 0;
-        dout(10) << "prepare_new_inode used_prealloc " << mdr->used_prealloc_ino
-                 << " (" << mdr->session->info.prealloc_inos.size() << " left)"
-	         << " but has been taken, will try again!" << dendl;
+        mdr->used_prealloc_ino = 0;
+        // take_ino() removed it from free_prealloc_inos; put it back for retry
+        mdr->session->free_prealloc_inos.insert(taken);
+        dout(10) << "prepare_new_inode used_prealloc " << taken << " ("
+                 << mdr->session->info.prealloc_inos.size() << " left)"
+                 << " but has been taken, will try again!" << dendl;
       } else {
         mds->sessionmap.mark_projected(mdr->session);
         dout(10) << "prepare_new_inode used_prealloc " << mdr->used_prealloc_ino
@@ -3679,13 +3716,16 @@ CInode* Server::prepare_new_inode(const MDRequestRef& mdr, CDir *dir, inodeno_t 
                  << dendl;
       }
     } else {
+      mdr->used_prealloc_ino = 0;
       mdr->alloc_ino =
        _inode->ino = mds->inotable->project_alloc_id(_useino);
       if (mdcache->test_and_clear_taken_inos(_inode->ino)) {
+        inodeno_t taken = mdr->alloc_ino;
         mds->inotable->apply_alloc_id(_inode->ino);
         _inode->ino = 0;
-        dout(10) << "prepare_new_inode alloc " << mdr->alloc_ino
-	         << " but has been taken, will try again!" << dendl;
+        mdr->alloc_ino = 0;
+        dout(10) << "prepare_new_inode alloc " << taken
+                 << " but has been taken, will try again!" << dendl;
       } else {
         dout(10) << "prepare_new_inode alloc " << mdr->alloc_ino << dendl;
       }
@@ -5038,7 +5078,15 @@ void Server::handle_client_openc(const MDRequestRef& mdr)
     newi->mark_clientwriteable();
     cap->mark_clientwriteable();
   }
-  
+
+  // path_traverse deferred parent scatter wrlocks for CREATE so we do not
+  // revoke Fs from the requesting client while it waits for this reply.
+  // After process_request_cap_release that client has already dropped Fs;
+  // re-acquire the wrlocks here so sibling clients lose Fs/COMPLETE before
+  // the new name is journaled.
+  if (!ensure_parent_dir_wrlocks(mdr, diri))
+    return;
+
   // prepare finisher
   mdr->ls = mdlog->get_current_segment();
   EUpdate *le = new EUpdate(mdlog, "openc");
@@ -8104,6 +8152,11 @@ void Server::handle_client_link(const MDRequestRef& mdr)
     return;
   }
 
+  // path_traverse deferred parent scatter wrlocks for LINK; re-acquire so
+  // sibling clients revoke Fs/COMPLETE before the new name is journaled.
+  if (!ensure_parent_dir_wrlocks(mdr, dir->get_inode()))
+    return;
+
   // go!
   ceph_assert(g_conf()->mds_kill_link_at != 1);
 
@@ -8696,8 +8749,18 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
   const cref_t<MClientRequest> &req = mdr->client_request;
   client_t client = mdr->get_client();
 
+  if (mdr->committing) {
+    dout(10) << "handle_client_unlink already committing " << *mdr << dendl;
+    return;
+  }
+
   // rmdir or unlink?
   bool rmdir = (req->get_op() == CEPH_MDS_OP_RMDIR);
+
+  // Keep the unsafe window closed until journal finish: early_reply drops
+  // rdlocks while xlocks are marked done, which lets overlapping work mutate
+  // projected inode state before _unlink_local_finish runs.
+  mdr->no_early_reply = true;
 
   if (rmdir)
     mdr->disable_lock_cache();
@@ -8746,8 +8809,25 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
 
   // -- create stray dentry? --
   CDentry *straydn = NULL;
+
+  // Unlink lock profile (single ordered sequence):
+  //   1) file inode linklock/snaplock (+ dir rdlock for rmdir checks)
+  //   2) stray dentry locks (if primary)
+  //   3) project + journal in _unlink_local() (parent scatter deferred if needed)
+  if (!(mdr->locking_state & MutationImpl::ALL_LOCKED)) {
+    MutationImpl::LockOpVec lov;
+
+    lov.add_xlock(&in->linklock);
+    lov.add_xlock(&in->snaplock);
+    if (in->is_dir())
+      lov.add_rdlock(&in->filelock); // to verify it's empty
+
+    if (!mds->locker->acquire_locks(mdr, lov))
+      return;
+  }
+
   if (dnl->is_primary()) {
-    straydn = prepare_stray_dentry(mdr, dnl->get_inode());
+    straydn = prepare_stray_dentry(mdr, in);
     if (!straydn)
       return;
     dout(10) << " straydn is " << *straydn << dendl;
@@ -8756,14 +8836,8 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
     mdr->straydn = NULL;
   }
 
-  // lock
   if (!(mdr->locking_state & MutationImpl::ALL_LOCKED)) {
     MutationImpl::LockOpVec lov;
-
-    lov.add_xlock(&in->linklock);
-    lov.add_xlock(&in->snaplock);
-    if (in->is_dir())
-      lov.add_rdlock(&in->filelock);   // to verify it's empty
 
     if (straydn) {
       lov.add_wrlock(&straydn->get_dir()->inode->filelock);
@@ -8833,37 +8907,71 @@ void Server::handle_client_unlink(const MDRequestRef& mdr)
       return;  // we're waiting for a witness.
   }
 
+  // path_traverse deferred parent scatter wrlocks for unlink/rmdir (and for
+  // CREATE/LINK) to avoid Fs-revoke deadlock with the requesting client.
+  // Re-acquire them here so sibling clients lose Fs/COMPLETE (and so rmdir
+  // sees a coherent parent nlink/dirstat).
+  if (!ensure_parent_dir_wrlocks(mdr, diri))
+    return;
+
   if (mds_allow_async_dirops && !rmdir && dnl->is_primary() && mdr->dn[0].size() == 1)
     mds->locker->create_lock_cache(mdr, diri);
+
+  mdr->tracei = in;
+  mdr->pin(in);
 
   // ok!
   if (dnl->is_remote() && !dnl->get_inode()->is_auth()) 
     _link_remote(mdr, false, dn, dnl->get_inode());
   else
-    _unlink_local(mdr, dn, straydn);
+    _unlink_local(mdr, dn, straydn, in);
 }
 
 class C_MDS_unlink_local_finish : public ServerLogContext {
   CDentry *dn;
   CDentry *straydn;
+  CInode* in;
   version_t dnpv;  // deleted dentry
 public:
-  C_MDS_unlink_local_finish(Server *s, const MDRequestRef& r, CDentry *d, CDentry *sd) :
-    ServerLogContext(s, r), dn(d), straydn(sd),
-    dnpv(d->get_projected_version()) {}
+  C_MDS_unlink_local_finish(
+      Server* s,
+      const MDRequestRef& r,
+      CDentry* d,
+      CDentry* sd,
+      CInode* i) :
+    ServerLogContext(s, r),
+    dn(d),
+    straydn(sd),
+    in(i),
+    dnpv(d->get_projected_version())
+  {}
   void finish(int r) override {
     ceph_assert(r == 0);
-    server->_unlink_local_finish(mdr, dn, straydn, dnpv);
+    server->_unlink_local_finish(mdr, dn, straydn, in, dnpv);
   }
 };
 
-void Server::_unlink_local(const MDRequestRef& mdr, CDentry *dn, CDentry *straydn)
+void
+Server::_unlink_local(
+    const MDRequestRef& mdr,
+    CDentry* dn,
+    CDentry* straydn,
+    CInode* in)
 {
-  dout(10) << "_unlink_local " << *dn << dendl;
+  dout(10) << "_unlink_local " << *dn << " " << *in << dendl;
+
+  if (mdr->committing) {
+    dout(10) << "_unlink_local already committing " << *mdr << dendl;
+    return;
+  }
 
   CDentry::linkage_t *dnl = dn->get_projected_linkage();
-  CInode *in = dnl->get_inode();
+  if (dnl->is_null() && dn->is_projected()) {
+    dout(10) << "_unlink_local already projected unlinked " << *dn << dendl;
+    return;
+  }
 
+  ceph_assert(in);
 
   // ok, let's do it.
   mdr->ls = mdlog->get_current_segment();
@@ -8880,7 +8988,11 @@ void Server::_unlink_local(const MDRequestRef& mdr, CDentry *dn, CDentry *strayd
 
   if (straydn) {
     ceph_assert(dnl->is_primary());
-    straydn->push_projected_linkage(in);
+    CDentry::linkage_t* strayl = straydn->get_projected_linkage();
+    if (strayl->is_null())
+      straydn->push_projected_linkage(in);
+    else
+      ceph_assert(stray_linkage_matches_inode(strayl, in));
   }
 
   // the unlinked dentry
@@ -8944,26 +9056,30 @@ void Server::_unlink_local(const MDRequestRef& mdr, CDentry *dn, CDentry *strayd
     mdcache->project_subtree_rename(in, dn->get_dir(), straydn->get_dir());
   }
 
-  journal_and_reply(mdr, 0, dn, le, new C_MDS_unlink_local_finish(this, mdr, dn, straydn));
+  journal_and_reply(
+      mdr, 0, dn, le, new C_MDS_unlink_local_finish(this, mdr, dn, straydn, in));
 }
 
-void Server::_unlink_local_finish(const MDRequestRef& mdr,
-				  CDentry *dn, CDentry *straydn,
-				  version_t dnpv) 
+void
+Server::_unlink_local_finish(
+    const MDRequestRef& mdr,
+    CDentry* dn,
+    CDentry* straydn,
+    CInode* in,
+    version_t dnpv)
 {
-  dout(10) << "_unlink_local_finish " << *dn << dendl;
+  dout(10) << "_unlink_local_finish " << *dn << " " << *in << dendl;
 
   if (!mdr->more()->witnessed.empty())
     mdcache->logged_leader_update(mdr->reqid);
 
-  CInode *strayin = NULL;
   bool hadrealm = false;
   if (straydn) {
     // if there is newly created snaprealm, need to split old snaprealm's
     // inodes_with_caps. So pop snaprealm before linkage changes.
-    strayin = dn->get_linkage()->get_inode();
-    hadrealm = strayin->snaprealm ? true : false;
-    strayin->early_pop_projected_snaprealm();
+    hadrealm = in->snaprealm ? true : false;
+    if (in->is_projected())
+      in->early_pop_projected_snaprealm();
   }
 
   // unlink main dentry
@@ -8974,7 +9090,11 @@ void Server::_unlink_local_finish(const MDRequestRef& mdr,
   // relink as stray?  (i.e. was primary link?)
   if (straydn) {
     dout(20) << " straydn is " << *straydn << dendl;
-    straydn->pop_projected_linkage();
+    if (straydn->is_projected()) {
+      straydn->pop_projected_linkage();
+    } else {
+      ceph_assert(straydn->get_linkage()->get_inode()->ino() == in->ino());
+    }
     mdcache->touch_dentry_bottom(straydn);
   }
 
@@ -8984,11 +9104,12 @@ void Server::_unlink_local_finish(const MDRequestRef& mdr,
   
   if (straydn) {
     // update subtree map?
-    if (strayin->is_dir())
-      mdcache->adjust_subtree_after_rename(strayin, dn->get_dir(), true);
+    if (in->is_dir())
+      mdcache->adjust_subtree_after_rename(in, dn->get_dir(), true);
 
-    if (strayin->snaprealm && !hadrealm)
-      mdcache->do_realm_invalidate_and_update_notify(strayin, CEPH_SNAP_OP_SPLIT, false);
+    if (in->snaprealm && !hadrealm)
+      mdcache->do_realm_invalidate_and_update_notify(
+          in, CEPH_SNAP_OP_SPLIT, false);
   }
 
   // bump pop
