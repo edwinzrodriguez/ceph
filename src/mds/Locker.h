@@ -179,6 +179,8 @@ public:
       CapReleaseEvalBatch* batch = nullptr);
 
   std::set<client_t> get_late_revoking_clients(double timeout);
+  /// Dump oldest pending revokes older than ``timeout`` (for abort diagnostics).
+  void dump_late_revoking(double timeout);
 
   void snapflush_nudge(CInode *in);
   void mark_need_snapflush_inode(CInode *in);
